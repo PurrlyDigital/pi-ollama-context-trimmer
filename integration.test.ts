@@ -303,9 +303,12 @@ describe("AC-1: view-time, age-scoped digesting", () => {
 			},
 			createMockContext(),
 		);
-		// Bump turn: invoke turn_end to advance the counter.
-		const turnEndHandlers = mockPi.getHandlers("turn_end");
-		await turnEndHandlers[0]({}, createMockContext());
+		// Bump turn: invoke before_agent_start (the user-turn boundary)
+		// to advance the counter. turn_end no longer bumps — a user
+		// prompt spans many Pi turns, so the user-turn boundary is the
+		// correct granularity for the age-scope.
+		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
+		await beforeAgentStartHandlers[0]({ prompt: "", images: [] }, createMockContext());
 
 		// Now the tool-result is on a previous turn; the context
 		// handler should swap to the digest.
@@ -722,9 +725,9 @@ describe("AC-5: five-path coherence (write-time side-by-side + view-time swap)",
 			},
 			createMockContext(),
 		);
-		// Bump turn.
-		const turnEndHandlers = mockPi.getHandlers("turn_end");
-		await turnEndHandlers[0]({}, createMockContext());
+		// Bump turn: invoke before_agent_start (the user-turn boundary).
+		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
+		await beforeAgentStartHandlers[0]({ prompt: "", images: [] }, createMockContext());
 
 		// Build a message with the side-by-side envelope. The view-time
 		// handler should swap to the digest.

@@ -213,18 +213,16 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		return { messages: finalMessages as unknown as typeof event.messages };
 	});
 
-	// ── `turn_end` handler (AC-2 + AC-3) ───────────────────────────────
-	// Fired for each turn (one LLM response + tool calls). The
-	// handler's job narrows to:
-	//   - Bump `currentTurnIndex` (feeds the `age` stamp on the next
-	//     `tool_result` event).
-	//   - Refresh the pinned tier's last-N tracker cache (so newly-
-	//     created tickets are picked up).
-	// The threshold-crossing observation from T-2706 is removed per
-	// AC-4 (the recency comfort window is a comfort knob, not a
-	// trigger).
+	// ── `turn_end` handler (AC-3) ───────────────────────────────────────
+	// Fired for each Pi turn (one LLM response + tool calls). The
+	// user-turn boundary is `before_agent_start` (one bump per user
+	// prompt), NOT here — a single user prompt spans many Pi turns
+	// (the agent calls tools and continues across LLM responses), and
+	// bumping here aged same-user-turn tool results to "digest" before
+	// the agent finished using them (the regression this fix
+	// corrects). `turn_end` only refreshes the pinned tier's last-N
+	// tracker cache (best-effort; newly-created tickets picked up).
 	pi.on("turn_end", async (_event, _ctx) => {
-		currentTurnIndex += 1;
 		pinnedTier.bumpTurn();
 		// Refresh the tracker cache on each turn so the pinned
 		// message always reflects the latest work. The refresh is
@@ -301,15 +299,26 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	// ── `before_agent_start` handler (AC-2 — agent keep/drop affordance) ─
-	// Fired after the user submits a prompt, before the agent loop.
-	// The handler injects the per-tool-output digest (the agent's
-	// keep-vs-drop affordance) and parses the assistant's most
-	// recent message for keep/drop marks. The injection channel is
-	// the same as the T-2707 BACKUP (`before_agent_start` +
-	// `message`), but the digest widens from "Read files" to "Tool
-	// outputs" per AC-2.
+	// ── `before_agent_start` handler (AC-2 + AC-1 turn boundary) ────────
+	// Fired after the user submits a prompt, before the agent loop —
+	// the user-turn boundary. The handler:
+	//   1. Bumps `currentTurnIndex` ONCE per user prompt (not per Pi
+	//      turn). `turn_end` fires per LLM-response cycle, which is more
+	//      granular than the user turn; bumping there aged
+	//      same-user-turn tool results to "digest" before the agent
+	//      finished using them (the regression this fix corrects).
+	//      Bumping here keeps tool results verbatim across the agent's
+	//      full work on this user prompt (across many Pi turns) and
+	//      only thins them to digest on the NEXT user submission.
+	//   2. Parses the assistant's most recent message for keep/drop
+	//      marks (the agent's keep-vs-drop affordance).
+	//   3. Injects the per-tool-output digest (widened from "Read
+	//      files" to "Tool outputs" per AC-2).
 	pi.on("before_agent_start", async (event, ctx) => {
+		// User-turn boundary: bump the turn counter once per user
+		// prompt, before any tool_result in this user turn stamps it.
+		currentTurnIndex += 1;
+
 		// Read the agent's most recent assistant message to discover
 		// keep-vs-drop marks. The `ctx.sessionManager.getBranch()`
 		// returns the current branch in leaf-to-root order; the FIRST
