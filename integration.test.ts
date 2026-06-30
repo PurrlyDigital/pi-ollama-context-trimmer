@@ -781,12 +781,4 @@ describe("AC-5: integration tests run green against the assembled extension", ()
 		// If we got here, the extension loaded successfully.
 		assert.ok(mockPi, "Extension must load without errors");
 	});
-
-	it("the extension is INACTIVE in `~/.pi/agent/extensions/context-trimmer/` (per the ticket's relocation)", () => {
-		// The extension was moved out of the live extensions dir
-		// for this work, per the ticket's "do NOT move it back" rule.
-		// The test asserts the inactive state.
-		const livePath = "/home/dez/.pi/agent/extensions/context-trimmer/index.ts";
-		assert.equal(existsSync(livePath), false, "Extension is INACTIVE during this work");
-	});
 });

@@ -86,7 +86,7 @@ import { digestToolResult, type DigestibleToolResult } from "./digest.ts";
  * override values (`kept` / `dropped`) are set by the agent's `keep` /
  * `drop` decision. `retired` is the recency-filter set-excluded state.
  */
-export type LifecycleState =
+export type LifecyclePhase =
 	| "verbatim"
 	| "digest"
 	| "retired"
@@ -119,7 +119,7 @@ export interface ToolOutputRecord {
 	 * applies: verbatim-on-producing-turn, digest-after). The agent sets
 	 * the override via `setLifecycleOverride`.
 	 */
-	override?: Exclude<LifecycleState, "verbatim" | "digest" | "retired">;
+	override?: Exclude<LifecyclePhase, "verbatim" | "digest" | "retired">;
 }
 
 /**
@@ -143,7 +143,7 @@ export interface LifecycleState {
 	/** Look up a record by `toolCallId`. */
 	getRecord: (toolCallId: string) => ToolOutputRecord | undefined;
 	/** Get the current lifecycle state for a `toolCallId` (default: `verbatim` if no override). */
-	getLifecycleState: (toolCallId: string, currentTurn: number) => LifecycleState;
+	getLifecycleState: (toolCallId: string, currentTurn: number) => LifecyclePhase;
 	/** Return the records in turn order (oldest first). */
 	getRecordsInOrder: () => ToolOutputRecord[];
 	/** Return the set of `toolCallId`s that have a `kept` override. */
@@ -388,7 +388,7 @@ export function buildToolOutputDigest(
 	return lines.join("\n");
 }
 
-function lifecycleStateLabel(s: LifecycleState): string {
+function lifecycleStateLabel(s: LifecyclePhase): string {
 	switch (s) {
 		case "verbatim":
 			return "verbatim";
