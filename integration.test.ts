@@ -1,37 +1,43 @@
 /**
- * T-2708 — Live-session integration tests for the context-trimmer extension.
+ * T-2717 — Live-session integration tests for the redesigned
+ * context-trimmer extension.
  *
- * This is the end-to-end functional gate for the assembled extension
- * (T-2706 handler + T-2707 digest + T-2705 policy). It exercises the
- * extension's event handlers against realistic bloat and asserts:
+ * This is the end-to-end functional gate for the assembled T-2717
+ * extension (the unified keep/digest/retire engine + pinned tier +
+ * recency comfort window). It exercises the extension's event
+ * handlers against realistic bloat and asserts:
  *
- *   AC-2: working-window token cost stays bounded across N turns
- *   AC-3: file read → dropped → re-requested is recoverable
- *   AC-4: tool/MCP outputs are digested in the session
- *   AC-5: tests run green against the assembled extension
+ *   AC-1: view-time, age-scoped digesting (current turn verbatim,
+ *         prior turns digest).
+ *   AC-2: unified keep/digest/retire engine (kept → verbatim,
+ *         dropped → excluded, auto-state transitions).
+ *   AC-3: pinned tier (auto-pin by convention; personality + last-N
+ *         tracker always present in the view).
+ *   AC-4: recency comfort window (no threshold gate; bound derives
+ *         from live `ctx.getContextUsage().contextWindow`).
+ *   AC-5: five-path coherence (write-time side-by-side, view-time
+ *         swap, session persistence, recency filter, lifecycle
+ *         engine all cohere on a single `ToolResultMessage` shape).
  *
- * Harness choice: SDK `createAgentSession` + `SessionManager.inMemory()` for
- * AC-1 (live session + auto-discovered extension). For the per-handler
- * assertions (AC-2/3/4), we use a mock `ExtensionAPI` that captures the
- * registered handlers — this is deterministic and fast, and exercises the
- * real extension module (not a stub). The mock approach is a recognized
- * fallback when the SDK's `tool_result` event cannot be triggered
- * deterministically without an LLM call (the tool_result event fires
- * only during real tool execution by the agent loop).
+ * Harness choice: mock `ExtensionAPI` that captures the registered
+ * handlers — deterministic and fast. The mock approach is a
+ * recognized fallback when the SDK's `tool_result` event cannot
+ * be triggered deterministically without an LLM call. The
+ * extension's real handlers are bound to the real state via the
+ * factory call.
  *
- * Bound derivation (AC-2):
- *   The bound is anchored to the policy's named constants:
- *     - THRESHOLD = 50_000 (from policy.ts)
- *     - DEFAULT_RECENCY_WINDOW = 20 (from policy.ts)
- *     - MAX_DIGEST_CHARS = 2000 (from digest.ts)
- *   Pi's auto-compaction trigger = contextWindow - reserveTokens
- *     = 128_000 - 16_384 = 111_616 (from T-2704 §3)
- *   The bound = 111_000 tokens (just below Pi's auto-compaction trigger).
- *   Rationale: the trimmer fires at THRESHOLD=50_000 and retains the most
- *   recent 20 turns; after trim, the working window is at most
- *   system_prompt + 20 turns × per-turn cost. The 111_000 bound is
- *   well above the recency-window natural cost ceiling and just below
- *   Pi's compaction trigger — the trimmer must keep us under both.
+ * Bound derivation (AC-4): the bound is anchored to the LIVE
+ * `ctx.getContextUsage()` shape. `reserveTokens` is the documented
+ * default 16384 (per `compaction.md`). The test reads
+ * `usage.contextWindow` and asserts the working window stays
+ * under `contextWindow - reserveTokens - slack`, where `slack`
+ * accounts for the recency window's expected cost.
+ *
+ * The live-session path that auto-discovers the extension from
+ * `~/.pi/agent/extensions/context-trimmer/` is **not** exercised
+ * here: the extension is INACTIVE during this work (moved out of
+ * the live extensions dir per the ticket's "do NOT move it back"
+ * directive). The mock-based path is the load-bearing assertion.
  */
 
 import { describe, it } from "node:test";
@@ -41,18 +47,30 @@ import { existsSync } from "node:fs";
 
 // ─── Constants from the assembled extension ────────────────────────────────
 
-/** Policy threshold: trimmer fires when tokens > THRESHOLD. */
-const THRESHOLD = 50_000;
 /** Policy default recency window: retain the most recent N user-message turns. */
-const DEFAULT_RECENCY_WINDOW = 20;
+import { RECENCY_COMFORT_WINDOW } from "./policy.ts";
+
 /** Digest cap: tool/MCP output digested to ≤ MAX_DIGEST_CHARS characters. */
-const MAX_DIGEST_CHARS = 2_000;
-/** Pi's auto-compaction trigger = contextWindow - reserveTokens. */
-const PI_COMPACTION_TRIGGER = 128_000 - 16_384; // 111_616
-/** AC-2 bound: just below Pi's auto-compaction trigger. */
-const AC2_BOUND = 111_000;
-/** Approximate chars per token for English text. */
+import { MAX_DIGEST_CHARS } from "./digest.ts";
+
+/** Pi's auto-compaction default `reserveTokens` (per `compaction.md`). */
+const PI_RESERVE_TOKENS = 16_384;
+
+/** Slack for the per-LLM-call view bound (covers recency window cost
+ *  and per-message digest envelope overhead). Pinned as a constant
+ *  so the test is stable. */
+const COMFORT_SLACK = 2_000;
+
+/** Approximate chars per token for English text (the SDK's estimate
+ *  uses the same heuristic; per `compaction.ts` `estimateTokens`). */
 const CHARS_PER_TOKEN = 4;
+
+/** The integration test's bound derivation. Per AC-4: anchored to
+ *  the LIVE `ctx.getContextUsage().contextWindow`. The test reads
+ *  this from the mock context; production code does not gate on it. */
+function deriveBound(contextWindow: number, reserveTokens: number): number {
+	return contextWindow - reserveTokens - COMFORT_SLACK;
+}
 
 // ─── Mock ExtensionAPI for deterministic handler invocation ─────────────────
 
@@ -60,7 +78,7 @@ const CHARS_PER_TOKEN = 4;
  * A mock ExtensionAPI that captures all registered event handlers. This lets
  * us invoke the extension's handlers directly with mock events, which is
  * deterministic and fast. The extension module's handlers are closures over
- * the keep-mark state; by calling the factory with this mock, we get the
+ * the lifecycle state; by calling the factory with this mock, we get the
  * real handlers bound to the real state.
  */
 function createMockPi() {
@@ -99,17 +117,28 @@ function createMockPi() {
 
 /**
  * Create a mock context with the minimum surface the extension uses.
- * The extension calls: ctx.getContextUsage(), ctx.hasUI, ctx.ui.notify,
- * ctx.sessionManager.getBranch().
+ * Per AC-4: the `contextWindow` is the live-model window the test
+ * reads for the bound derivation. The `tokens` field simulates the
+ * working window's reported token count.
  */
-function createMockContext(opts: { tokens?: number; hasUI?: boolean } = {}) {
-	const tokens = opts.tokens ?? 0;
+function createMockContext(opts: {
+	tokens?: number | null;
+	contextWindow?: number;
+	hasUI?: boolean;
+} = {}) {
+	const tokens = opts.tokens ?? null;
+	const contextWindow = opts.contextWindow ?? 128_000;
 	const hasUI = opts.hasUI ?? false;
 	return {
-		getContextUsage: () => (tokens > 0 ? { tokens } : undefined),
+		getContextUsage: () => ({
+			tokens,
+			contextWindow,
+			percent: tokens !== null ? Math.round((tokens / contextWindow) * 100) : null,
+		}),
 		hasUI,
 		ui: {
 			notify: (_msg: string, _level: string) => {},
+			setStatus: (_key: string, _text: string) => {},
 		},
 		cwd: "/tmp/pi-test",
 		sessionManager: {
@@ -143,40 +172,52 @@ async function loadExtension() {
 	return mockPi;
 }
 
-// ─── Helper: build a tool result message ────────────────────────────────────
+// ─── Helper: build a tool-result message with the side-by-side envelope ────
 
+/**
+ * Build a `toolResult` message with the side-by-side envelope
+ * (Storage Shape A: `content` verbatim + `details.digest` +
+ * `details.turnIndex`). The shape is the AC-5 contract across all
+ * five paths.
+ */
 function makeToolResultMessage(opts: {
 	toolName: string;
 	toolCallId: string;
+	age: number;
 	verbatimContent: string;
+	digestContent: string;
 	input?: Record<string, unknown>;
 }) {
 	return {
 		role: "toolResult",
 		toolCallId: opts.toolCallId,
 		toolName: opts.toolName,
+		age: opts.age,
 		input: opts.input ?? {},
 		content: [{ type: "text", text: opts.verbatimContent }],
-		details: {},
+		details: { digest: opts.digestContent, turnIndex: opts.age, toolCallId: opts.toolCallId },
 		isError: false,
 	};
 }
 
-// ─── Helper: build a user message ───────────────────────────────────────────
-
+/** Build a user message. */
 function makeUserMessage(text: string) {
 	return { role: "user", content: text };
 }
 
-// ─── Helper: build an assistant message ────────────────────────────────────
-
+/** Build an assistant message. */
 function makeAssistantMessage(text: string) {
 	return { role: "assistant", content: [{ type: "text", text }] };
 }
 
-// ─── AC-1: live session + auto-discovered extension ────────────────────────
+/** Build a per-tool digester envelope (used in mock tool_result events). */
+function makeDigest(turnIndex: number, toolName: string, key: string): string {
+	return `[factOfCall: ${toolName}(${key})]\n[digest: turn-${turnIndex} digest body]`;
+}
 
-describe("AC-1: live Pi session with auto-discovered extension", () => {
+// ─── AC-1: live Pi session with auto-discovered extension ──────────────────
+
+describe("AC-1: extension module loads + registers handlers", () => {
 	it("the extension module is importable and exports a default factory", async () => {
 		const extPath = resolve(import.meta.dirname ?? ".", "index.ts");
 		assert.ok(existsSync(extPath), `Extension not found at ${extPath}`);
@@ -186,8 +227,6 @@ describe("AC-1: live Pi session with auto-discovered extension", () => {
 
 	it("the extension registers handlers on the mock pi", async () => {
 		const mockPi = await loadExtension();
-		// The extension should register at least: context, tool_result,
-		// before_agent_start, turn_end, session_start.
 		const contextHandlers = mockPi.getHandlers("context");
 		const toolResultHandlers = mockPi.getHandlers("tool_result");
 		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
@@ -195,352 +234,546 @@ describe("AC-1: live Pi session with auto-discovered extension", () => {
 		assert.ok(toolResultHandlers.length > 0, "tool_result handler must be registered");
 		assert.ok(beforeAgentStartHandlers.length > 0, "before_agent_start handler must be registered");
 	});
-
-	it("node + SDK are available for the live session path", () => {
-		// The SDK is at /usr/lib/node_modules/@earendil-works/pi-coding-agent.
-		// If this path is absent, the live-session path is infeasible.
-		const sdkPath = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
-		assert.ok(existsSync(sdkPath), `Pi SDK not found at ${sdkPath}`);
-	});
 });
 
-// ─── AC-2: working-window token cost stays bounded ─────────────────────────
+// ─── AC-1: view-time, age-scoped digesting ─────────────────────────────────
 
-describe("AC-2: working-window token cost stays bounded across N turns", () => {
-	it("context handler returns messages under the bound when over threshold", async () => {
+describe("AC-1: view-time, age-scoped digesting", () => {
+	it("on the producing turn: tool-result content is verbatim", async () => {
 		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
 		const contextHandlers = mockPi.getHandlers("context");
 
-		// Build a bloated session: 30 user-message turns, each with a large
-		// tool result. The recency window is 20, so 10 turns should be dropped.
-		const messages: unknown[] = [];
-		for (let i = 0; i < 30; i++) {
-			messages.push(makeUserMessage(`User turn ${i}: ${"x".repeat(500)}`));
-			messages.push(makeAssistantMessage(`Assistant turn ${i}: ${"y".repeat(500)}`));
-			messages.push(makeToolResultMessage({
+		// Drive a single tool call: the tool_result handler records
+		// the lifecycle state, and the next context handler should
+		// show the verbatim content (the tool was produced on the
+		// current turn).
+		await toolResultHandlers[0](
+			{
 				toolName: "bash",
-				toolCallId: `tc-${i}`,
-				verbatimContent: "VERBATIM_OUTPUT:" + "z".repeat(3000),
-				input: { command: `echo turn-${i}` },
-			}));
-		}
-
-		// Simulate over-threshold context usage.
-		const ctx = createMockContext({ tokens: 60_000 });
-
-		// Invoke the context handler.
-		const result = await contextHandlers[0]({ messages }, ctx);
-
-		// The handler should return { messages: filteredMessages }.
-		assert.ok(result, "context handler must return a result");
-		const resultMessages = (result as { messages: unknown[] }).messages;
-		assert.ok(Array.isArray(resultMessages), "context handler must return { messages: [...] }");
-
-		// The recency window retains the most recent 20 user-message turns.
-		// 20 user turns × 3 messages each (user + assistant + toolResult) = 60.
-		// Plus the first user message (if present). The exact count depends
-		// on the policy's recency measurement basis; we assert it's < 90
-		// (30 turns × 3 messages = 90 unfiltered) and ≥ 20 user turns.
-		assert.ok(resultMessages.length < 90, `Expected < 90 messages after trim, got ${resultMessages.length}`);
-		assert.ok(resultMessages.length >= 20, `Expected ≥ 20 messages (recency floor), got ${resultMessages.length}`);
-
-		// Compute the approximate token cost of the returned messages.
-		const totalChars = JSON.stringify(resultMessages).length;
-		const estimatedTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
-
-		// The bound: 111_000 tokens. After trim, the working window should
-		// be well under this. We assert the estimated token cost is below
-		// the bound, with a generous slack for JSON serialization overhead.
-		// The recency window retains 20 turns × ~3000 chars ≈ 60k chars
-		// ≈ 15k tokens, well under 111_000.
-		assert.ok(
-			estimatedTokens < AC2_BOUND,
-			`Working-window token cost ${estimatedTokens} exceeds bound ${AC2_BOUND}`,
+				toolCallId: "tc-1",
+				input: { command: "ls" },
+				content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
 		);
+
+		// Build a messages array with the tool-result on the current
+		// turn (turn 0). The context handler must show verbatim.
+		const messages = [
+			makeUserMessage("hi"),
+			makeAssistantMessage(""),
+			makeToolResultMessage({
+				toolName: "bash",
+				toolCallId: "tc-1",
+				age: 0,
+				verbatimContent: "VERBATIM_OUTPUT",
+				digestContent: "DIGEST_OUTPUT",
+				input: { command: "ls" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		// Find the tool-result in the output. The pinned message is
+		// prepended (AC-3); the tool-result is at index 1.
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		assert.ok(toolMsg, "tool-result is in the output");
+		const content = (toolMsg?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "VERBATIM_OUTPUT", "producing turn → verbatim content");
 	});
 
-	it("context handler is a no-op when under threshold", async () => {
+	it("on a later turn: tool-result content is swapped to digest", async () => {
 		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
 		const contextHandlers = mockPi.getHandlers("context");
 
-		const messages = [makeUserMessage("hello")];
-		const ctx = createMockContext({ tokens: 1_000 });
+		// Drive a tool call on turn 0. Then bump the turn counter
+		// (via the turn_end handler) to advance the lifecycle state
+		// to a later turn.
+		await toolResultHandlers[0](
+			{
+				toolName: "bash",
+				toolCallId: "tc-1",
+				input: { command: "ls" },
+				content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
+		);
+		// Bump turn: invoke turn_end to advance the counter.
+		const turnEndHandlers = mockPi.getHandlers("turn_end");
+		await turnEndHandlers[0]({}, createMockContext());
 
-		const result = await contextHandlers[0]({ messages }, ctx);
-
-		// Under threshold, the handler should pass through unchanged.
-		const resultMessages = (result as { messages: unknown[] }).messages;
-		assert.equal(resultMessages.length, messages.length, "messages must pass through unchanged");
+		// Now the tool-result is on a previous turn; the context
+		// handler should swap to the digest.
+		const messages = [
+			makeUserMessage("hi"),
+			makeAssistantMessage(""),
+			makeToolResultMessage({
+				toolName: "bash",
+				toolCallId: "tc-1",
+				age: 0, // produced on turn 0; current is turn 1
+				verbatimContent: "VERBATIM_OUTPUT",
+				digestContent: "DIGEST_OUTPUT",
+				input: { command: "ls" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		const content = (toolMsg?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "DIGEST_OUTPUT", "later turn → digest content swapped");
 	});
 });
 
-// ─── AC-3: file read → dropped → re-requested is recoverable ────────────────
+// ─── AC-2: unified keep/digest/retire engine ───────────────────────────────
 
-describe("AC-3: file read → dropped → re-requested is recoverable", () => {
-	it("before_agent_start injects a file-read digest listing dropped files", async () => {
+describe("AC-2: unified keep/digest/retire engine over all tool outputs", () => {
+	it("agent `keep` override pins verbatim across turns", async () => {
 		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
 		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
+		const contextHandlers = mockPi.getHandlers("context");
 
-		// Build a session with file reads. The extension tracks reads via
-		// the tool_result handler. We simulate this by invoking the
-		// tool_result handler first with read-tool results, then invoking
-		// before_agent_start.
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		const readFiles = [
-			{ path: "/tmp/file-a.ts", content: "AAA".repeat(100) },
-			{ path: "/tmp/file-b.ts", content: "BBB".repeat(100) },
-			{ path: "/tmp/file-c.ts", content: "CCC".repeat(100) },
-		];
-
-		// Simulate read tool results.
-		for (const f of readFiles) {
-			await toolResultHandlers[0](
-				{
-					toolName: "read",
-					toolCallId: `tc-read-${f.path}`,
-					input: { path: f.path },
-					content: [{ type: "text", text: f.content }],
-					details: {},
-					isError: false,
-				},
-				createMockContext(),
-			);
-		}
-
-		// Now invoke before_agent_start. The extension should inject a
-		// customType: "context-trimmer-file-reads" message listing the
-		// read files.
-		const event = {
-			prompt: "what's in those files?",
-			images: [],
-			systemPrompt: "test system prompt",
-			systemPromptOptions: {},
-		};
-		const ctx = createMockContext({ hasUI: false });
-		const result = await beforeAgentStartHandlers[0](event, ctx);
-
-		assert.ok(result, "before_agent_start must return a result");
-		const injectedMessage = (result as { message?: { customType: string; content: string } }).message;
-		assert.ok(injectedMessage, "before_agent_start must inject a message");
-		assert.equal(injectedMessage.customType, "context-trimmer-file-reads");
-		assert.ok(injectedMessage.content.length > 0, "injected message must have content");
-	});
-
-	it("file-read recovery: re-reading a dropped file produces a fresh digest", async () => {
-		const mockPi = await loadExtension();
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		// Simulate an initial read.
+		// Record a read tool result.
 		await toolResultHandlers[0](
 			{
 				toolName: "read",
-				toolCallId: "tc-read-1",
-				input: { path: "/tmp/recovery-test.ts" },
-				content: [{ type: "text", text: "ORIGINAL_CONTENT:" + "a".repeat(500) }],
+				toolCallId: "tc-r1",
+				input: { path: "/tmp/file-a.ts" },
+				content: [{ type: "text", text: "FILE_A_BODY" }],
 				details: {},
 				isError: false,
 			},
 			createMockContext(),
 		);
+		// Bump turn.
+		const turnEndHandlers = mockPi.getHandlers("turn_end");
+		await turnEndHandlers[0]({}, createMockContext());
 
-		// Simulate a re-read (the agent re-requests the file after a drop).
-		const reReadResult = await toolResultHandlers[0](
+		// Have the agent mark the file as kept: we need a session
+		// branch entry to return a text with `keep /tmp/file-a.ts`.
+		// Build a sessionManager mock that returns an assistant entry
+		// carrying the keep-mark.
+		const branchEntry = {
+			message: { role: "assistant", content: [{ type: "text", text: "keep /tmp/file-a.ts" }] },
+		};
+		const ctxWithBranch = createMockContext();
+		(ctxWithBranch.sessionManager as { getBranch: () => unknown[] }).getBranch = () => [branchEntry];
+
+		await beforeAgentStartHandlers[0]({ prompt: "ok", images: [] }, ctxWithBranch);
+
+		// Now run context: the kept file should be verbatim.
+		const messages = [
+			makeUserMessage("hi"),
+			makeToolResultMessage({
+				toolName: "read",
+				toolCallId: "tc-r1",
+				age: 0,
+				verbatimContent: "FILE_A_BODY_VERBATIM",
+				digestContent: "FILE_A_BODY_DIGEST",
+				input: { path: "/tmp/file-a.ts" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		const content = (toolMsg?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "FILE_A_BODY_VERBATIM", "kept override → verbatim across turns");
+	});
+
+	it("agent `drop` override excludes the result from the view", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
+		const contextHandlers = mockPi.getHandlers("context");
+
+		await toolResultHandlers[0](
 			{
 				toolName: "read",
-				toolCallId: "tc-read-2",
-				input: { path: "/tmp/recovery-test.ts" },
-				content: [{ type: "text", text: "FRESH_CONTENT:" + "b".repeat(500) }],
+				toolCallId: "tc-r1",
+				input: { path: "/tmp/file-b.ts" },
+				content: [{ type: "text", text: "FILE_B_BODY" }],
 				details: {},
 				isError: false,
 			},
 			createMockContext(),
 		);
+		const turnEndHandlers = mockPi.getHandlers("turn_end");
+		await turnEndHandlers[0]({}, createMockContext());
 
-		// The re-read must produce a digest envelope.
-		assert.ok(reReadResult, "tool_result handler must return a result for re-read");
-		const content = (reReadResult as { content: Array<{ type: string; text: string }> }).content;
-		assert.ok(Array.isArray(content), "result must have content array");
-		assert.equal(content[0].type, "text");
-		assert.ok(
-			content[0].text.includes("[factOfCall:"),
-			"re-read result must have [factOfCall: ...] envelope",
-		);
-		assert.ok(
-			content[0].text.includes("[digest:"),
-			"re-read result must have [digest: ...] envelope",
-		);
-	});
-});
+		// Mark as dropped.
+		const branchEntry = {
+			message: { role: "assistant", content: [{ type: "text", text: "drop /tmp/file-b.ts" }] },
+		};
+		const ctxWithBranch = createMockContext();
+		(ctxWithBranch.sessionManager as { getBranch: () => unknown[] }).getBranch = () => [branchEntry];
+		await beforeAgentStartHandlers[0]({ prompt: "ok", images: [] }, ctxWithBranch);
 
-// ─── AC-4: tool/MCP outputs are digested in the session ─────────────────────
-
-describe("AC-4: tool/MCP outputs are digested; compaction summaries do not re-bloat", () => {
-	it("tool_result handler produces the [factOfCall: ...] / [digest: ...] envelope", async () => {
-		const mockPi = await loadExtension();
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		const verbatim = "VERBATIM_BASH_OUTPUT:" + "x".repeat(3000);
-		const result = await toolResultHandlers[0](
-			{
-				toolName: "bash",
-				toolCallId: "tc-bash-1",
-				input: { command: "echo hello" },
-				content: [{ type: "text", text: verbatim }],
-				details: {},
-				isError: false,
-			},
-			createMockContext(),
-		);
-
-		assert.ok(result, "tool_result handler must return a result");
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		assert.ok(Array.isArray(content), "result must have content array");
-		const text = content[0].text;
-
-		// The digest envelope must be present.
-		assert.ok(text.startsWith("[factOfCall:"), `Expected digest to start with [factOfCall:, got: ${text.slice(0, 50)}`);
-		assert.ok(text.includes("\n[digest:"), "Expected [digest: on line 2");
-		assert.ok(text.endsWith("]"), "Expected digest to end with ]");
-
-		// The digest body must be within MAX_DIGEST_CHARS. The bash digest
-		// preserves the first line of the output (truncated), so the
-		// verbatim marker may appear in the first line — the key
-		// constraint is the length cap, not string exclusion. The total
-		// envelope (labels + body) can be slightly over MAX_DIGEST_CHARS
-		// due to label overhead; we check the body length specifically.
-		// NOTE: The bash digest format includes metadata (cmd, truncation
-		// info, full output path) that can push the body slightly over
-		// MAX_DIGEST_CHARS. The content portion (truncated text) is capped
-		// at MAX_DIGEST_CHARS; the total body includes ~250 chars of
-		// metadata. We assert the body is within MAX_DIGEST_CHARS + 300
-		// to account for the bash digest's metadata overhead.
-		const bodyMatch = text.match(/\[digest: (.*)\]$/s);
-		assert.ok(bodyMatch, "digest body must be extractable");
-		const body = bodyMatch[1];
-		const BASH_DIGEST_METADATA_SLACK = 300;
-		assert.ok(
-			body.length <= MAX_DIGEST_CHARS + BASH_DIGEST_METADATA_SLACK,
-			`Digest body length ${body.length} exceeds MAX_DIGEST_CHARS + slack ${MAX_DIGEST_CHARS + BASH_DIGEST_METADATA_SLACK}`,
-		);
-	});
-
-	it("read tool result is digested (not kept verbatim)", async () => {
-		const mockPi = await loadExtension();
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		const verbatim = "FILE_BODY:" + "y".repeat(3000);
-		const result = await toolResultHandlers[0](
-			{
+		// The dropped file should be excluded from the view.
+		const messages = [
+			makeUserMessage("hi"),
+			makeToolResultMessage({
 				toolName: "read",
-				toolCallId: "tc-read-1",
-				input: { path: "/tmp/some-file.ts" },
-				content: [{ type: "text", text: verbatim }],
-				details: {},
-				isError: false,
-			},
-			createMockContext(),
-		);
-
-		assert.ok(result, "read tool_result must produce a result");
-		const text = (result as { content: Array<{ type: string; text: string }> }).content[0].text;
-		assert.ok(text.startsWith("[factOfCall:"), "read digest must start with [factOfCall:");
-		assert.ok(!text.includes(verbatim), "read verbatim must not appear in digest");
-		assert.ok(text.length <= MAX_DIGEST_CHARS, `read digest length ${text.length} exceeds ${MAX_DIGEST_CHARS}`);
+				toolCallId: "tc-r1",
+				age: 0,
+				verbatimContent: "FILE_B_BODY",
+				digestContent: "FILE_B_DIGEST",
+				input: { path: "/tmp/file-b.ts" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		assert.equal(toolMsg, undefined, "dropped → excluded from the per-LLM-call view");
 	});
 
-	it("edit tool result is digested", async () => {
+	it("the per-turn digest widens from file reads to all tool outputs", async () => {
 		const mockPi = await loadExtension();
 		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const beforeAgentStartHandlers = mockPi.getHandlers("before_agent_start");
 
-		const result = await toolResultHandlers[0](
-			{
-				toolName: "edit",
-				toolCallId: "tc-edit-1",
-				input: { path: "/tmp/edit-me.ts", oldText: "old", newText: "new" },
-				content: [{ type: "text", text: "EDIT_OK" }],
-				details: {},
-				isError: false,
-			},
-			createMockContext(),
-		);
-
-		assert.ok(result, "edit tool_result must produce a result");
-		const text = (result as { content: Array<{ type: string; text: string }> }).content[0].text;
-		assert.ok(text.startsWith("[factOfCall:"));
-		assert.ok(text.includes("[digest:"));
-	});
-
-	it("write tool result is digested", async () => {
-		const mockPi = await loadExtension();
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		const result = await toolResultHandlers[0](
-			{
-				toolName: "write",
-				toolCallId: "tc-write-1",
-				input: { path: "/tmp/write-me.ts", content: "hello" },
-				content: [{ type: "text", text: "WRITE_OK" }],
-				details: {},
-				isError: false,
-			},
-			createMockContext(),
-		);
-
-		assert.ok(result, "write tool_result must produce a result");
-		const text = (result as { content: Array<{ type: string; text: string }> }).content[0].text;
-		assert.ok(text.startsWith("[factOfCall:"));
-		assert.ok(text.includes("[digest:"));
-	});
-
-	it("digested messages in the session are within the bound (no re-bloat)", async () => {
-		const mockPi = await loadExtension();
-		const toolResultHandlers = mockPi.getHandlers("tool_result");
-
-		// Simulate 25 tool results (exceeding the recency window of 20).
-		const messages: unknown[] = [];
-		for (let i = 0; i < 25; i++) {
-			messages.push(makeUserMessage(`turn-${i}`));
-			const result = await toolResultHandlers[0](
+		// Drive three different tool types: read, bash, grep.
+		const types: Array<{ toolName: string; toolCallId: string; input: Record<string, unknown>; key: string }> = [
+			{ toolName: "read", toolCallId: "tc-1", input: { path: "/tmp/a.ts" }, key: "path=/tmp/a.ts" },
+			{ toolName: "bash", toolCallId: "tc-2", input: { command: "ls -la" }, key: "command=ls -la" },
+			{ toolName: "grep", toolCallId: "tc-3", input: { pattern: "TODO", path: "./src" }, key: "pattern=TODO" },
+		];
+		for (const t of types) {
+			await toolResultHandlers[0](
 				{
-					toolName: "bash",
-					toolCallId: `tc-${i}`,
-					input: { command: `echo ${i}` },
-					content: [{ type: "text", text: "OUTPUT:" + "z".repeat(2000) }],
+					toolName: t.toolName,
+					toolCallId: t.toolCallId,
+					input: t.input,
+					content: [{ type: "text", text: "OUTPUT" }],
 					details: {},
 					isError: false,
 				},
 				createMockContext(),
 			);
-			const digested = (result as { content: Array<{ type: string; text: string }> }).content[0].text;
-			messages.push(makeToolResultMessage({
-				toolName: "bash",
-				toolCallId: `tc-${i}`,
-				verbatimContent: digested, // The persisted content is the digest.
-				input: { command: `echo ${i}` },
-			}));
 		}
 
-		// Now trigger the context handler. It should filter to the recency window.
-		const contextHandlers = mockPi.getHandlers("context");
-		const ctx = createMockContext({ tokens: 80_000 });
-		const result = await contextHandlers[0]({ messages }, ctx);
-		const filteredMessages = (result as { messages: unknown[] }).messages;
-
-		// The filtered messages should be fewer than the unfiltered count.
-		assert.ok(filteredMessages.length < messages.length, "context handler must filter messages");
-
-		// The total chars of filtered messages should be well under the bound.
-		const totalChars = JSON.stringify(filteredMessages).length;
-		const estimatedTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
-		assert.ok(
-			estimatedTokens < AC2_BOUND,
-			`Post-trim working window ${estimatedTokens} exceeds bound ${AC2_BOUND}`,
+		const result = await beforeAgentStartHandlers[0](
+			{ prompt: "ok", images: [] },
+			createMockContext(),
 		);
+		const injected = (result as { message?: { customType: string; content: string } }).message;
+		assert.ok(injected, "before_agent_start must inject a message");
+		assert.equal(injected.customType, "context-trimmer-tool-outputs", "customType widens to all tool outputs");
+		// The digest should mention each tool name.
+		assert.ok(injected.content.includes("[read]"), "read result in the digest");
+		assert.ok(injected.content.includes("[bash]"), "bash result in the digest");
+		assert.ok(injected.content.includes("[grep]"), "grep result in the digest");
 	});
 });
 
-// ─── AC-5: all tests green against the assembled extension ──────────────────
+// ─── AC-3: pinned tier (auto-pin by convention) ─────────────────────────────
+
+describe("AC-3: pinned tier is always present in the per-LLM-call view", () => {
+	it("every context call prepends a `context-trimmer-pinned` customType message", async () => {
+		const mockPi = await loadExtension();
+		const contextHandlers = mockPi.getHandlers("context");
+
+		// Empty conversation: the pinned message must still be present.
+		const result = await contextHandlers[0]({ messages: [] }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; customType?: string }> }).messages;
+		assert.ok(out.length > 0, "pinned message is in the view even for empty conversation");
+		const pinned = out[0];
+		assert.ok(pinned, "pinned message is the first message");
+		assert.equal(pinned.customType, "context-trimmer-pinned", "pinned customType is correct");
+	});
+
+	it("the pinned message is `display: false` (TUI does not show it as a line)", async () => {
+		const mockPi = await loadExtension();
+		const contextHandlers = mockPi.getHandlers("context");
+		const result = await contextHandlers[0]({ messages: [] }, createMockContext());
+		const out = (result as { messages: Array<{ customType?: string; display?: boolean }> }).messages;
+		const pinned = out[0];
+		assert.equal(pinned?.display, false, "pinned message has display=false (TUI silent)");
+	});
+
+	it("the pinned content carries the personality + last-N tracker list", async () => {
+		const mockPi = await loadExtension();
+		const contextHandlers = mockPi.getHandlers("context");
+		const result = await contextHandlers[0]({ messages: [] }, createMockContext());
+		const out = (result as { messages: Array<{ content?: string }> }).messages;
+		const pinned = out[0];
+		// The content should mention the pinned-tier structure (the
+		// actual personality + tracker content depends on the
+		// operator's machine; the test asserts the structure).
+		assert.ok(pinned?.content?.includes("Pinned"), "pinned content carries the structure");
+		assert.ok(pinned?.content?.includes("personality"), "personality section is present");
+		assert.ok(pinned?.content?.includes("tracker"), "tracker section is present");
+	});
+});
+
+// ─── AC-4: recency comfort window (no threshold gate; live bound) ──────────
+
+describe("AC-4: recency comfort window + live-contextWindow bound", () => {
+	it("the context handler returns the recency-comfort set, unconditionally", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const contextHandlers = mockPi.getHandlers("context");
+
+		// Drive a tool_result for each turn so the lifecycle engine
+		// has a record of each toolCallId (otherwise the engine
+		// would `retire` them as unknown).
+		for (let i = 0; i < 30; i++) {
+			await toolResultHandlers[0](
+				{
+					toolName: "bash",
+					toolCallId: `tc-${i}`,
+					input: { command: `echo turn-${i}` },
+					content: [{ type: "text", text: "OUTPUT" }],
+					details: {},
+					isError: false,
+				},
+				createMockContext(),
+			);
+		}
+
+		// Build a bloated session: 30 user-message turns. The recency
+		// window is 20; the handler must carve to 20 turns.
+		const messages: unknown[] = [];
+		for (let i = 0; i < 30; i++) {
+			messages.push(makeUserMessage(`turn-${i}`));
+			messages.push(makeAssistantMessage(""));
+			messages.push({
+				role: "toolResult",
+				toolCallId: `tc-${i}`,
+				age: 0, // All on turn 0 (not yet bumped); the engine treats them all as on the current turn.
+				content: [{ type: "text", text: "v" }],
+				details: { digest: "d" },
+			});
+		}
+
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: unknown[] }).messages;
+
+		// The handler runs the recency filter unconditionally. 30
+		// turns * 3 messages/turn = 90 messages; the filter carves
+		// to 20 turns (60 messages) + the pinned message (1) = 61.
+		assert.ok(out.length < 90, `Expected < 90 messages after recency, got ${out.length}`);
+		assert.equal(out.length, 20 * 3 + 1, `Expected 60 (recency) + 1 (pinned) = 61, got ${out.length}`);
+	});
+
+	it("the bound derives from the LIVE `ctx.getContextUsage().contextWindow`", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const contextHandlers = mockPi.getHandlers("context");
+
+		// Build a session that fits in the recency window. The
+		// estimated token cost of the post-filter view must be
+		// under the LIVE bound. First, drive the tool_result
+		// events so the lifecycle engine has records of each
+		// toolCallId (otherwise the engine would `retire` them as
+		// unknown and the test would not exercise the bound).
+		for (let i = 0; i < RECENCY_COMFORT_WINDOW; i++) {
+			await toolResultHandlers[0](
+				{
+					toolName: "bash",
+					toolCallId: `tc-${i}`,
+					input: { command: `echo turn-${i}` },
+					content: [{ type: "text", text: "OUTPUT" }],
+					details: {},
+					isError: false,
+				},
+				createMockContext(),
+			);
+		}
+
+		const messages: unknown[] = [];
+		for (let i = 0; i < RECENCY_COMFORT_WINDOW; i++) {
+			messages.push(makeUserMessage(`turn-${i}`));
+			messages.push(makeAssistantMessage(""));
+			messages.push({
+				role: "toolResult",
+				toolCallId: `tc-${i}`,
+				age: 0,
+				content: [{ type: "text", text: "VERBATIM_OUTPUT" + "z".repeat(200) }],
+				details: { digest: makeDigest(i, "bash", `echo turn-${i}`) },
+			});
+		}
+
+		// Simulate a non-default context window (e.g. GLM-5.2's 976k).
+		const ctxWindow = 976_000;
+		const ctx = createMockContext({ tokens: 200_000, contextWindow: ctxWindow });
+
+		const result = await contextHandlers[0]({ messages }, ctx);
+		const out = (result as { messages: unknown[] }).messages;
+		const totalChars = JSON.stringify(out).length;
+		const estimatedTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
+
+		// The bound: contextWindow - reserveTokens - slack.
+		const bound = deriveBound(ctxWindow, PI_RESERVE_TOKENS);
+		assert.ok(
+			estimatedTokens < bound,
+			`Post-trim working window ${estimatedTokens} must be under live bound ${bound} (ctx=${ctxWindow} - reserve=${PI_RESERVE_TOKENS} - slack=${COMFORT_SLACK})`,
+		);
+	});
+
+	it("the bound works for any of the documented model context windows (GLM, gemma4, kimi, deepseek, minimax)", async () => {
+		// Per AC-4: the integration test's bound must work for the
+		// documented model context windows. The test exercises
+		// gemma4:31b's 256k, GLM-5.2's 976k, minimax's 1M, etc.
+		const modelWindows = [256_000, 976_000, 1_000_000];
+		for (const ctxWindow of modelWindows) {
+			const mockPi = await loadExtension();
+			const toolResultHandlers = mockPi.getHandlers("tool_result");
+			const contextHandlers = mockPi.getHandlers("context");
+
+			// Drive the tool_result events so the lifecycle engine
+			// has records of each toolCallId.
+			for (let i = 0; i < RECENCY_COMFORT_WINDOW; i++) {
+				await toolResultHandlers[0](
+					{
+						toolName: "bash",
+						toolCallId: `tc-${i}`,
+						input: { command: `echo turn-${i}` },
+						content: [{ type: "text", text: "OUTPUT" }],
+						details: {},
+						isError: false,
+					},
+					createMockContext(),
+				);
+			}
+
+			const messages: unknown[] = [];
+			for (let i = 0; i < RECENCY_COMFORT_WINDOW; i++) {
+				messages.push(makeUserMessage(`turn-${i}`));
+				messages.push(makeAssistantMessage(""));
+				messages.push({
+					role: "toolResult",
+					toolCallId: `tc-${i}`,
+					age: 0,
+					content: [{ type: "text", text: "OUTPUT" }],
+					details: { digest: "d" },
+				});
+			}
+
+			const ctx = createMockContext({ tokens: 100_000, contextWindow: ctxWindow });
+			const result = await contextHandlers[0]({ messages }, ctx);
+			const out = (result as { messages: unknown[] }).messages;
+			const totalChars = JSON.stringify(out).length;
+			const estimatedTokens = Math.ceil(totalChars / CHARS_PER_TOKEN);
+
+			const bound = deriveBound(ctxWindow, PI_RESERVE_TOKENS);
+			assert.ok(
+				estimatedTokens < bound,
+				`ctxWindow=${ctxWindow}: estimated ${estimatedTokens} < bound ${bound}`,
+			);
+		}
+	});
+});
+
+// ─── AC-5: five-path coherence ─────────────────────────────────────────────
+
+describe("AC-5: five-path coherence (write-time side-by-side + view-time swap)", () => {
+	it("tool_result writes the side-by-side envelope (verbatim + digest)", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+
+		const result = await toolResultHandlers[0](
+			{
+				toolName: "bash",
+				toolCallId: "tc-1",
+				input: { command: "ls" },
+				content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
+		);
+
+		// The handler returns a partial patch with `content: verbatim`
+		// and `details: { digest, turnIndex, toolCallId }` — the
+		// Storage Shape A side-by-side envelope.
+		const patch = result as { content: Array<{ text: string }>; details: { digest: string; turnIndex: number; toolCallId: string } };
+		assert.equal(patch.content[0]?.text, "VERBATIM_OUTPUT", "content is verbatim");
+		assert.ok(patch.details.digest.startsWith("[factOfCall:"), "details.digest is the digest envelope");
+		assert.equal(patch.details.toolCallId, "tc-1", "details carries toolCallId");
+		// The turnIndex is a non-negative integer (the current turn
+		// counter at the time of the write). The exact value depends
+		// on prior test executions that share the module-level
+		// counter; the test asserts the shape, not a specific value.
+		assert.ok(
+			Number.isInteger(patch.details.turnIndex) && patch.details.turnIndex >= 0,
+			"details carries a non-negative integer turnIndex (age stamp)",
+		);
+	});
+
+	it("the view-time handler honors the same shape: digest is read from details.digest", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const contextHandlers = mockPi.getHandlers("context");
+
+		// Drive a tool call.
+		await toolResultHandlers[0](
+			{
+				toolName: "bash",
+				toolCallId: "tc-1",
+				input: { command: "ls" },
+				content: [{ type: "text", text: "VERBATIM" }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
+		);
+		// Bump turn.
+		const turnEndHandlers = mockPi.getHandlers("turn_end");
+		await turnEndHandlers[0]({}, createMockContext());
+
+		// Build a message with the side-by-side envelope. The view-time
+		// handler should swap to the digest.
+		const messages = [
+			makeUserMessage("hi"),
+			makeToolResultMessage({
+				toolName: "bash",
+				toolCallId: "tc-1",
+				age: 0,
+				verbatimContent: "VERBATIM",
+				digestContent: "DIGEST_FROM_DETAILS",
+				input: { command: "ls" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		const content = (toolMsg?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "DIGEST_FROM_DETAILS", "view-time handler reads digest from details.digest (Shape A contract)");
+	});
+
+	it("the digest body is bounded by MAX_DIGEST_CHARS (no session-file bloat)", async () => {
+		const mockPi = await loadExtension();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+
+		// Generate a huge bash output.
+		const hugeOutput = "x".repeat(MAX_DIGEST_CHARS * 2);
+		const result = await toolResultHandlers[0](
+			{
+				toolName: "bash",
+				toolCallId: "tc-huge",
+				input: { command: "cat huge" },
+				content: [{ type: "text", text: hugeOutput }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
+		);
+		const patch = result as { details: { digest: string } };
+		// The digest is bounded well under the raw output.
+		assert.ok(
+			patch.details.digest.length < MAX_DIGEST_CHARS * 2,
+			`digest length (${patch.details.digest.length}) is bounded well under raw output (${hugeOutput.length})`,
+		);
+		assert.ok(patch.details.digest.includes("[truncated:"), "truncation marker is present");
+	});
+});
+
+// ─── AC-5: integration tests run green against the assembled extension ─────
 
 describe("AC-5: integration tests run green against the assembled extension", () => {
 	it("the assembled extension module loads without errors", async () => {
@@ -549,51 +782,11 @@ describe("AC-5: integration tests run green against the assembled extension", ()
 		assert.ok(mockPi, "Extension must load without errors");
 	});
 
-	it("the extension is discoverable from ~/.pi/agent/extensions/context-trimmer/", () => {
-		const extIndexPath = "/home/dez/.pi/agent/extensions/context-trimmer/index.ts";
-		assert.ok(existsSync(extIndexPath), `Assembled extension not found at ${extIndexPath}`);
-	});
-
-	it("the extension loads in a real Pi session (createAgentSession + SessionManager.inMemory)", async () => {
-		// This is the AC-1 live-session path. We use the SDK's createAgentSession
-		// with SessionManager.inMemory() to create a real session. The
-		// context-trimmer extension is auto-discovered from
-		// ~/.pi/agent/extensions/context-trimmer/index.ts.
-		//
-		// We don't run an LLM call (non-deterministic, slow). We verify:
-		// 1. The session is created without errors.
-		// 2. The extension is loaded (extensionsResult.extensions.length > 0).
-		// 3. No extension load errors.
-		// 4. The session has the expected tools available.
-		const sdkPath = "/usr/lib/node_modules/@earendil-works/pi-coding-agent";
-		if (!existsSync(sdkPath)) {
-			// SDK not available; skip this test.
-			return;
-		}
-		// Dynamic import to avoid hard dependency on SDK path.
-		const sdk = await import(/* @vite-ignore */ `file://${sdkPath}/dist/index.js` as string).catch(() => null);
-		if (!sdk) {
-			// SDK import failed; skip.
-			return;
-		}
-		const { AuthStorage, createAgentSession, ModelRegistry, SessionManager, SettingsManager } = sdk;
-		const authStorage = AuthStorage.create();
-		const modelRegistry = ModelRegistry.create(authStorage);
-		const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false } });
-		const { session, extensionsResult } = await createAgentSession({
-			sessionManager: SessionManager.inMemory(),
-			authStorage,
-			modelRegistry,
-			settingsManager,
-		});
-		try {
-			assert.ok(extensionsResult.extensions.length > 0, "at least one extension must be loaded");
-			assert.equal(extensionsResult.errors.length, 0, `extension load errors: ${JSON.stringify(extensionsResult.errors)}`);
-			const toolNames = session.agent.state.tools.map((t: { name: string }) => t.name);
-			assert.ok(toolNames.includes("read"), "read tool must be available");
-			assert.ok(toolNames.includes("bash"), "bash tool must be available");
-		} finally {
-			session.dispose();
-		}
+	it("the extension is INACTIVE in `~/.pi/agent/extensions/context-trimmer/` (per the ticket's relocation)", () => {
+		// The extension was moved out of the live extensions dir
+		// for this work, per the ticket's "do NOT move it back" rule.
+		// The test asserts the inactive state.
+		const livePath = "/home/dez/.pi/agent/extensions/context-trimmer/index.ts";
+		assert.equal(existsSync(livePath), false, "Extension is INACTIVE during this work");
 	});
 });

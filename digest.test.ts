@@ -1,32 +1,35 @@
 /**
- * T-2707 — Digest + keep-mark unit tests.
+ * T-2717 — Digest + lifecycle unit tests.
  *
  * Runner: Node's built-in `node:test` (no project install required).
- * Run: `npx tsx --test /home/dez/.pi/agent/extensions/context-trimmer/digest.test.ts`
+ * Run: `node --experimental-strip-types --test digest.test.ts`
  *
- * The tests cover the two pure-logic modules T-2707 ships:
+ * The tests cover the two pure-logic modules T-2717 ships at the
+ * digest + lifecycle layer:
  *   - `digest.ts` — the `[factOfCall: ...]\n[digest: ...]` envelope
- *     (AC-4 stability contract) and the per-tool-type digest content
- *     (AC-1 full-tool-surface coverage).
- *   - `keep-mark.ts` — the file-read tracking, the keep-mark parser,
- *     the opt-in default, and the `promoteKeptToolResults` integration
- *     helper T-2706 reads.
+ *     (stability contract; the envelope is what the lifecycle engine
+ *     stores in `details.digest` and the view-time handler swaps into
+ *     the per-LLM-call view on later turns).
+ *   - `lifecycle-state.ts` — the unified keep/digest/retire engine
+ *     over all tool outputs (replaces the T-2707 `keep-mark.ts`
+ *     file-read-only surface). Covers state, the parser, the
+ *     apply-at-view-time engine, and the side-by-side envelope
+ *     writer (`buildToolResultEnvelope`).
  *
- * The test file is structurally separate from `policy.test.ts` (T-2705)
- * but reuses the same describe/it/assert style for consistency. The
- * shared test-runner invocation is the same `node:test` shape — the
- * two files can be run together with `npx tsx --test *.test.ts`.
+ * The test file is structurally separate from `policy.test.ts` and
+ * `integration.test.ts` but reuses the same describe/it/assert style
+ * for consistency.
  *
- * NOT tested here (T-2708 owns):
+ * NOT tested here (`integration.test.ts` owns):
  *   - The `tool_result` handler wiring in `index.ts` (a live Pi
  *     session is required to exercise the event flow end-to-end).
- *   - The `before_agent_start` handler's keep-mark observation.
- *   - The `session_start` / `session_shutdown` reset lifecycle.
- *   - The integration with the policy's `context` handler at the
- *     per-LLM-call view level.
+ *   - The `context` handler's view-time age-scope + lifecycle
+ *     composition.
+ *   - The pinned-tier injection.
+ *   - The session-persistence path (the compactor's view).
  *
  * These are unit tests of the pure-logic surface; the live-session
- * tests are T-2708's scope per the AC bundle's test-coverage notes.
+ * tests are `integration.test.ts`'s scope.
  */
 
 import { describe, it } from "node:test";
@@ -34,7 +37,6 @@ import assert from "node:assert/strict";
 
 import {
 	digestToolResult,
-	digestToolResultPatch,
 	MAX_DIGEST_CHARS,
 	FACT_OF_CALL_LABEL,
 	DIGEST_LABEL,
@@ -42,12 +44,13 @@ import {
 	type DigestibleToolResult,
 } from "./digest.ts";
 import {
-	createKeepMarkState,
-	parseKeepMarksFromText,
-	promoteKeptToolResults,
-	buildFileReadDigest,
-	type ToolResultMessage,
-} from "./keep-mark.ts";
+	createLifecycleState,
+	parseLifecycleMarksFromText,
+	applyLifecycleState,
+	buildToolOutputDigest,
+	buildToolResultEnvelope,
+	type LifecycleMessage,
+} from "./lifecycle-state.ts";
 
 // ─── Test helpers ──────────────────────────────────────────────────────────
 
@@ -61,9 +64,9 @@ function imageContent(): DigestibleToolResult["content"] {
 	return [{ type: "image", source: { data: "<bytes>" } }];
 }
 
-// ─── digest.ts — AC-4 format stability ─────────────────────────────────────
+// ─── digest.ts — format stability ──────────────────────────────────────────
 
-describe("AC-4 — digest format is named and stable", () => {
+describe("digest — format is named and stable", () => {
 	it("the envelope uses the [factOfCall: ...] / [digest: ...] labels", () => {
 		const result = digestToolResult({
 			toolName: "bash",
@@ -93,9 +96,9 @@ describe("AC-4 — digest format is named and stable", () => {
 		);
 	});
 
-	it("exports the four AC-4 surface constants (label strings are Hyrum's-Law contracts)", () => {
+	it("exports the format surface constants (label strings are Hyrum's-Law contracts)", () => {
 		// Pin the constants verbatim. A rename is a breaking change for
-		// the compactor + tests; the constants are the contract.
+		// the agent + tests; the constants are the contract.
 		assert.equal(FACT_OF_CALL_LABEL, "[factOfCall:", "FACT_OF_CALL_LABEL is the bracketed prefix");
 		assert.equal(DIGEST_LABEL, "[digest:", "DIGEST_LABEL is the bracketed prefix");
 		assert.equal(LABEL_CLOSE, "]", "LABEL_CLOSE is the closing bracket");
@@ -119,9 +122,9 @@ describe("AC-4 — digest format is named and stable", () => {
 	});
 });
 
-// ─── digest.ts — per-tool-type digest content (AC-1) ──────────────────────
+// ─── digest.ts — per-tool-type digest content ──────────────────────────────
 
-describe("AC-1 — full tool surface coverage", () => {
+describe("digest — full tool surface coverage", () => {
 	it("bash digest names the command and the first line of output", () => {
 		const result = digestToolResult({
 			toolName: "bash",
@@ -290,9 +293,9 @@ describe("AC-1 — full tool surface coverage", () => {
 	});
 });
 
-// ─── digest.ts — length budget (AC-4) ──────────────────────────────────────
+// ─── digest.ts — length budget ─────────────────────────────────────────────
 
-describe("AC-4 — digest length budget", () => {
+describe("digest — length budget", () => {
 	it("the digest body respects MAX_DIGEST_CHARS (truncated marker when exceeded)", () => {
 		// Build a huge bash output.
 		const hugeOutput = "x".repeat(MAX_DIGEST_CHARS * 2);
@@ -316,231 +319,278 @@ describe("AC-4 — digest length budget", () => {
 	});
 });
 
-// ─── digest.ts — partial-patch return shape ───────────────────────────────
+// ─── lifecycle-state.ts — state factory ────────────────────────────────────
 
-describe("AC-1 — partial-patch return contract", () => {
-	it("digestToolResultPatch returns the { content: TextContent[] } shape", () => {
-		const patch = digestToolResultPatch({
-			toolName: "bash",
-			toolCallId: "patch-1",
-			input: { command: "ls" },
-			content: textContent("a.txt"),
-			isError: false,
-		});
-		assert.ok(Array.isArray(patch.content), "patch.content is an array");
-		assert.equal(patch.content.length, 1, "patch.content is a single text block");
-		const block = patch.content[0];
-		assert.ok(block, "block exists");
-		assert.equal(block.type, "text", "block is a text content block");
-		assert.ok(
-			block.text.startsWith(FACT_OF_CALL_LABEL),
-			"block.text is the digest envelope",
-		);
-	});
-});
-
-// ─── keep-mark.ts — state factory (AC-2) ──────────────────────────────────
-
-describe("AC-2 — keep-mark state is opt-in by default", () => {
-	it("a newly recorded read is undecided (opt-in default: not in the keep-set)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/foo.ts", "call-1", 1);
-		// The map is opt-in: an absent entry means undecided. The
-		// effective behavior is "drop" because `getKeptToolCallIds`
-		// does not return undecided files. The test asserts both
-		// surfaces — the explicit getter and the effective behavior.
-		assert.equal(state.getKeepMark("/foo.ts"), null, "undecided → no entry (absent, not 'drop')");
-		assert.equal(state.getKeptToolCallIds().size, 0, "undecided files are not in the kept set (effective 'drop')");
+describe("lifecycle — state is the unified engine over all tool outputs", () => {
+	it("recordToolResult records every tool output with a unique toolCallId", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-r1", "/foo.ts", 1);
+		state.recordToolResult("bash", "tc-b1", "ls -la", 2);
+		state.recordToolResult("grep", "tc-g1", "TODO@./src", 3);
+		assert.equal(state.records.size, 3, "every tool output gets a record");
+		assert.equal(state.getRecord("tc-r1")?.toolName, "read", "read record is preserved");
+		assert.equal(state.getRecord("tc-b1")?.key, "ls -la", "bash key is the command");
+		assert.equal(state.getRecord("tc-g1")?.key, "TODO@./src", "grep key is pattern@path");
 	});
 
-	it("setKeepMark('keep') survives a getReadRecord round-trip", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/foo.ts", "call-1", 1);
-		state.setKeepMark("/foo.ts", "keep");
-		assert.equal(state.getKeepMark("/foo.ts"), "keep", "keep mark is set");
-		assert.equal(state.getReadRecord("/foo.ts")?.toolCallId, "call-1", "read record is preserved");
+	it("auto-state: verbatim on the producing turn, digest on later turns", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		// The current turn is 5: the tool was produced on turn 2,
+		// which is a previous turn → state is `digest`.
+		assert.equal(state.getLifecycleState("tc-1", 5), "digest", "prior turn → digest");
+		// On the producing turn (2): state is `verbatim`.
+		assert.equal(state.getLifecycleState("tc-1", 2), "verbatim", "producing turn → verbatim");
 	});
 
-	it("re-recording a read preserves the keep-mark (the agent's decision survives a re-read)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/foo.ts", "call-1", 1);
-		state.setKeepMark("/foo.ts", "keep");
-		state.recordRead("/foo.ts", "call-2", 5);
-		// The keep-mark survives the re-read; the toolCallId updates to
-		// the most recent read.
-		assert.equal(state.getKeepMark("/foo.ts"), "keep", "keep mark survives re-read");
-		assert.equal(state.getReadRecord("/foo.ts")?.toolCallId, "call-2", "toolCallId updates to most recent read");
+	it("agent `kept` override pins state at `kept` regardless of age", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.setLifecycleOverride("tc-1", "kept");
+		assert.equal(state.getLifecycleState("tc-1", 5), "kept", "kept override pins state regardless of turn");
+		assert.equal(state.getLifecycleState("tc-1", 2), "kept", "kept override pins state on producing turn too");
+		assert.equal(state.getKeptToolCallIds().size, 1, "kept set is populated");
 	});
 
-	it("resetSession clears both reads and keep-marks (session-scope contract)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/foo.ts", "call-1", 1);
-		state.setKeepMark("/foo.ts", "keep");
+	it("agent `dropped` override excludes the result from the per-LLM-call view", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.setLifecycleOverride("tc-1", "dropped");
+		assert.equal(state.getLifecycleState("tc-1", 5), "dropped", "dropped override excludes the result");
+		assert.equal(state.getLifecycleState("tc-1", 2), "dropped", "dropped override excludes on producing turn too");
+		assert.equal(state.getDroppedToolCallIds().size, 1, "dropped set is populated");
+	});
+
+	it("re-recording a tool result preserves the override (the agent's decision survives a re-run)", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.setLifecycleOverride("tc-1", "kept");
+		state.recordToolResult("read", "tc-1", "/foo.ts", 5);
+		// The override survives the re-record; the turn updates to 5.
+		assert.equal(state.getLifecycleState("tc-1", 5), "kept", "override survives re-record");
+		assert.equal(state.getRecord("tc-1")?.turnIndex, 5, "turnIndex updates to most recent record");
+	});
+
+	it("unknown toolCallId returns `retired` (excluded from the view)", () => {
+		const state = createLifecycleState();
+		assert.equal(state.getLifecycleState("unknown", 5), "retired", "unknown toolCallId → retired");
+	});
+
+	it("resetSession clears the records (session-scope contract)", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.setLifecycleOverride("tc-1", "kept");
 		state.resetSession();
-		assert.equal(state.getReadPaths().length, 0, "reads cleared");
-		assert.equal(state.getKeepMark("/foo.ts"), null, "keep-marks cleared");
+		assert.equal(state.records.size, 0, "records cleared on reset");
+		assert.equal(state.getKeptToolCallIds().size, 0, "kept set cleared on reset");
 	});
 });
 
-// ─── keep-mark.ts — parser (AC-2) ─────────────────────────────────────────
+// ─── lifecycle-state.ts — parser (AC-2 — agent keep/drop affordance) ───────
 
-describe("AC-2 — parseKeepMarksFromText", () => {
-	it("parses a bare 'keep <path>' pattern", () => {
+describe("lifecycle — parseLifecycleMarksFromText", () => {
+	it("parses a bare 'keep <key>' pattern", () => {
 		const known = new Set(["/foo.ts"]);
-		const result = parseKeepMarksFromText("I want to keep /foo.ts", known);
+		const result = parseLifecycleMarksFromText("I want to keep /foo.ts", known);
 		assert.equal(result.length, 1, "one mark parsed");
-		assert.equal(result[0]?.path, "/foo.ts", "path is /foo.ts");
-		assert.equal(result[0]?.decision, "keep", "decision is keep");
+		assert.equal(result[0]?.key, "/foo.ts", "key is /foo.ts");
+		assert.equal(result[0]?.override, "kept", "override is kept");
 	});
 
-	it("parses a bare 'drop <path>' pattern", () => {
+	it("parses a bare 'drop <key>' pattern", () => {
 		const known = new Set(["/foo.ts"]);
-		const result = parseKeepMarksFromText("drop /foo.ts please", known);
+		const result = parseLifecycleMarksFromText("drop /foo.ts please", known);
 		assert.equal(result.length, 1, "one mark parsed");
-		assert.equal(result[0]?.decision, "drop", "decision is drop");
+		assert.equal(result[0]?.override, "dropped", "override is dropped");
 	});
 
-	it("parses a quoted path", () => {
+	it("parses a quoted key (paths with spaces, bash commands with spaces)", () => {
 		const known = new Set(["/foo bar.ts"]);
-		const result = parseKeepMarksFromText('keep "/foo bar.ts"', known);
+		const result = parseLifecycleMarksFromText('keep "/foo bar.ts"', known);
 		assert.equal(result.length, 1, "one mark parsed");
-		assert.equal(result[0]?.path, "/foo bar.ts", "quoted path is parsed");
+		assert.equal(result[0]?.key, "/foo bar.ts", "quoted key is parsed");
 	});
 
-	it("ignores keep/drop for unknown paths (the read must happen first)", () => {
+	it("parses a bash-command key (the key is the command string, not a path)", () => {
+		// Bash commands typically contain spaces, so the agent must
+		// quote them in the keep/drop affordance. The parser handles
+		// quoted multi-word keys.
+		const known = new Set(["ls -la /tmp"]);
+		const result = parseLifecycleMarksFromText('keep "ls -la /tmp"', known);
+		assert.equal(result.length, 1, "one mark parsed");
+		assert.equal(result[0]?.key, "ls -la /tmp", "command key is parsed");
+	});
+
+	it("ignores keep/drop for unknown keys (the tool result must happen first)", () => {
 		const known = new Set(["/known.ts"]);
-		const result = parseKeepMarksFromText("keep /unknown.ts", known);
-		assert.equal(result.length, 0, "unknown paths are no-ops");
+		const result = parseLifecycleMarksFromText("keep /unknown.ts", known);
+		assert.equal(result.length, 0, "unknown keys are no-ops");
 	});
 
-	it("ignores bare 'keep' or 'drop' with no path", () => {
+	it("ignores bare 'keep' or 'drop' with no key", () => {
 		const known = new Set<string>();
-		const result = parseKeepMarksFromText("keep drop", known);
+		const result = parseLifecycleMarksFromText("keep drop", known);
 		assert.equal(result.length, 0, "bare keywords are ignored");
 	});
 
-	it("strips trailing punctuation glued to the path", () => {
+	it("strips trailing punctuation glued to the key", () => {
 		const known = new Set(["/foo.ts"]);
-		const result = parseKeepMarksFromText("keep /foo.ts.", known);
+		const result = parseLifecycleMarksFromText("keep /foo.ts.", known);
 		assert.equal(result.length, 1, "trailing punctuation is stripped");
-		assert.equal(result[0]?.path, "/foo.ts", "path is /foo.ts");
+		assert.equal(result[0]?.key, "/foo.ts", "key is /foo.ts");
 	});
 
 	it("is case-insensitive on the keyword", () => {
 		const known = new Set(["/foo.ts"]);
-		const result = parseKeepMarksFromText("KEEP /foo.ts", known);
+		const result = parseLifecycleMarksFromText("KEEP /foo.ts", known);
 		assert.equal(result.length, 1, "KEEP (uppercase) is recognized");
-		assert.equal(result[0]?.decision, "keep", "decision is keep");
+		assert.equal(result[0]?.override, "kept", "override is kept");
 	});
 
 	it("returns an empty array for empty input", () => {
-		const result = parseKeepMarksFromText("", new Set(["/foo.ts"]));
+		const result = parseLifecycleMarksFromText("", new Set(["/foo.ts"]));
 		assert.deepEqual(result, [], "empty input → empty marks");
 	});
 });
 
-// ─── keep-mark.ts — promoteKeptToolResults (AC-3 seam) ────────────────────
+// ─── lifecycle-state.ts — applyLifecycleState (AC-1 view-time engine) ─────
 
-describe("AC-3 — promoteKeptToolResults: keep-marks promote messages from trim to retain", () => {
-	function toolResult(id: string, path: string): ToolResultMessage {
-		return { role: "toolResult", toolCallId: id, details: { path } };
+describe("lifecycle — applyLifecycleState (the view-time consumer)", () => {
+	function toolResultMessage(
+		toolCallId: string,
+		age: number,
+		verbatim: string,
+		digest: string,
+	): LifecycleMessage {
+		return {
+			role: "toolResult",
+			toolCallId,
+			age,
+			content: [{ type: "text", text: verbatim }],
+			details: { digest },
+		};
 	}
 
-	it("no keep-marks → no promotion (fast path: fresh copies of both arrays)", () => {
-		const state = createKeepMarkState();
-		const trim: ToolResultMessage[] = [toolResult("t1", "/a.ts"), toolResult("t2", "/b.ts")];
-		const retain: ToolResultMessage[] = [];
-		const result = promoteKeptToolResults(trim, retain, state);
-		assert.equal(result.retain.length, 0, "no keep-marks → no promotion");
-		assert.equal(result.trim.length, 2, "all trim messages stay in trim");
-	});
-
-	it("a kept file is moved from trim to retain", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		state.setKeepMark("/a.ts", "keep");
-		const trim: ToolResultMessage[] = [toolResult("t1", "/a.ts"), toolResult("t2", "/b.ts")];
-		const retain: ToolResultMessage[] = [];
-		const result = promoteKeptToolResults(trim, retain, state);
-		assert.equal(result.retain.length, 1, "kept file is promoted to retain");
-		assert.equal(result.trim.length, 1, "the other file stays in trim");
-		// The promoted message is the right one.
-		const promoted = result.retain[0];
-		assert.ok(promoted, "promoted message exists");
-		assert.equal(promoted.toolCallId, "t1", "promoted message is the kept file");
-	});
-
-	it("preserves the union-equals-input invariant (no message lost, no message invented)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		state.setKeepMark("/a.ts", "keep");
-		const trim: ToolResultMessage[] = [
-			toolResult("t1", "/a.ts"),
-			toolResult("t2", "/b.ts"),
-			{ role: "user", content: "hello" }, // non-toolResult message
+	it("on the producing turn (age === currentTurn): content is verbatim", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("bash", "tc-1", "ls", 2);
+		const messages = [
+			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const retain: ToolResultMessage[] = [{ role: "user", content: "older" }];
-		const result = promoteKeptToolResults(trim, retain, state);
-		// Union-equals-input: retain.length + trim.length === trim.length + retain.length.
-		assert.equal(
-			result.retain.length + result.trim.length,
-			trim.length + retain.length,
-			"union-equals-input invariant holds",
-		);
+		const result = applyLifecycleState(messages, state, 2);
+		assert.equal(result.length, 1, "message preserved");
+		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "VERBATIM_OUTPUT", "producing turn → verbatim");
 	});
 
-	it("non-toolResult messages in trim are not promoted (only toolResult is eligible)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		state.setKeepMark("/a.ts", "keep");
-		const trim: ToolResultMessage[] = [
-			{ role: "user", content: "hello" }, // not a toolResult — not eligible
+	it("on a later turn (age < currentTurn): content is swapped to digest", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("bash", "tc-1", "ls", 2);
+		const messages = [
+			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const retain: ToolResultMessage[] = [];
-		const result = promoteKeptToolResults(trim, retain, state);
-		assert.equal(result.retain.length, 0, "user message is NOT promoted");
-		assert.equal(result.trim.length, 1, "user message stays in trim");
+		const result = applyLifecycleState(messages, state, 5);
+		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "DIGEST_OUTPUT", "later turn → digest");
 	});
 
-	it("reads toolCallId from details.toolCallId as a fallback (compatibility shape)", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		state.setKeepMark("/a.ts", "keep");
-		const trim: ToolResultMessage[] = [
-			{ role: "toolResult", details: { toolCallId: "t1", path: "/a.ts" } },
+	it("`kept` override: content stays verbatim regardless of turn", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.setLifecycleOverride("tc-1", "kept");
+		const messages = [
+			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const retain: ToolResultMessage[] = [];
-		const result = promoteKeptToolResults(trim, retain, state);
-		assert.equal(result.retain.length, 1, "toolCallId from details is recognized");
+		const result = applyLifecycleState(messages, state, 5);
+		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(content, "VERBATIM_OUTPUT", "kept → verbatim regardless of age");
+	});
+
+	it("`dropped` override: message is excluded from the view", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.setLifecycleOverride("tc-1", "dropped");
+		const messages = [
+			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
+		];
+		const result = applyLifecycleState(messages, state, 5);
+		assert.equal(result.length, 0, "dropped → excluded");
+	});
+
+	it("non-tool-result messages pass through unchanged", () => {
+		const state = createLifecycleState();
+		const userMsg: LifecycleMessage = { role: "user", content: [{ type: "text", text: "hi" }] };
+		const result = applyLifecycleState([userMsg], state, 5);
+		assert.equal(result.length, 1, "user message preserved");
+		assert.equal(result[0], userMsg, "user message is the same reference");
+	});
+
+	it("digest-missing fallback: a placeholder is shown so the view stays bounded", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("bash", "tc-1", "ls", 2);
+		// Message WITHOUT details.digest (old session, message loaded
+		// without the side-by-side envelope).
+		const msg: LifecycleMessage = {
+			role: "toolResult",
+			toolCallId: "tc-1",
+			age: 2,
+			content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+			// details absent
+		};
+		const result = applyLifecycleState([msg], state, 5);
+		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
+		assert.ok(content?.includes("digest: missing") ?? false, "missing digest → placeholder, not raw content");
 	});
 });
 
-// ─── keep-mark.ts — buildFileReadDigest (AC-2 file-read surface) ──────────
+// ─── lifecycle-state.ts — buildToolOutputDigest (AC-2 per-tool digest) ────
 
-describe("AC-2 — buildFileReadDigest: the agent-facing file-read list", () => {
+describe("lifecycle — buildToolOutputDigest (the agent-facing list)", () => {
 	it("empty state produces a 'none yet' digest", () => {
-		const state = createKeepMarkState();
-		const result = buildFileReadDigest(state);
-		assert.ok(result.includes("Read files in this session (0)"), "header is correct");
+		const state = createLifecycleState();
+		const result = buildToolOutputDigest(state, 0);
+		assert.ok(result.includes("Tool outputs in this session (0)"), "header is correct");
 		assert.ok(result.includes("none yet"), "empty-state message present");
 	});
 
-	it("lists every recorded file with its current mark", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		state.recordRead("/b.ts", "t2", 2);
-		state.setKeepMark("/a.ts", "keep");
-		const result = buildFileReadDigest(state);
-		assert.ok(result.includes("Read files in this session (2)"), "count is correct");
-		assert.ok(result.includes("/a.ts") && result.includes("keep"), "kept file is named");
-		assert.ok(result.includes("/b.ts") && result.includes("drop"), "drop file is named");
+	it("lists every recorded tool output with its current state", () => {
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/a.ts", 1);
+		state.recordToolResult("bash", "tc-2", "ls -la", 2);
+		state.setLifecycleOverride("tc-1", "kept");
+		// currentTurn = 2: tc-1 is on turn 1 (digest), tc-2 is on turn 2 (verbatim)
+		const result = buildToolOutputDigest(state, 2);
+		assert.ok(result.includes("Tool outputs in this session (2)"), "count is correct");
+		assert.ok(result.includes("[read] /a.ts") && result.includes("kept"), "read result is named and kept");
+		assert.ok(result.includes("[bash] ls -la") && result.includes("verbatim"), "bash result is named and verbatim on producing turn");
 	});
 
 	it("the digest carries the keep/drop affordance instructions", () => {
-		const state = createKeepMarkState();
-		state.recordRead("/a.ts", "t1", 1);
-		const result = buildFileReadDigest(state);
-		assert.ok(result.includes("keep <path>"), "digest instructs the agent how to keep");
-		assert.ok(result.includes("drop <path>"), "digest instructs the agent how to drop");
+		const state = createLifecycleState();
+		state.recordToolResult("read", "tc-1", "/a.ts", 1);
+		const result = buildToolOutputDigest(state, 1);
+		assert.ok(result.includes("keep <key>"), "digest instructs the agent how to keep");
+		assert.ok(result.includes("drop <key>"), "digest instructs the agent how to drop");
+	});
+});
+
+// ─── lifecycle-state.ts — buildToolResultEnvelope (the side-by-side writer)
+
+describe("lifecycle — buildToolResultEnvelope (the side-by-side writer)", () => {
+	it("writes verbatim content + a pre-computed digest (Storage Shape A)", () => {
+		const event: DigestibleToolResult = {
+			toolName: "bash",
+			toolCallId: "tc-1",
+			input: { command: "ls" },
+			content: textContent("file1.txt", "file2.txt"),
+			isError: false,
+		};
+		const envelope = buildToolResultEnvelope(event, 2);
+		// The envelope is a `{ content, details }` shape (Storage Shape A).
+		assert.deepEqual(envelope.content, event.content, "content is the verbatim blocks");
+		assert.ok(typeof envelope.details.digest === "string", "details.digest is a string");
+		assert.ok(envelope.details.digest.startsWith(FACT_OF_CALL_LABEL), "details.digest is the digest envelope");
+		assert.equal(envelope.details.toolCallId, "tc-1", "details carries the toolCallId");
+		assert.equal(envelope.details.turnIndex, 2, "details carries the turnIndex");
 	});
 });

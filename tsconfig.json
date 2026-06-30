@@ -28,5 +28,14 @@
       ]
     }
   },
-  "include": ["./policy.ts", "./policy.test.ts", "./index.ts", "./digest.ts", "./keep-mark.ts", "./digest.test.ts", "./integration.test.ts"]
+  "include": [
+    "./policy.ts",
+    "./policy.test.ts",
+    "./index.ts",
+    "./digest.ts",
+    "./digest.test.ts",
+    "./integration.test.ts",
+    "./lifecycle-state.ts",
+    "./pinned-tier.ts"
+  ]
 }

@@ -1,253 +1,321 @@
 /**
- * T-2706 + T-2707 — Context-trimmer extension entrypoint.
+ * T-2717 — Context-trimmer extension entrypoint.
  *
- * T-2706 wires the T-2705 trim policy (`./policy.ts`) into Pi's `context`
- * event — the per-LLM-call, non-destructive message-mutation surface. The
- * handler receives the deep-copy `event.messages` Pi hands it, calls
- * `trimConversation` with the threshold check, applies the keep-mark
- * promotion (T-2707), and returns `{ messages: result.retain }` for Pi
- * to consume as the next LLM call's working view. The `turn_end` handler
- * is observational (mirrors the `examples/extensions/trigger-compact.ts`
- * precedent's `getContextUsage()` + threshold pattern) and does NOT
- * call `ctx.compact()` — Pi's auto-compaction is left intact per T-2704
- * §4 Placement A.
- *
- * T-2707 adds the source-digest surface: the `tool_result` handler
- * replaces verbatim tool/MCP output with fact-of-call + short digest at
- * the source, the `before_agent_start` handler injects the file-read
- * digest (the agent's keep-vs-drop affordance per AC-2), and the
- * `session_start` / `session_shutdown` handlers manage the keep-mark
- * state lifecycle.
+ * Redesign of the T-2703 / T-2706 / T-2707 extension into the
+ * keep/digest/retire lifecycle. The shipped T-2703 design was
+ * source-digesting at `tool_result` (T-2704 Placement A) — the agent
+ * saw the digest, not the verbatim output, on the producing turn.
+ * The T-2717 redesign moves digesting to view-time: the agent sees
+ * the verbatim output on the producing turn and the digest on all
+ * later turns. The redesign also unifies the digest + keep-mark
+ * surfaces into one keep/digest/retire engine over all tool outputs,
+ * adds a pinned tier (auto-pin by convention) for always-present
+ * essentials, and reframes the recency threshold as a comfort knob
+ * (no longer a compaction trigger).
  *
  * ─────────────────────────────────────────────────────────────────────────────
- * T-2704 / T-2705 / T-2706 / T-2707 decomposition seam (load-bearing):
+ * Five paths (AC-5 — the cross-path contract)
  *
- *   - T-2705 owns the policy: `trimConversation(messages, metrics, options?) -> { retain, trim }`
- *     with the threshold gate (50_000 tokens default) and the recency filter
- *     (20 user-message turns default) inside it. Pure-logic; no Pi imports.
- *   - T-2706 (this file) owns the wiring: the `context` event registration,
- *     the `turn_end` observability handler, and the `event.messages` ↔
- *     `ConversationMessage` bridge at the import boundary.
- *   - T-2707 owns the source-digest surface (`tool_result` handler) and the
- *     file-read surface (`before_agent_start` handler) — both registered
- *     in this file. The digester (`./digest.ts`) and the keep-mark state
- *     (`./keep-mark.ts`) are sibling modules in the same extension
- *     directory; the entrypoint composes them.
+ *   1. `tool_result` handler (write-time):
+ *      Stamps the tool-result message with `age = currentTurnIndex`
+ *      and stores the side-by-side envelope `content: <verbatim> +
+ *      details: { digest: <pre-computed envelope> }` (Storage Shape A
+ *      — the per-AC tension resolution; see the storage-shape
+ *      rationale below). The handler returns the partial-patch
+ *      `{ content: <verbatim>, details: { digest, turnIndex } }` so
+ *      Pi persists both payloads naturally through the existing
+ *      partial-patch contract.
  *
- * Boundary discipline:
- *   - The `context` event is non-destructive by Pi's design (`event.messages`
- *     is a deep copy; the policy returns fresh arrays via `slice()`). The
- *     handler does NOT call any write surface (`pi.appendEntry`,
- *     `ctx.sessionManager` is read-only per the Pi docs).
- *   - The `tool_result` handler returns a partial patch (`{ content }`)
- *     that flows into the persisted tool-result message; the handler does
- *     NOT call `pi.appendEntry()` or any write surface — the partial
+ *   2. `context` handler (view-time):
+ *      - Applies `trimConversation` (recency comfort window; the
+ *        threshold gate is removed per AC-4).
+ *      - Applies `applyLifecycleState` (the renamed
+ *        `promoteKeptToolResults` from AC-2): for each tool-result
+ *        message, swap content to digest if the message is on a
+ *        turn other than the producing turn; honor `kept` /
+ *        `dropped` overrides.
+ *      - Prepends the pinned-tier message (AC-3): the synthetic
+ *        `context-trimmer-pinned` message built by
+ *        `pinnedTier.buildPinnedMessage()`. The LLM sees it at
+ *        the top of every per-LLM-call view; the recency filter
+ *        cannot retire it (it's added after the filter runs).
+ *
+ *   3. Pi session persistence: the session file stores the full
+ *      `ToolResultMessageShape` (verbatim + digest + age). The
+ *      compactor reads the session, sees the digest for all but
+ *      the most recent turn, summarizes clean source. Coexistence
+ *      with Pi's auto-compaction is unchanged (T-2704 §4 rationale
+ *      still holds).
+ *
+ *   4. `trimConversation` (the recency filter): runs unconditionally
+ *      on every `context` event (no threshold gate). Carves the
+ *      most recent 20 user-message-initiated turns into `retain`,
+ *      the rest into `trim`. The lifecycle engine then runs on
+ *      `retain` to apply the per-message swap; `trim` is persisted
+ *      in the session, excluded from the view.
+ *
+ *   5. `applyLifecycleState` (the lifecycle engine): reads the
+ *      keep/drop state for each tool-result message in the `retain`
+ *      set and applies the swap (verbatim-on-producing-turn, digest
+ *      on later turns, kept → verbatim regardless, dropped → excluded).
+ *      The function's union-equals-input invariant is preserved.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Storage shape (Tension-1 — Senior BE resolution)
+ *
+ *   **Shape A: `content: verbatim` + `details: { digest: <envelope> }`.**
+ *   Reasons:
+ *   - Stays closest to Pi's existing `tool_result` partial-patch
+ *     contract (`{ content, details, isError }`). The handler returns
+ *     `content: verbatim` and `details: { digest, toolCallId, turnIndex }`
+ *     in one partial patch; Pi persists both naturally.
+ *   - The view-time handler reads `message.content` for verbatim and
+ *     `message.details.digest` for digest — both already-typed paths
+ *     in the persisted message shape.
+ *   - Shape B (multi-block `content: [verbatim, digest]`) would
+ *     require a new field on the tool-result message that the
+ *     downstream Pi consumers (compactor, LLM serializer) would
+ *     have to learn. Shape A reuses existing paths.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Boundary discipline
+ *
+ *   - The `context` event is non-destructive by Pi's design
+ *     (`event.messages` is a deep copy; the policy returns fresh
+ *     arrays via `slice()`). The handler does NOT call any write
+ *     surface (`pi.appendEntry`, `ctx.sessionManager` is read-only
+ *     per the Pi docs).
+ *   - The `tool_result` handler returns a partial patch
+ *     (`{ content, details }`) that flows into the persisted
+ *     tool-result message; the handler does NOT call
+ *     `pi.appendEntry()` or any other write surface — the partial
  *     patch is the write surface, by Pi's design (T-2704 §3).
  *   - The `turn_end` handler does NOT call `ctx.compact()`. Pi's
- *     auto-compaction (`contextWindow - reserveTokens`) is left intact and
- *     reads the already-digested session source.
+ *     auto-compaction (`contextWindow - reserveTokens`) is left
+ *     intact and reads the digested session source. The trimmer
+ *     coexists by keeping the working window small continuously;
+ *     the auto-compaction is the safety net that never fires.
  *
- * Per-session overrides are deliberately not exposed here: T-2705 ships the
- * defaults (`THRESHOLD = 50_000`, `DEFAULT_RECENCY_WINDOW = 20`) and the
- * handler uses them. Per-project override mechanics, if needed later, are a
- * follow-up per T-2704 §5.
+ * Per-session overrides are deliberately not exposed here: the
+ * trimmer ships with the defaults (`RECENCY_COMFORT_WINDOW = 20`,
+ * `DEFAULT_PINNED_TRACKER_COUNT = 5`); per-project override
+ * mechanics, if needed later, are a follow-up per T-2704 §5.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+import { trimConversation, type ConversationMessage } from "./policy.ts";
+import { digestToolResult, type DigestibleToolResult } from "./digest.ts";
 import {
-	trimConversation,
-	THRESHOLD,
-	type ConversationMessage,
-} from "./policy.ts";
-import { digestToolResultPatch, type DigestibleToolResult } from "./digest.ts";
+	createLifecycleState,
+	parseLifecycleMarksFromText,
+	applyLifecycleState,
+	buildToolOutputDigest,
+	buildToolResultEnvelope,
+	type LifecycleState,
+	type LifecycleMessage,
+} from "./lifecycle-state.ts";
 import {
-	createKeepMarkState,
-	buildFileReadDigest,
-	parseKeepMarksFromText,
-	promoteKeptToolResults,
-	type KeepMarkState,
-	type ToolResultMessage,
-} from "./keep-mark.ts";
+	createPinnedTier,
+	type PinnedTier,
+	type PinnedMessage,
+} from "./pinned-tier.ts";
 
 // ─── State ─────────────────────────────────────────────────────────────────
 
 /**
- * The keep-mark state lives in a module-level variable, scoped to the
+ * The lifecycle state lives in a module-level variable, scoped to the
  * extension runtime. The runtime is torn down on `session_shutdown` and
  * re-built on `session_start` (per Pi's extension lifecycle); the state
- * is reset on `session_start` to honor the session-scope contract (AC-2
- * says no cross-session memory).
+ * is reset on `session_start` to honor the session-scope contract.
  */
-let keepMarkState: KeepMarkState = createKeepMarkState();
+let lifecycleState: LifecycleState = createLifecycleState();
 
-/** Per-session turn counter (monotonic, resets on `session_start`). */
+/** The pinned tier: auto-pin-by-convention. Refreshed on
+ *  `session_start` and on each `turn_end` (so newly-created tickets
+ *  are picked up). */
+let pinnedTier: PinnedTier = createPinnedTier();
+
+/** Per-session turn counter (monotonic, resets on `session_start`).
+ *  The counter feeds the `age` field on tool-result messages so the
+ *  lifecycle engine can compare to the current turn. */
 let currentTurnIndex = 0;
 
 // ─── Public entry point ────────────────────────────────────────────────────
 
 /**
- * Extension factory (T-2706 / AC-4 / T-2707). Per Pi's `Extension Styles` →
- * "Directory with index.ts" pattern, this is the subdirectory form
- * `~/.pi/agent/extensions/context-trimmer/index.ts` (T-2704 §5 lock). The
- * factory is sync — handlers are async, but registration is not.
+ * Extension factory. Per Pi's `Extension Styles` → "Directory with
+ * index.ts" pattern, this is the subdirectory form
+ * `~/.pi/agent/extensions/context-trimmer/index.ts` (T-2704 §5 lock).
+ * The factory is sync — handlers are async, but registration is not.
  */
 export default function contextTrimmerExtension(pi: ExtensionAPI): void {
-	// ── `context` handler (T-2706 / AC-1) ─────────────────────────────────
-	// Fired before each LLM call. `event.messages` is a deep copy per the
-	// Pi docs ("Modify messages non-destructively"); safe to filter. The
-	// handler returns `{ messages: result.retain }` for Pi to consume as
-	// the per-LLM-call view for the next LLM call.
+	// ── `context` handler (AC-1 + AC-2 + AC-3 + AC-4) ───────────────────
+	// Fired before each LLM call. The handler applies the four layers
+	// in order:
+	//   1. trimConversation (recency comfort window; AC-4)
+	//   2. applyLifecycleState (verbatim/digest/kept/dropped swap; AC-1+2)
+	//   3. Pinned-tier injection (auto-pin by convention; AC-3)
+	// The four layers compose: the recency filter carves the candidate
+	// set, the lifecycle engine applies the per-message swap, and the
+	// pinned-tier message is prepended to the result.
 	pi.on("context", (event, ctx) => {
 		// Bridge: the policy's structural `ConversationMessage` accepts
-		// Pi's `AgentMessage` (the policy documents this — the shape is
-		// discriminated on `role`; extra fields pass through). We cast at
-		// the import boundary to keep the policy free of Pi imports.
+		// Pi's `AgentMessage` (the policy documents this — the shape
+		// is discriminated on `role`; extra fields pass through). We
+		// cast at the import boundary to keep the policy free of Pi
+		// imports.
 		const messages = event.messages as unknown as ConversationMessage[];
 
-		// Threshold-check surface (T-2706 / AC-2): `ctx.getContextUsage()`
-		// is the canonical reading per T-2704 §3. `{ tokens: 0 }` defensive
-		// default per the policy's "gate-stays-closed on unknown usage"
-		// documented behavior.
-		const usage = ctx.getContextUsage();
-		const tokens = usage?.tokens ?? 0;
+		// Layer 1: recency comfort window (AC-4). Runs unconditionally;
+		// no threshold gate. The recency window is the only retention
+		// signal.
+		const result = trimConversation(messages);
 
-		// Pure-logic partition. The policy's threshold gate runs inside
-		// `trimConversation`: below `THRESHOLD` (50_000 tokens) the policy
-		// returns `{ retain: messages.slice(), trim: [] }` — a no-op that
-		// preserves the per-call view length-for-length. At or above
-		// `THRESHOLD`, the recency filter runs (last 20 user-message
-		// turns retained, older messages moved to `trim` for T-2707).
-		const result = trimConversation(messages, { tokens });
-
-		// T-2707 keep-mark promotion (AC-3 seam): move kept tool-result
-		// messages from the policy's `trim` set to `retain` so the
-		// agent's keep-vs-drop decision is honored. The promotion is a
-		// pure helper call; the policy's union-equals-input invariant
-		// is preserved (the helper returns a fresh partition that is
-		// still a partition of the original input).
-		const promoted = promoteKeptToolResults(
-			result.trim as unknown as ToolResultMessage[],
-			result.retain as unknown as ToolResultMessage[],
-			keepMarkState,
+		// Layer 2: lifecycle state (AC-1 + AC-2). The engine reads the
+		// current turn index, the per-message `age` stamp (written at
+		// `tool_result` time), and the agent's keep/drop overrides.
+		// The output is a fresh `retain` array where each tool-result
+		// message has been swapped to its per-age payload (verbatim
+		// on the producing turn, digest on later turns, kept →
+		// verbatim regardless, dropped → excluded).
+		const withLifecycle = applyLifecycleState(
+			result.retain as unknown as LifecycleMessage[],
+			lifecycleState,
+			currentTurnIndex,
 		);
+
+		// Layer 3: pinned-tier injection (AC-3). The synthetic message
+		// is prepended to the per-LLM-call view so the LLM sees the
+		// always-present essentials (personality + last-N tracker) at
+		// the top of every call. The pinned message is `display: false`
+		// so the TUI does not render it as a visible line.
+		const pinnedMessage: PinnedMessage = pinnedTier.buildPinnedMessage();
+		const finalMessages = [
+			// `custom` role so the LLM sees the content; Pi's existing
+			// custom-message support handles this without a new role.
+			pinnedMessage as unknown as LifecycleMessage,
+			...withLifecycle,
+		];
+
+		// Surface a low-noise status-bar item for the operator. The
+		// status carries the tool-output count; it does not need UI
+		// attention (setStatus is fire-and-forget; it replaces any
+		// prior status this extension set).
+		if (ctx.hasUI) {
+			const recordCount = lifecycleState.records.size;
+			ctx.ui.setStatus("context-trimmer", `tool-outputs: ${recordCount}`);
+		}
 
 		// Return shape per the Pi extension contract:
 		//   `{ messages: filtered }` — consumed by Pi as the next
 		//   LLM call's working view.
-		return { messages: promoted.retain as unknown as typeof event.messages };
+		return { messages: finalMessages as unknown as typeof event.messages };
 	});
 
-	// ── `turn_end` handler (T-2706 / AC-2) ────────────────────────────────
-	// Fired for each turn (one LLM response + tool calls). The threshold
-	// gate check runs here via `ctx.getContextUsage()`, mirroring the
-	// `examples/extensions/trigger-compact.ts` precedent (`turn_end` +
-	// `getContextUsage()` + threshold). The actual filter call runs from
-	// the `context` handler above; this handler is observational — it
-	// surfaces the cross/under signal for observability and future
-	// enhancements (per T-2704 §4, the precedent's `ctx.compact()` call
-	// is NOT replicated here because Pi's auto-compaction is left intact
-	// under Placement A).
-	pi.on("turn_end", (_event, _ctx) => {
-		// Bump the per-session turn counter. The counter feeds the
-		// `turnIndex` field on `ReadFileRecord` so the file-read list
-		// preserves read order across turns.
+	// ── `turn_end` handler (AC-2 + AC-3) ───────────────────────────────
+	// Fired for each turn (one LLM response + tool calls). The
+	// handler's job narrows to:
+	//   - Bump `currentTurnIndex` (feeds the `age` stamp on the next
+	//     `tool_result` event).
+	//   - Refresh the pinned tier's last-N tracker cache (so newly-
+	//     created tickets are picked up).
+	// The threshold-crossing observation from T-2706 is removed per
+	// AC-4 (the recency comfort window is a comfort knob, not a
+	// trigger).
+	pi.on("turn_end", async (_event, _ctx) => {
 		currentTurnIndex += 1;
-
-		const usage = _ctx.getContextUsage();
-		const currentTokens = usage?.tokens ?? null;
-		if (currentTokens === null) {
-			return; // Usage unavailable — no observation to surface.
-		}
-		// Cross/under signal relative to the policy's threshold. The policy
-		// itself runs the gate on the next `context` event; this handler
-		// is the precedent-shaped observation surface (no compaction
-		// trigger; no redundant filter call).
-		// `crossedThreshold` is true once usage meets or exceeds `THRESHOLD`
-		// — the boundary semantics the policy honors ("at exactly
-		// THRESHOLD, the gate OPENS").
-		const crossedThreshold = currentTokens >= THRESHOLD;
-		if (!crossedThreshold) {
-			return; // Under threshold — next `context` call will no-op.
-		}
-		// At/over threshold: the next `context` event will run the recency
-		// filter. The handler is observational only — the filter is the
-		// `context` handler's job, not this one.
+		pinnedTier.bumpTurn();
+		// Refresh the tracker cache on each turn so the pinned
+		// message always reflects the latest work. The refresh is
+		// best-effort (a tracker hiccup degrades to "no pinned
+		// tickets" — see `pinned-tier.ts`).
+		pinnedTier.refresh();
 	});
 
-	// ── `session_start` handler (T-2707 / AC-2) ───────────────────────────
-	// Fired when a session is started, loaded, or reloaded. The handler
-	// resets the keep-mark state and the turn counter to honor the
-	// session-scope contract (a dropped file in a previous session is
-	// dropped in this session until the agent re-reads it). Pi emits
-	// `session_start` for `startup`, `new`, `resume`, `fork`, and `reload`
-	// reasons — the reset runs on every one of them (the previous
-	// extension instance is torn down on `session_shutdown` before
-	// the new instance's `session_start` fires; the module-level state
-	// is a fresh instance for the new session by construction, but we
-	// reset explicitly to make the lifecycle intent obvious).
-	pi.on("session_start", () => {
-		keepMarkState = createKeepMarkState();
+	// ── `session_start` handler (AC-2 + AC-3) ───────────────────────────
+	// Fired when a session is started, loaded, or reloaded. The
+	// handler resets the lifecycle state, the pinned tier, and the
+	// turn counter to honor the session-scope contract (a dropped
+	// tool result in a previous session is dropped in this session
+	// until the agent re-produces it).
+	pi.on("session_start", async () => {
+		lifecycleState = createLifecycleState();
+		pinnedTier = createPinnedTier();
 		currentTurnIndex = 0;
+		// First refresh: populate the personality + last-N tracker
+		// cache so the first `context` call sees a populated pinned
+		// message. The refresh is best-effort.
+		pinnedTier.refresh();
 	});
 
-	// ── `session_shutdown` handler (T-2707 / AC-2) ────────────────────────
-	// Fired before the session runtime is torn down. The handler clears
-	// the read-files set and the keep-mark map explicitly so the next
-	// session starts with a clean slate (defense in depth — the
-	// `session_start` reset above is the primary seam; this is the
-	// belt-and-suspenders for reload flows where the module-level state
-	// persists across the shutdown/start pair).
+	// ── `session_shutdown` handler ─────────────────────────────────────
+	// Fired before the session runtime is torn down. The handler
+	// clears the state explicitly so the next session starts with a
+	// clean slate (defense in depth — the `session_start` reset is
+	// the primary seam; this is the belt-and-suspenders for reload
+	// flows where the module-level state persists across the
+	// shutdown/start pair).
 	pi.on("session_shutdown", () => {
-		keepMarkState.resetSession();
+		lifecycleState.resetSession();
 	});
 
-	// ── `tool_result` handler (T-2707 / AC-1) ─────────────────────────────
-	// Fired after tool execution finishes and before `tool_execution_end`
-	// plus the final tool result message events are emitted. Can modify
-	// result (T-2704 §3): handlers chain like middleware and return
-	// partial patches `{ content, details, isError }`; omitted fields
-	// keep their current values. The handler is the source-digesting
-	// surface per T-2704 §4 Placement A: the modified `{ content }`
-	// flows into the persisted tool-result message; the session file
-	// stores the digest, not the verbatim output.
+	// ── `tool_result` handler (AC-1 + AC-2) ─────────────────────────────
+	// Fired after tool execution finishes. The handler:
+	//   1. Records the tool output in the lifecycle state (so the
+	//      engine knows about it for the view-time swap).
+	//   2. Computes the side-by-side envelope
+	//      (`{ content: verbatim, details: { digest, toolCallId, turnIndex } }`)
+	//      and returns it as the partial-patch. Pi persists both
+	//      payloads naturally through the existing partial-patch
+	//      contract (Storage Shape A — the per-AC tension resolution;
+	//      see the storage-shape rationale at the file top).
 	pi.on("tool_result", async (event, _ctx) => {
-		// Bridge: the digester accepts a structural `DigestibleToolResult`
-		// shape. Pi's typed event is a discriminated union by `toolName`;
-		// the bridge is the import boundary (the digester is pure-logic,
+		// Bridge: the digester / lifecycle engine accept a structural
+		// `DigestibleToolResult` / `DigestibleToolResult` shape. Pi's
+		// typed event is a discriminated union by `toolName`; the
+		// bridge is the import boundary (the digester is pure-logic,
 		// no Pi imports).
 		const event_ = event as unknown as DigestibleToolResult;
 
-		// Observe the read-tool subset for the file-read surface
-		// (T-2707 / AC-2). Only the read tool produces a file path
-		// the agent can mark keep-vs-drop; other tools are digested
-		// but not added to the read-files set.
-		if (event_.toolName === "read" && !event_.isError) {
-			const path = event_.input.path;
-			if (typeof path === "string" && path.length > 0) {
-				keepMarkState.recordRead(path, event_.toolCallId, currentTurnIndex);
-			}
-		}
+		// Record the tool output. The lifecycle engine keys on
+		// `toolCallId`; every tool result gets one record. The `key`
+		// is the agent's keep/drop affordance handle (path for
+		// read/write/edit, command for bash, pattern+path for
+		// grep/find, path for ls, tool id for MCP-generic).
+		const key = extractToolKey(event_);
+		lifecycleState.recordToolResult(
+			event_.toolName,
+			event_.toolCallId,
+			key,
+			currentTurnIndex,
+		);
 
-		// Source-digest: produce the partial patch. The patch is a
-		// single text block carrying the `[factOfCall: ...]\n[digest: ...]`
-		// envelope; `details` and `isError` are not set (they flow through
-		// unchanged per the partial-patch return contract).
-		return digestToolResultPatch(event_);
+		// Build the side-by-side envelope. The verbatim content
+		// goes in `content`; the pre-computed digest goes in
+		// `details.digest`. Pi persists both.
+		const envelope = buildToolResultEnvelope(event_, currentTurnIndex);
+		return {
+			content: envelope.content as unknown as { type: "text"; text: string }[],
+			details: envelope.details,
+		};
 	});
 
-	// ── `before_agent_start` handler (T-2707 / AC-2) ──────────────────────
-	// Fired after the user submits a prompt, before the agent loop. The
-	// handler injects the file-read digest as a persistent message the
-	// agent sees at the start of each turn. The agent can mark files
-	// to keep/drop in its response; the next `before_agent_start` reads
-	// the keep-mark via `parseKeepMarksFromText` applied to the most
-	// recent assistant message.
+	// ── `before_agent_start` handler (AC-2 — agent keep/drop affordance) ─
+	// Fired after the user submits a prompt, before the agent loop.
+	// The handler injects the per-tool-output digest (the agent's
+	// keep-vs-drop affordance) and parses the assistant's most
+	// recent message for keep/drop marks. The injection channel is
+	// the same as the T-2707 BACKUP (`before_agent_start` +
+	// `message`), but the digest widens from "Read files" to "Tool
+	// outputs" per AC-2.
 	pi.on("before_agent_start", async (event, ctx) => {
 		// Read the agent's most recent assistant message to discover
-		// keep-vs-drop marks. The `ctx.sessionManager.getBranch()` returns
-		// the current branch in leaf-to-root order; the FIRST assistant-role
-		// entry is the most recent one (Pi walks from the leaf back to the
-		// root; newer entries come first). No `reverse()` needed.
+		// keep-vs-drop marks. The `ctx.sessionManager.getBranch()`
+		// returns the current branch in leaf-to-root order; the FIRST
+		// assistant-role entry is the most recent one (Pi walks from
+		// the leaf back to the root; newer entries come first). No
+		// `reverse()` needed.
 		const branch = ctx.sessionManager.getBranch();
 		const lastAssistant = branch.find((entry) => {
 			const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
@@ -255,37 +323,38 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		});
 		const lastAssistantText = extractTextFromMessage(lastAssistant);
 
-		// Parse the keep-marks from the assistant's last message and
-		// apply them to the state. The parser only acts on paths the
-		// digester has already observed via `recordRead`; a keep-mark
-		// for an unobserved path is a no-op (the read must happen first).
+		// Parse the lifecycle marks from the assistant's last message
+		// and apply them to the state. The parser only acts on keys
+		// the engine has already observed via `recordToolResult`; a
+		// keep-mark for an unobserved key is a no-op (the tool
+		// result must have happened first).
 		if (lastAssistantText) {
-			const knownPaths = new Set(keepMarkState.getReadPaths());
-			const marks = parseKeepMarksFromText(lastAssistantText, knownPaths);
-			for (const { path, decision } of marks) {
-				keepMarkState.setKeepMark(path, decision);
+			const knownKeys = new Set<string>();
+			for (const r of lifecycleState.records.values()) {
+				knownKeys.add(r.key);
+			}
+			const marks = parseLifecycleMarksFromText(lastAssistantText, knownKeys);
+			for (const { key, override } of marks) {
+				// Look up the toolCallId for the matching key. The
+				// engine keys records on toolCallId; the agent marks
+				// by key, so we resolve key → toolCallId here.
+				for (const [id, r] of lifecycleState.records) {
+					if (r.key === key) {
+						lifecycleState.setLifecycleOverride(id, override);
+					}
+				}
 			}
 		}
 
-		// Build the file-read digest. The message is a persistent
-		// `customType` message the agent sees at the start of this turn
-		// (the LLM consumes the content as part of the system context).
-		// `display: true` makes it visible in the TUI so the operator
-		// can audit the file-read list.
-		const digestContent = buildFileReadDigest(keepMarkState);
-
-		// Also surface a low-noise status-bar item for the operator.
-		// The status carries the read-file count; it does not need UI
-		// attention (setStatus is fire-and-forget; it replaces any prior
-		// status this extension set).
-		const readCount = keepMarkState.getReadPaths().length;
-		if (ctx.hasUI) {
-			ctx.ui.setStatus("context-trimmer", `read-files: ${readCount}`);
-		}
+		// Build the per-tool-output digest. The message is a
+		// `customType: "context-trimmer-tool-outputs"` message the
+		// agent sees at the start of this turn. The digest widens
+		// from "Read files" (BACKUP) to "Tool outputs" (T-2717).
+		const digestContent = buildToolOutputDigest(lifecycleState, currentTurnIndex);
 
 		return {
 			message: {
-				customType: "context-trimmer-file-reads",
+				customType: "context-trimmer-tool-outputs",
 				content: digestContent,
 				display: true,
 			},
@@ -296,12 +365,46 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 // ─── Internal helpers ──────────────────────────────────────────────────────
 
 /**
+ * Extract the agent-facing key for a tool result. The key is the
+ * handle the agent uses in `keep <key>` / `drop <key>` patterns:
+ *   - `read`/`write`/`edit` → file path
+ *   - `bash`               → the command string
+ *   - `grep`/`find`        → `<pattern>@<path>`
+ *   - `ls`                 → the path
+ *   - MCP-custom           → the tool id
+ * Missing fields produce an empty key (the tool result is still
+ * recorded; the agent can still use the toolCallId in the future
+ * if a richer key extraction is added).
+ */
+function extractToolKey(event: DigestibleToolResult): string {
+	const input = event.input;
+	switch (event.toolName) {
+		case "read":
+		case "write":
+		case "edit":
+		case "ls":
+			return typeof input.path === "string" ? input.path : "";
+		case "bash":
+			return typeof input.command === "string" ? input.command : "";
+		case "grep":
+		case "find": {
+			const pattern = typeof input.pattern === "string" ? input.pattern : "";
+			const path = typeof input.path === "string" ? input.path : "";
+			return path ? `${pattern}@${path}` : pattern;
+		}
+		default:
+			// MCP custom / future built-ins: use the tool id as the key.
+			return event.toolName;
+	}
+}
+
+/**
  * Extract concatenated text from a session entry's assistant message.
  * Pi's assistant messages carry content as a `ContentBlock[]` where
  * text blocks have `{ type: "text", text: string }`. The function
- * concatenates all text blocks into a single string for keep-mark
- * parsing. Defensive: unknown shapes return an empty string rather
- * than throwing.
+ * concatenates all text blocks into a single string for lifecycle
+ * mark parsing. Defensive: unknown shapes return an empty string
+ * rather than throwing.
  */
 function extractTextFromMessage(entry: unknown): string {
 	if (!entry || typeof entry !== "object") return "";

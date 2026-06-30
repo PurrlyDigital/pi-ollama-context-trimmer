@@ -1,24 +1,27 @@
 /**
- * T-2705 — Trim policy unit tests.
+ * T-2717 — Trim policy unit tests (recency comfort window).
  *
  * Runner: Node's built-in `node:test` (no project install required).
- * Run: `node --test /home/dez/.pi/agent/extensions/context-trimmer/policy.test.ts`
- * (or with `npx tsx` / `ts-node` if a loader is available; the file is
- * TypeScript and the harness needs a TS-aware runner to execute it as-is).
+ * Run: `node --experimental-strip-types --test policy.test.ts`
  *
- * The tests import the same `policy.ts` the production code imports from
- * — no duplicate constants, no shadow modules. The contract is asserted
- * directly on the public API.
+ * The tests cover the redesigned `policy.ts` (per AC-4 of T-2717):
+ *   - The recency comfort window is the only retention signal.
+ *   - The threshold gate is REMOVED; the filter runs unconditionally.
+ *   - `RECENCY_COMFORT_WINDOW = 20` (the renamed default).
+ *   - The function is pure: no Pi imports, no I/O, no `Date.now()`.
+ *
+ * The tests import the same `policy.ts` the production code imports
+ * from — no duplicate constants, no shadow modules. The contract is
+ * asserted directly on the public API.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-	DEFAULT_RECENCY_WINDOW,
 	RECENCY_BASIS,
-	THRESHOLD,
-	THRESHOLD_UNIT,
+	RECENCY_COMFORT_WINDOW,
+	DEFAULT_RECENCY_WINDOW,
 	trimConversation,
 	type ConversationMessage,
 	type TrimOptions,
@@ -69,54 +72,62 @@ describe("AC-1 — recency-window measurement basis and default", () => {
 		assert.equal(RECENCY_BASIS, "turns", "RECENCY_BASIS must be 'turns' (the basis picked with rationale in the module header)");
 	});
 
-	it("exports DEFAULT_RECENCY_WINDOW as a positive integer named in turns", () => {
-		assert.equal(typeof DEFAULT_RECENCY_WINDOW, "number");
-		assert.ok(Number.isInteger(DEFAULT_RECENCY_WINDOW), "DEFAULT_RECENCY_WINDOW must be an integer (turns are countable)");
-		assert.ok(DEFAULT_RECENCY_WINDOW > 0, "DEFAULT_RECENCY_WINDOW must be positive (a zero/negative window would trim everything)");
+	it("exports RECENCY_COMFORT_WINDOW as a positive integer named in turns", () => {
+		assert.equal(typeof RECENCY_COMFORT_WINDOW, "number");
+		assert.ok(Number.isInteger(RECENCY_COMFORT_WINDOW), "RECENCY_COMFORT_WINDOW must be an integer (turns are countable)");
+		assert.ok(RECENCY_COMFORT_WINDOW > 0, "RECENCY_COMFORT_WINDOW must be positive (a zero/negative window would trim everything)");
 		// The default value is named in the module header. Pin it here so a
 		// silent change to the constant is caught at test time.
-		assert.equal(DEFAULT_RECENCY_WINDOW, 20, "DEFAULT_RECENCY_WINDOW must equal 20 (the named default in the module header)");
+		assert.equal(RECENCY_COMFORT_WINDOW, 20, "RECENCY_COMFORT_WINDOW must equal 20 (the named default in the module header)");
+	});
+
+	it("DEFAULT_RECENCY_WINDOW is a back-compat alias for RECENCY_COMFORT_WINDOW", () => {
+		// The T-2705 default constant is preserved as a back-compat alias
+		// so any external consumer that imported `DEFAULT_RECENCY_WINDOW`
+		// (test files, downstream extensions) keeps working.
+		assert.equal(
+			DEFAULT_RECENCY_WINDOW,
+			RECENCY_COMFORT_WINDOW,
+			"DEFAULT_RECENCY_WINDOW must equal RECENCY_COMFORT_WINDOW (back-compat alias)",
+		);
 	});
 });
 
-// ─── AC-2: threshold gate ──────────────────────────────────────────────────
+// ─── AC-2: recency-only retention (threshold gate removed) ─────────────────
 
-describe("AC-2 — threshold gate and threshold constant", () => {
-	it("exports THRESHOLD as a finite non-negative number named in tokens", () => {
-		assert.equal(typeof THRESHOLD, "number");
-		assert.ok(Number.isFinite(THRESHOLD), "THRESHOLD must be finite");
-		assert.ok(THRESHOLD >= 0, "THRESHOLD must be non-negative");
-		// The unit is named in the constant AND the type alias — three
-		// independent readings of the same unit (constant, type, this test).
-		assert.equal(THRESHOLD_UNIT, "tokens", "THRESHOLD_UNIT must be 'tokens' (the unit named in the module header)");
-		// Pin the value: a silent change to the constant is caught here.
-		assert.equal(THRESHOLD, 50_000, "THRESHOLD must equal 50_000 tokens (the named default in the module header)");
+describe("AC-2 — recency-only retention (threshold gate removed)", () => {
+	it("no THRESHOLD constant is exported (the gate is removed per AC-4)", () => {
+		// The threshold gate is removed. Assert the constant is NOT on
+		// the public surface. If a future ticket re-introduces a
+		// threshold (e.g. a per-model hard cap), the test should be
+		// updated to assert the new constant's contract.
+		assert.equal(
+			(trimConversation as unknown as { THRESHOLD?: unknown }).THRESHOLD,
+			undefined,
+			"THRESHOLD must NOT be exported (the gate is removed per AC-4)",
+		);
 	});
 
-	it("under-threshold: returns the input unchanged as retain, trim is empty", () => {
-		// 30 turns of 3 messages each = 90 messages total. The threshold
-		// gate is the FIRST predicate; the recency window does not run.
+	it("the filter runs unconditionally — there is no token gate", () => {
+		// 30 turns of 3 messages each = 90 messages total. The filter
+		// carves the most recent 20 turns; 20*3=60 retained, 10*3=30
+		// trimmed. There is no metrics parameter; the filter runs
+		// regardless of any token count.
 		const messages = conversation(30);
-		const underThreshold = THRESHOLD - 1;
-		const result = trimConversation(messages, { tokens: underThreshold });
-		assert.deepEqual(result.retain, messages, "under-threshold retain must deep-equal the input");
-		assert.deepEqual(result.trim, [], "under-threshold trim must be empty");
-		// Union-equals-input invariant: under-threshold is a no-op, so
-		// retain holds the entire input.
-		assert.equal(result.retain.length, messages.length, "under-threshold retain length must equal input length");
-		assert.equal(result.trim.length, 0, "under-threshold trim length must be zero");
+		const result = trimConversation(messages);
+		assert.equal(result.retain.length, 20 * 3, "filter runs unconditionally; recency window is the only signal");
+		assert.equal(result.trim.length, 10 * 3, "trim is the 10 oldest turns (10 turns * 3 messages/turn)");
 	});
 
-	it("threshold accepts a caller override (per-session tuning by T-2706)", () => {
-		// Same input as the under-threshold test, but the caller passes a
-		// threshold of 10 — well below the input's token count. The gate
-		// must open and the recency filter must run.
+	it("the filter accepts a caller override on the recency window", () => {
+		// 30 turns; caller asks for 10 turns retained. The filter must
+		// honor the override (the function exposes `recencyWindow` as
+		// a parameter; the caller — `index.ts` — owns the override
+		// decision).
 		const messages = conversation(30);
-		const result = trimConversation(messages, { tokens: 100_000 }, { threshold: 10 });
-		// 30 turns, window=20 → retain 10 most-recent turns, trim 20 oldest.
-		// Each turn is 3 messages; 20*3=60 retained, 10*3=30 trimmed.
-		assert.equal(result.retain.length, 60, "caller-overridden threshold opens the gate; recency filter carves the window");
-		assert.equal(result.trim.length, 30, "the carve is the 10 oldest turns (10 turns * 3 messages/turn)");
+		const result = trimConversation(messages, { recencyWindow: 10 });
+		assert.equal(result.retain.length, 10 * 3, "caller-overridden window carves 10 turns = 30 messages");
+		assert.equal(result.trim.length, 20 * 3, "the carve is the 20 oldest turns");
 	});
 });
 
@@ -125,8 +136,8 @@ describe("AC-2 — threshold gate and threshold constant", () => {
 describe("AC-3 — pure function contract (determinism, no side effects)", () => {
 	it("is deterministic: identical inputs produce identical outputs across calls", () => {
 		const messages = conversation(40);
-		const a = trimConversation(messages, { tokens: THRESHOLD + 1 });
-		const b = trimConversation(messages, { tokens: THRESHOLD + 1 });
+		const a = trimConversation(messages);
+		const b = trimConversation(messages);
 		// Deep-equal on the output shape, not just the references.
 		assert.deepEqual(a, b, "two calls with identical inputs must return deep-equal results");
 	});
@@ -134,7 +145,7 @@ describe("AC-3 — pure function contract (determinism, no side effects)", () =>
 	it("does not mutate the input array", () => {
 		const messages = conversation(40);
 		const snapshot = messages.slice();
-		trimConversation(messages, { tokens: THRESHOLD + 1 });
+		trimConversation(messages);
 		// Compare element-by-element — the input array is not the output
 		// array, and neither reorders nor rewrites the input.
 		assert.equal(messages.length, snapshot.length, "input length is unchanged");
@@ -143,39 +154,28 @@ describe("AC-3 — pure function contract (determinism, no side effects)", () =>
 		}
 	});
 
-	it("returns fresh arrays on the no-op path (no aliasing of the input)", () => {
-		const messages = conversation(5);
-		const result = trimConversation(messages, { tokens: 0 });
-		// Even on the no-op path, the result must be a new array — the
-		// contract says "returns," not "aliases."
-		assert.notEqual(result.retain, messages, "no-op retain is a fresh array, not the input aliased");
-		assert.notEqual(result.trim, messages, "no-op trim is a fresh array, not the input aliased");
-		assert.deepEqual(result.retain, messages, "but the no-op retain deep-equals the input");
+	it("returns fresh arrays on the recency path (no aliasing of the input)", () => {
+		const messages = conversation(40);
+		const result = trimConversation(messages);
+		// The contract says "returns," not "aliases."
+		assert.notEqual(result.retain, messages, "retain is a fresh array, not the input aliased");
+		assert.notEqual(result.trim, messages, "trim is a fresh array, not the input aliased");
 	});
 
 	it("honors the union-equals-input invariant on the recency path", () => {
 		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 });
+		const result = trimConversation(messages);
 		// Every message in the input must appear in exactly one of the two
 		// output sets. The union is a partition; nothing is lost, nothing
-		// is invented. The policy returns `trim` first (oldest) then
-		// `retain` (newest) — the recency filter carves at a turn boundary
-		// in the middle of the array, so the two sets live on opposite
-		// sides of the cut, not in a concatenation that preserves order.
+		// is invented.
 		assert.equal(
 			result.retain.length + result.trim.length,
 			messages.length,
 			"retain.length + trim.length must equal messages.length (no messages lost, no messages invented)",
 		);
-		// Multiset-equality check: sort both sides by identity and compare.
-		// The simplest correct check is "every input element appears in
-		// either retain or trim, and every retain/trim element came from
-		// the input." Reference equality is sufficient — the policy
-		// returns slices of the input (no cloning, no reordering of the
-		// elements within either side).
+		// Disjoint: no element is in both sets.
 		const retainSet = new Set(result.retain);
 		const trimSet = new Set(result.trim);
-		// Disjoint: no element is in both sets.
 		for (const m of result.retain) {
 			assert.ok(!trimSet.has(m), "a message is in retain — must not also be in trim");
 		}
@@ -215,125 +215,54 @@ describe("AC-3 — pure function contract (determinism, no side effects)", () =>
 			"retain is the newest slice of the input (order preserved)",
 		);
 	});
-
-	it("honors the union-equals-input invariant on the no-op path", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: 0 });
-		assert.equal(result.retain.length, messages.length, "no-op retain length equals input");
-		assert.equal(result.trim.length, 0, "no-op trim length is zero");
-		// The no-op path returns a fresh array, but the elements are the
-		// same references as the input (slice preserves references).
-		assert.deepEqual(
-			result.retain,
-			messages,
-			"no-op retain is a fresh array but element-wise deep-equals the input",
-		);
-	});
 });
 
-// ─── AC-4: under-threshold, over-threshold, and boundary cases ─────────────
+// ─── AC-4: recency boundary cases ──────────────────────────────────────────
 
-describe("AC-4 — under-threshold no-op, over-threshold recency retention, boundary cases", () => {
-	it("under-threshold: messages.length < THRESHOLD returns retain=input, trim=[]", () => {
-		// The threshold gate is on `metrics.tokens`, NOT on
-		// `messages.length`. The "under-threshold" case is a
-		// token-below-threshold case; the input may have any number of
-		// messages. The recency filter does NOT run on this path.
-		const messages = conversation(100); // 300 messages, but the gate is tokens-based
-		const result = trimConversation(messages, { tokens: THRESHOLD - 1 });
-		assert.deepEqual(result.retain, messages, "under-threshold retain deep-equals input");
-		assert.deepEqual(result.trim, [], "under-threshold trim is empty");
-	});
-
-	it("over-threshold: retain is the most recent DEFAULT_RECENCY_WINDOW turns, trim is the rest", () => {
-		// Build a deterministic conversation: 50 turns (150 messages).
-		// Set the window to 20 (the default) and assert the carve.
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 });
-
-		// 50 turns total, retain 20 most-recent → retain 20*3=60, trim 30*3=90.
-		assert.equal(result.retain.length, 20 * 3, "over-threshold retain length = 20 turns * 3 messages/turn");
-		assert.equal(result.trim.length, 30 * 3, "over-threshold trim length = 30 turns * 3 messages/turn");
-
-		// The retained messages must be the most recent — the LAST 60
-		// messages of the input. Slice and compare element-by-element.
-		const expectedRetain = messages.slice(messages.length - 60);
-		for (let i = 0; i < expectedRetain.length; i++) {
-			assert.equal(result.retain[i], expectedRetain[i], `retain[${i}] is the most-recent message at that position`);
-		}
-	});
-
-	it("over-threshold respects the caller's recencyWindow override", () => {
-		// 50 turns; caller asks for 10 turns retained. Recency filter must
-		// honor the override (the function exposes recencyWindow as a
-		// parameter; the caller — T-2706 — owns the override decision).
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 }, { recencyWindow: 10 });
-		assert.equal(result.retain.length, 10 * 3, "caller-overridden window carves 10 turns = 30 messages");
-		assert.equal(result.trim.length, 40 * 3, "the carve is the 40 oldest turns");
-	});
-
-	it("boundary === THRESHOLD: the gate opens (the policy runs, recency filter applied)", () => {
-		// Boundary semantics: at exactly THRESHOLD tokens, the gate OPENS.
-		// The threshold is the "trimming is worth it" line; the recency
-		// filter at the boundary is deterministic and asserted.
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD });
-		// Gate opened → recency filter applied → 20 turns retained.
-		assert.equal(result.retain.length, 20 * 3, "at === THRESHOLD, the gate opens and the recency filter runs");
-		assert.equal(result.trim.length, 30 * 3, "at === THRESHOLD, the carve is the same as for tokens > THRESHOLD");
-	});
-
+describe("AC-4 — recency boundary cases", () => {
 	it("boundary === 0 messages: empty input returns retain=[], trim=[] without throwing", () => {
-		const result = trimConversation([], { tokens: 1_000_000 });
+		const result = trimConversation([]);
 		assert.deepEqual(result.retain, [], "empty input → retain is empty");
 		assert.deepEqual(result.trim, [], "empty input → trim is empty");
-		// Length-only check is also fine; the deep-equal above is the
-		// load-bearing assertion.
 		assert.equal(result.retain.length + result.trim.length, 0, "empty input → union is empty");
-	});
-
-	it("boundary === THRESHOLD - 1 tokens: the no-op path runs", () => {
-		// One token under the threshold. The gate stays closed; the
-		// recency filter does NOT run. Assert the no-op shape.
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD - 1 });
-		assert.deepEqual(result.retain, messages, "one token under threshold → no-op");
-		assert.deepEqual(result.trim, [], "one token under threshold → trim is empty");
-	});
-
-	it("boundary === THRESHOLD + 1 tokens: the recency-retention path runs", () => {
-		// One token over the threshold. The gate opens; the recency
-		// filter carves the most-recent N turns. The carve at
-		// THRESHOLD + 1 is the same shape as at THRESHOLD + 1_000_000 —
-		// the threshold gate is binary, not graded.
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 });
-		assert.equal(result.retain.length, 20 * 3, "one token over threshold → recency filter carves the window");
-		assert.equal(result.trim.length, 30 * 3, "one token over threshold → trim is the oldest messages");
 	});
 
 	it("boundary — recency window larger than available turns: retain all, trim none", () => {
 		// 5 turns, window of 20. The window exceeds the available turns;
 		// the recency filter cannot carve what does not exist. The whole
-		// input is retained; trim is empty. This is the "thin session"
-		// path — the gate may be open (tokens are high) but the recency
-		// filter has nothing to trim.
+		// input is retained; trim is empty.
 		const messages = conversation(5);
-		// Token count well above the threshold so the gate opens.
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 });
+		const result = trimConversation(messages);
 		assert.deepEqual(result.retain, messages, "window > available turns → retain all");
 		assert.deepEqual(result.trim, [], "window > available turns → trim is empty");
 		// Union-equals-input holds.
 		assert.equal(result.retain.length + result.trim.length, messages.length, "partition union equals input");
 	});
 
+	it("boundary — recency window equal to available turns: retain all, trim none", () => {
+		// 20 turns, window of 20. Boundary case: the window matches the
+		// available turns exactly. The carve is at index 0; everything
+		// is retained.
+		const messages = conversation(20);
+		const result = trimConversation(messages);
+		assert.deepEqual(result.retain, messages, "window = available turns → retain all");
+		assert.deepEqual(result.trim, [], "window = available turns → trim is empty");
+	});
+
+	it("boundary — one turn beyond the window: trim exactly one turn", () => {
+		// 21 turns, window of 20. One turn is over the window; exactly
+		// one turn (3 messages) is trimmed.
+		const messages = conversation(21);
+		const result = trimConversation(messages);
+		assert.equal(result.retain.length, 20 * 3, "one turn over window → retain the most recent 20 turns");
+		assert.equal(result.trim.length, 1 * 3, "one turn over window → trim exactly the oldest turn (3 messages)");
+	});
+
 	it("boundary — no user messages in the conversation: recency filter has no anchor, fall back to no-op", () => {
 		// A session composed entirely of tool-results / assistant messages
 		// (no user-role message). The recency contract keys on user turns;
 		// without any, the filter cannot anchor. Documented behavior: fall
-		// back to the no-op path (retain all, trim none) rather than
-		// guessing a boundary.
+		// back to the no-op path (retain all, trim none).
 		const messages: ConversationMessage[] = [
 			assistant(0),
 			toolResult(0),
@@ -341,9 +270,18 @@ describe("AC-4 — under-threshold no-op, over-threshold recency retention, boun
 			toolResult(1),
 			assistant(2),
 		];
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 });
+		const result = trimConversation(messages);
 		assert.deepEqual(result.retain, messages, "no user messages → fall back to no-op retain");
 		assert.deepEqual(result.trim, [], "no user messages → trim is empty");
+	});
+
+	it("boundary — single-turn conversation: the lone turn is retained (window ≥ turns)", () => {
+		// 1 turn (3 messages), default window 20. The window exceeds the
+		// available turns; everything is retained.
+		const messages = conversation(1);
+		const result = trimConversation(messages);
+		assert.deepEqual(result.retain, messages, "single turn → retain all");
+		assert.deepEqual(result.trim, [], "single turn → trim is empty");
 	});
 });
 
@@ -352,23 +290,21 @@ describe("AC-4 — under-threshold no-op, over-threshold recency retention, boun
 describe("defensive — malformed options collapse to defaults without throwing", () => {
 	it("recencyWindow of 0 collapses to the default (positive integer requirement)", () => {
 		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 }, { recencyWindow: 0 });
-		// Default window = 20; the carve is the same as the over-threshold test.
-		assert.equal(result.retain.length, 20 * 3, "recencyWindow=0 collapses to DEFAULT_RECENCY_WINDOW");
-	});
-
-	it("negative threshold collapses to the default (non-negative requirement)", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 }, { threshold: -5 });
-		// Default threshold = 50_000; the gate opens (metrics.tokens > THRESHOLD);
-		// the recency filter carves the same window.
-		assert.equal(result.retain.length, 20 * 3, "threshold=-5 collapses to THRESHOLD; gate opens; carve is the default window");
+		const result = trimConversation(messages, { recencyWindow: 0 });
+		// Default window = 20; the carve is the same as the no-override test.
+		assert.equal(result.retain.length, 20 * 3, "recencyWindow=0 collapses to RECENCY_COMFORT_WINDOW");
 	});
 
 	it("non-integer recencyWindow collapses to the default (integer requirement)", () => {
 		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 }, { recencyWindow: 7.5 });
-		assert.equal(result.retain.length, 20 * 3, "recencyWindow=7.5 collapses to DEFAULT_RECENCY_WINDOW");
+		const result = trimConversation(messages, { recencyWindow: 7.5 });
+		assert.equal(result.retain.length, 20 * 3, "recencyWindow=7.5 collapses to RECENCY_COMFORT_WINDOW");
+	});
+
+	it("negative recencyWindow collapses to the default", () => {
+		const messages = conversation(50);
+		const result = trimConversation(messages, { recencyWindow: -3 });
+		assert.equal(result.retain.length, 20 * 3, "recencyWindow=-3 collapses to RECENCY_COMFORT_WINDOW");
 	});
 });
 
@@ -380,7 +316,7 @@ describe("type surface — public API is consumable from the documented contract
 		// The runtime assertion is a smoke test that the function returns
 		// the documented shape (the destructurable `{ retain, trim }`).
 		const messages = conversation(5);
-		const result: TrimResult<ConversationMessage> = trimConversation(messages, { tokens: 0 });
+		const result: TrimResult<ConversationMessage> = trimConversation(messages);
 		assert.ok(Array.isArray(result.retain), "TrimResult.retain is an array");
 		assert.ok(Array.isArray(result.trim), "TrimResult.trim is an array");
 		// Destructurable: callers can pull either set off the return.
@@ -393,36 +329,28 @@ describe("type surface — public API is consumable from the documented contract
 		// The implementer should use the same module path the production
 		// code uses. The constants are the literal values from `policy.ts`:
 		// a future change to the constants in `policy.ts` flows to this
-		// assertion automatically. If a shadow module were introduced,
-		// the import paths would diverge and the test would import from
-		// the wrong file.
+		// assertion automatically.
 		assert.equal(typeof RECENCY_BASIS, "string", "RECENCY_BASIS is a string");
-		assert.equal(typeof THRESHOLD_UNIT, "string", "THRESHOLD_UNIT is a string");
-		assert.equal(typeof DEFAULT_RECENCY_WINDOW, "number", "DEFAULT_RECENCY_WINDOW is a number");
-		assert.equal(typeof THRESHOLD, "number", "THRESHOLD is a number");
+		assert.equal(typeof RECENCY_COMFORT_WINDOW, "number", "RECENCY_COMFORT_WINDOW is a number");
 	});
 });
 
 // ─── Options type guard (compile-time only; runtime smoke) ────────────────
 
-// The `TrimOptions` type is exported for the caller (T-2706) to type its
+// The `TrimOptions` type is exported for the caller (`index.ts`) to type its
 // override payload. The runtime smoke below is a touch-up that the
 // optional options object flows through correctly.
-describe("options object — T-2706's per-call override payload flows through", () => {
+describe("options object — index.ts's per-call override payload flows through", () => {
 	it("an empty options object uses the module defaults", () => {
 		const messages = conversation(50);
-		const result = trimConversation(messages, { tokens: THRESHOLD + 1 }, {});
-		assert.equal(result.retain.length, 20 * 3, "empty options → DEFAULT_RECENCY_WINDOW");
+		const result = trimConversation(messages, {});
+		assert.equal(result.retain.length, 20 * 3, "empty options → RECENCY_COMFORT_WINDOW");
 	});
 
-	it("both overrides together (recencyWindow + threshold) compose", () => {
+	it("an options object with recencyWindow honors the override", () => {
 		const messages = conversation(50);
-		const result = trimConversation(
-			messages,
-			{ tokens: 1_000_000 },
-			{ recencyWindow: 5, threshold: 10 },
-		);
-		assert.equal(result.retain.length, 5 * 3, "caller-overridden window honored alongside caller-overridden threshold");
+		const result = trimConversation(messages, { recencyWindow: 5 });
+		assert.equal(result.retain.length, 5 * 3, "caller-overridden window honored");
 		assert.equal(result.trim.length, 45 * 3, "trim is the rest");
 	});
 });
