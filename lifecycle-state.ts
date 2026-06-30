@@ -97,6 +97,13 @@ export type LifecyclePhase =
  * A single tool-output record: the tool identity + the join key + the
  * turn the output was produced. The state map is keyed on `toolCallId`
  * so every tool result has exactly one record.
+ *
+ * T-2720 adds the per-Pi-turn stamp (`piTurnAge`): the value of the
+ * module-level `piTurnIndex` counter at the moment the tool ran. The
+ * engine compares this against the current `piTurnIndex` at view time
+ * to apply the per-Pi-turn cap (`PI_TURN_DIGEST_AFTER` / `PI_TURN_RETIRE_AFTER`).
+ * The stamp is set once at `recordToolResult` time and never updated —
+ * the engine computes the age on demand from `(currentPiTurn - stamped)`.
  */
 export interface ToolOutputRecord {
 	/** Tool name (`"read"`, `"bash"`, `"mcp_*"`, etc.). */
@@ -112,8 +119,16 @@ export interface ToolOutputRecord {
 	 *   - MCP-custom           → the tool id
 	 */
 	key: string;
-	/** Turn index (0-based) at which the tool ran. */
+	/** Turn index (0-based, user-turn stamp from `before_agent_start`) at which the tool ran. */
 	turnIndex: number;
+	/**
+	 * T-2720 — Per-Pi-turn stamp: the value of the module-level
+	 * `piTurnIndex` counter at the moment the tool ran. The engine
+	 * reads this at view time to apply the per-Pi-turn cap
+	 * (`piTurnAge <= K` → keep; `piTurnAge > K` → digest;
+	 * `piTurnAge > M` → retire). Frozen at record time.
+	 */
+	piTurnAge: number;
 	/**
 	 * The agent's keep/drop override. Absent = no override (auto-state
 	 * applies: verbatim-on-producing-turn, digest-after). The agent sets
@@ -137,6 +152,7 @@ export interface LifecycleState {
 		toolCallId: string,
 		key: string,
 		turnIndex: number,
+		piTurnAge: number,
 	) => void;
 	/** Set the agent's keep/drop override on a recorded tool output (keyed by `toolCallId`). */
 	setLifecycleOverride: (toolCallId: string, override: "kept" | "dropped") => void;
@@ -167,13 +183,18 @@ export interface LifecycleState {
  *      the result is on its producing turn OR kept)
  *   - `details.digest: string` — the pre-computed digest envelope (shown
  *      when the result is on a later turn and not kept)
+ *
+ * T-2720 adds the per-Pi-turn stamp:
+ *   - `details.piTurnAge: number` — the per-Pi-turn age stamp; the engine
+ *      reads this at view time to apply the per-Pi-turn cap
+ *      (`piTurnAge <= K` → keep; `piTurnAge > K` → digest).
  */
 export interface LifecycleMessage {
 	role: string;
 	toolCallId?: string;
 	age?: number;
 	content?: unknown;
-	details?: { digest?: string; [key: string]: unknown };
+	details?: { digest?: string; piTurnAge?: number; [key: string]: unknown };
 	[key: string]: unknown;
 }
 
@@ -187,16 +208,29 @@ export interface LifecycleMessage {
  *     lifecycle engine then applies the per-message state to that set.
  *   - `applyLifecycleState` (formerly `promoteKeptToolResults`) is the
  *     lifecycle engine's view-time consumer.
+ *
+ * T-2720 adds `piTurnAge` (the per-Pi-turn stamp) to the persisted
+ * contract. The value travels alongside `age` (the user-turn stamp)
+ * in the message — `age` drives the user-turn-bounded swap, `piTurnAge`
+ * drives the per-Pi-turn cap (`piTurnAge <= K` → keep; `piTurnAge > K`
+ * → digest; `piTurnAge > M` → retire).
  */
 export interface ToolResultMessageShape {
 	role: "toolResult";
 	toolCallId: string;
 	toolName: string;
 	input: Record<string, unknown>;
-	/** The current turn index when the tool result was produced. */
+	/** The current user-turn index when the tool result was produced. */
 	age: number;
+	/**
+	 * T-2720 — The per-Pi-turn stamp: the value of the module-level
+	 * `piTurnIndex` counter at the moment the tool ran. The engine
+	 * reads this at view time to apply the per-Pi-turn cap. Set
+	 * once at `tool_result` time and never updated.
+	 */
+	piTurnAge: number;
 	content: unknown;
-	details?: { digest?: string; [key: string]: unknown };
+	details?: { digest?: string; piTurnAge?: number; [key: string]: unknown };
 	isError: boolean;
 }
 
@@ -218,18 +252,20 @@ export function createLifecycleState(): LifecycleState {
 
 	return {
 		records,
-		recordToolResult(toolName, toolCallId, key, turnIndex) {
+		recordToolResult(toolName, toolCallId, key, turnIndex, piTurnAge) {
 			// Re-recording a tool result (e.g. a re-run with the same
-			// toolCallId — a re-call) updates the key, turnIndex, and
-			// toolName, but PRESERVES the override if one is set. The
-			// agent's keep/drop decision survives a re-run — they meant
-			// to keep (or drop) the result, not just the snapshot.
+			// toolCallId — a re-call) updates the key, turnIndex,
+			// toolName, and piTurnAge, but PRESERVES the override if
+			// one is set. The agent's keep/drop decision survives a
+			// re-run — they meant to keep (or drop) the result, not
+			// just the snapshot.
 			const existing = records.get(toolCallId);
 			records.set(toolCallId, {
 				toolName,
 				toolCallId,
 				key,
 				turnIndex,
+				piTurnAge,
 				override: existing?.override,
 			});
 		},
@@ -412,27 +448,30 @@ function lifecycleStateLabel(s: LifecyclePhase): string {
  * `messages` array where each tool-result message has been replaced with
  * the right per-LLM-call-view shape (verbatim / digest / excluded).
  *
- * Algorithm:
- *   1. For each message in `retain`, if it is a tool-result message and
- *      the lifecycle engine has a record for it, apply the lifecycle:
- *        - `kept`        → leave verbatim content as-is
- *        - `dropped`     → exclude from the view
- *        - `retired`     → exclude from the view (the recency filter
- *                          would have already moved this to `trim`, but
- *                          a message can also be explicitly retired via
- *                          the engine)
- *        - `verbatim`    → leave verbatim content as-is (on producing turn)
- *        - `digest`      → replace `content` with the pre-computed
- *                          `details.digest` (or, if the digest is missing
- *                          because the message was loaded from an old
- *                          session, fall back to a `[digest missing]`
- *                          placeholder so the view stays bounded)
- *   2. The `trim` set is appended to the view as a separate "trimmed
- *      history" indicator? No — the trim set is EXCLUDED from the view
- *      by construction. The function returns just the filtered
- *      `messages` array. The session file preserves both verbatim and
- *      digest; the compactor reads the session, not the view.
- *   3. The order within `retain` is preserved (slices, not rearrangements).
+ * T-2720 adds the per-Pi-turn cap to the algorithm. The function now
+ * takes three additional parameters:
+ *   - `currentPiTurn: number` — the value of the module-level
+ *     `piTurnIndex` counter at view time (read from `index.ts`).
+ *   - `piTurnDigestAfter: number` — the K knob (`PI_TURN_DIGEST_AFTER`).
+ *   - `piTurnRetireAfter: number` — the M knob (`PI_TURN_RETIRE_AFTER`).
+ *
+ * Unified rule (the algorithm):
+ *   - `kept`                          → verbatim (override, age-independent)
+ *   - `dropped`                       → excluded
+ *   - `retired` (recency filter)      → excluded
+ *   - `verbatim` and not kept/dropped:
+ *     - if `(currentPiTurn - piTurnAge) > piTurnDigestAfter` (K) → digest
+ *     - else → verbatim (on producing turn) OR digest (later user turn)
+ *   - `digest` and not kept/dropped:
+ *     - if `(currentPiTurn - piTurnAge) > piTurnRetireAfter` (M) → excluded
+ *     - else → digest swap
+ *
+ * The per-Pi-turn clause runs FIRST in the algorithm (M-check before
+ * user-turn logic, K-check inside the verbatim branch) so a tool
+ * result stamped on a recent Pi-turn never goes to digest/retire when
+ * the M and K are higher than the elapsed Pi-turns. The Infinity
+ * defaults (parent) make the per-Pi-turn clause a no-op, which
+ * preserves the T-2717 user-turn-bounded behavior unchanged.
  *
  * The function is pure: it does not mutate `messages` or the state. The
  * output is a fresh array. Union-equals-input invariant: every input
@@ -444,6 +483,9 @@ export function applyLifecycleState(
 	messages: ReadonlyArray<LifecycleMessage>,
 	state: LifecycleState,
 	currentTurn: number,
+	currentPiTurn: number,
+	piTurnDigestAfter: number,
+	piTurnRetireAfter: number,
 ): LifecycleMessage[] {
 	const dropped = state.getDroppedToolCallIds();
 	const out: LifecycleMessage[] = [];
@@ -470,7 +512,28 @@ export function applyLifecycleState(
 			out.push(msg);
 			continue;
 		}
+
+		// Read the per-Pi-turn stamp stamped at `tool_result` time. The
+		// stamp lives on the message's `details.piTurnAge`; if the
+		// message was loaded from an old session without the new field
+		// (the AC-1 side-by-side envelope pre-dates T-2720), treat as
+		// `currentPiTurn` (zero elapsed, the no-op for the per-Pi-turn
+		// clause).
+		const stampedPiTurnAge = readPiTurnAge(msg, currentPiTurn);
+		const piTurnsElapsed = currentPiTurn - stampedPiTurnAge;
+
 		if (lifecycle === "digest") {
+			// M check on digest: if the per-Pi-turn retire cap is
+			// exceeded, exclude from the view (the per-L7 "or token
+			// cap hit" clause; the M knob is the primary retire
+			// signal; the token cap is checked in `index.ts` after
+			// this function returns).
+			if (
+				Number.isFinite(piTurnRetireAfter) &&
+				piTurnsElapsed > piTurnRetireAfter
+			) {
+				continue;
+			}
 			// Swap content to the pre-computed digest.
 			const digest = readDigest(msg);
 			if (digest === null) {
@@ -489,7 +552,49 @@ export function applyLifecycleState(
 			});
 			continue;
 		}
-		// `verbatim` (or unknown) — pass through unchanged.
+
+		// `verbatim` (the producing-turn state, per `getLifecycleState`).
+		// The per-Pi-turn clause is the additional check: even on the
+		// producing user turn, if K is exceeded, force-digest. This is
+		// the per-L7 "force-digest after K Pi-turns" lever — the load-
+		// bearing trim the per-Pi-turn counter provides inside a
+		// subagent (where the user-turn boundary never fires).
+		if (
+			Number.isFinite(piTurnDigestAfter) &&
+			piTurnsElapsed > piTurnDigestAfter
+		) {
+			// M check also applies: if the M cap is exceeded, exclude.
+			if (
+				Number.isFinite(piTurnRetireAfter) &&
+				piTurnsElapsed > piTurnRetireAfter
+			) {
+				continue;
+			}
+			const digest = readDigest(msg);
+			if (digest === null) {
+				out.push({
+					...msg,
+					content: [{ type: "text", text: "[digest: missing — re-request to view]" }],
+				});
+				continue;
+			}
+			out.push({
+				...msg,
+				content: [{ type: "text", text: digest }],
+			});
+			continue;
+		}
+
+		// M check on verbatim (when K didn't fire but M did).
+		if (
+			Number.isFinite(piTurnRetireAfter) &&
+			piTurnsElapsed > piTurnRetireAfter
+		) {
+			continue;
+		}
+
+		// `verbatim` (or unknown) and within K and M — pass through
+		// unchanged.
 		out.push(msg);
 	}
 	return out;
@@ -522,6 +627,24 @@ function readDigest(msg: LifecycleMessage): string | null {
 	return digest;
 }
 
+/**
+ * Read the per-Pi-turn stamp from a tool-result message. The stamp
+ * lives in `details.piTurnAge` (T-2720), written by
+ * `buildToolResultEnvelope` at `tool_result` time. Returns
+ * `currentPiTurn` (a no-op for the per-Pi-turn clause) if the field
+ * is missing — the message was loaded from a pre-T-2720 session, and
+ * the per-Pi-turn cadence did not exist when the tool ran. The
+ * fallback preserves the T-2717 user-turn-bounded behavior for old
+ * sessions.
+ */
+function readPiTurnAge(msg: LifecycleMessage, currentPiTurn: number): number {
+	const details = msg.details;
+	if (!details || typeof details !== "object") return currentPiTurn;
+	const age = details.piTurnAge;
+	if (typeof age !== "number" || !Number.isFinite(age)) return currentPiTurn;
+	return age;
+}
+
 // ─── Tool-result writer (the AC-1 + AC-2 producer) ────────────────────────
 
 /**
@@ -539,14 +662,26 @@ function readDigest(msg: LifecycleMessage): string | null {
  * verbatim `content` AND a `details` carrying the digest, so the
  * persisted message naturally has both.
  *
- * This function is pure: it takes a `DigestibleToolResult` and a
- * turn-index stamp and returns the side-by-side envelope. The
- * `index.ts` handler wires the call.
+ * T-2720 adds the per-Pi-turn stamp (`piTurnIndex`) as a third
+ * argument. The value flows into `details.piTurnAge` so the lifecycle
+ * engine can read it at view time and apply the per-Pi-turn cap
+ * (`piTurnAge <= K` → keep; `piTurnAge > K` → digest). The stamp is
+ * set once at `tool_result` time and never updated; the engine
+ * computes the elapsed Pi-turns on demand from
+ * `(currentPiTurn - stamped value)`.
+ *
+ * This function is pure: it takes a `DigestibleToolResult`, a
+ * turn-index stamp, and a per-Pi-turn stamp, and returns the
+ * side-by-side envelope. The `index.ts` handler wires the call.
  */
 export function buildToolResultEnvelope(
 	event: DigestibleToolResult,
 	turnIndex: number,
-): { content: unknown; details: { digest: string; toolCallId: string; turnIndex: number } } {
+	piTurnIndex: number,
+): {
+	content: unknown;
+	details: { digest: string; toolCallId: string; turnIndex: number; piTurnAge: number };
+} {
 	const digest = digestToolResult(event);
 	return {
 		content: event.content,
@@ -554,6 +689,7 @@ export function buildToolResultEnvelope(
 			digest,
 			toolCallId: event.toolCallId,
 			turnIndex,
+			piTurnAge: piTurnIndex,
 		},
 	};
 }

@@ -324,9 +324,9 @@ describe("digest — length budget", () => {
 describe("lifecycle — state is the unified engine over all tool outputs", () => {
 	it("recordToolResult records every tool output with a unique toolCallId", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-r1", "/foo.ts", 1);
-		state.recordToolResult("bash", "tc-b1", "ls -la", 2);
-		state.recordToolResult("grep", "tc-g1", "TODO@./src", 3);
+		state.recordToolResult("read", "tc-r1", "/foo.ts", 1, 0);
+		state.recordToolResult("bash", "tc-b1", "ls -la", 2, 0);
+		state.recordToolResult("grep", "tc-g1", "TODO@./src", 3, 0);
 		assert.equal(state.records.size, 3, "every tool output gets a record");
 		assert.equal(state.getRecord("tc-r1")?.toolName, "read", "read record is preserved");
 		assert.equal(state.getRecord("tc-b1")?.key, "ls -la", "bash key is the command");
@@ -335,7 +335,7 @@ describe("lifecycle — state is the unified engine over all tool outputs", () =
 
 	it("auto-state: verbatim on the producing turn, digest on later turns", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2, 0);
 		// The current turn is 5: the tool was produced on turn 2,
 		// which is a previous turn → state is `digest`.
 		assert.equal(state.getLifecycleState("tc-1", 5), "digest", "prior turn → digest");
@@ -345,7 +345,7 @@ describe("lifecycle — state is the unified engine over all tool outputs", () =
 
 	it("agent `kept` override pins state at `kept` regardless of age", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2, 0);
 		state.setLifecycleOverride("tc-1", "kept");
 		assert.equal(state.getLifecycleState("tc-1", 5), "kept", "kept override pins state regardless of turn");
 		assert.equal(state.getLifecycleState("tc-1", 2), "kept", "kept override pins state on producing turn too");
@@ -354,7 +354,7 @@ describe("lifecycle — state is the unified engine over all tool outputs", () =
 
 	it("agent `dropped` override excludes the result from the per-LLM-call view", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2, 0);
 		state.setLifecycleOverride("tc-1", "dropped");
 		assert.equal(state.getLifecycleState("tc-1", 5), "dropped", "dropped override excludes the result");
 		assert.equal(state.getLifecycleState("tc-1", 2), "dropped", "dropped override excludes on producing turn too");
@@ -363,9 +363,9 @@ describe("lifecycle — state is the unified engine over all tool outputs", () =
 
 	it("re-recording a tool result preserves the override (the agent's decision survives a re-run)", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2, 0);
 		state.setLifecycleOverride("tc-1", "kept");
-		state.recordToolResult("read", "tc-1", "/foo.ts", 5);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 5, 0);
 		// The override survives the re-record; the turn updates to 5.
 		assert.equal(state.getLifecycleState("tc-1", 5), "kept", "override survives re-record");
 		assert.equal(state.getRecord("tc-1")?.turnIndex, 5, "turnIndex updates to most recent record");
@@ -378,7 +378,7 @@ describe("lifecycle — state is the unified engine over all tool outputs", () =
 
 	it("resetSession clears the records (session-scope contract)", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/foo.ts", 2);
+		state.recordToolResult("read", "tc-1", "/foo.ts", 2, 0);
 		state.setLifecycleOverride("tc-1", "kept");
 		state.resetSession();
 		assert.equal(state.records.size, 0, "records cleared on reset");
@@ -473,11 +473,11 @@ describe("lifecycle — applyLifecycleState (the view-time consumer)", () => {
 
 	it("on the producing turn (age === currentTurn): content is verbatim", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.recordToolResult("bash", "tc-1", "ls", 2, 0);
 		const messages = [
 			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const result = applyLifecycleState(messages, state, 2);
+		const result = applyLifecycleState(messages, state, 2, 0, Infinity, Infinity);
 		assert.equal(result.length, 1, "message preserved");
 		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
 		assert.equal(content, "VERBATIM_OUTPUT", "producing turn → verbatim");
@@ -485,49 +485,49 @@ describe("lifecycle — applyLifecycleState (the view-time consumer)", () => {
 
 	it("on a later turn (age < currentTurn): content is swapped to digest", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.recordToolResult("bash", "tc-1", "ls", 2, 0);
 		const messages = [
 			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const result = applyLifecycleState(messages, state, 5);
+		const result = applyLifecycleState(messages, state, 5, 0, Infinity, Infinity);
 		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
 		assert.equal(content, "DIGEST_OUTPUT", "later turn → digest");
 	});
 
 	it("`kept` override: content stays verbatim regardless of turn", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.recordToolResult("bash", "tc-1", "ls", 2, 0);
 		state.setLifecycleOverride("tc-1", "kept");
 		const messages = [
 			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const result = applyLifecycleState(messages, state, 5);
+		const result = applyLifecycleState(messages, state, 5, 0, Infinity, Infinity);
 		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
 		assert.equal(content, "VERBATIM_OUTPUT", "kept → verbatim regardless of age");
 	});
 
 	it("`dropped` override: message is excluded from the view", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.recordToolResult("bash", "tc-1", "ls", 2, 0);
 		state.setLifecycleOverride("tc-1", "dropped");
 		const messages = [
 			toolResultMessage("tc-1", 2, "VERBATIM_OUTPUT", "DIGEST_OUTPUT"),
 		];
-		const result = applyLifecycleState(messages, state, 5);
+		const result = applyLifecycleState(messages, state, 5, 0, Infinity, Infinity);
 		assert.equal(result.length, 0, "dropped → excluded");
 	});
 
 	it("non-tool-result messages pass through unchanged", () => {
 		const state = createLifecycleState();
 		const userMsg: LifecycleMessage = { role: "user", content: [{ type: "text", text: "hi" }] };
-		const result = applyLifecycleState([userMsg], state, 5);
+		const result = applyLifecycleState([userMsg], state, 5, 0, Infinity, Infinity);
 		assert.equal(result.length, 1, "user message preserved");
 		assert.equal(result[0], userMsg, "user message is the same reference");
 	});
 
 	it("digest-missing fallback: a placeholder is shown so the view stays bounded", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("bash", "tc-1", "ls", 2);
+		state.recordToolResult("bash", "tc-1", "ls", 2, 0);
 		// Message WITHOUT details.digest (old session, message loaded
 		// without the side-by-side envelope).
 		const msg: LifecycleMessage = {
@@ -537,7 +537,7 @@ describe("lifecycle — applyLifecycleState (the view-time consumer)", () => {
 			content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
 			// details absent
 		};
-		const result = applyLifecycleState([msg], state, 5);
+		const result = applyLifecycleState([msg], state, 5, 0, Infinity, Infinity);
 		const content = (result[0]?.content as Array<{ text: string }>)[0]?.text;
 		assert.ok(content?.includes("digest: missing") ?? false, "missing digest → placeholder, not raw content");
 	});
@@ -555,8 +555,8 @@ describe("lifecycle — buildToolOutputDigest (the agent-facing list)", () => {
 
 	it("lists every recorded tool output with its current state", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/a.ts", 1);
-		state.recordToolResult("bash", "tc-2", "ls -la", 2);
+		state.recordToolResult("read", "tc-1", "/a.ts", 1, 0);
+		state.recordToolResult("bash", "tc-2", "ls -la", 2, 0);
 		state.setLifecycleOverride("tc-1", "kept");
 		// currentTurn = 2: tc-1 is on turn 1 (digest), tc-2 is on turn 2 (verbatim)
 		const result = buildToolOutputDigest(state, 2);
@@ -567,7 +567,7 @@ describe("lifecycle — buildToolOutputDigest (the agent-facing list)", () => {
 
 	it("the digest carries the keep/drop affordance instructions", () => {
 		const state = createLifecycleState();
-		state.recordToolResult("read", "tc-1", "/a.ts", 1);
+		state.recordToolResult("read", "tc-1", "/a.ts", 1, 0);
 		const result = buildToolOutputDigest(state, 1);
 		assert.ok(result.includes("keep <key>"), "digest instructs the agent how to keep");
 		assert.ok(result.includes("drop <key>"), "digest instructs the agent how to drop");
@@ -585,12 +585,13 @@ describe("lifecycle — buildToolResultEnvelope (the side-by-side writer)", () =
 			content: textContent("file1.txt", "file2.txt"),
 			isError: false,
 		};
-		const envelope = buildToolResultEnvelope(event, 2);
+		const envelope = buildToolResultEnvelope(event, 2, 0);
 		// The envelope is a `{ content, details }` shape (Storage Shape A).
 		assert.deepEqual(envelope.content, event.content, "content is the verbatim blocks");
 		assert.ok(typeof envelope.details.digest === "string", "details.digest is a string");
 		assert.ok(envelope.details.digest.startsWith(FACT_OF_CALL_LABEL), "details.digest is the digest envelope");
 		assert.equal(envelope.details.toolCallId, "tc-1", "details carries the toolCallId");
 		assert.equal(envelope.details.turnIndex, 2, "details carries the turnIndex");
+		assert.equal(envelope.details.piTurnAge, 0, "details carries the piTurnAge (T-2720 per-Pi-turn stamp)");
 	});
 });

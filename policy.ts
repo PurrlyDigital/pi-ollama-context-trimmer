@@ -89,6 +89,34 @@ export type RecencyBasis = typeof RECENCY_BASIS;
 export const RECENCY_COMFORT_WINDOW = 20;
 export { RECENCY_COMFORT_WINDOW as DEFAULT_RECENCY_WINDOW }; // Back-compat alias for the T-2705 constant.
 
+/**
+ * T-2720 — Per-Pi-turn digest-after threshold (the K knob).
+ *
+ * The default is `Number.POSITIVE_INFINITY` so the parent (which sets no
+ * env) gets the user-turn-bounded behavior unchanged: the per-Pi-turn
+ * clause is a no-op when K = Infinity. The subagent dispatch sets
+ * `process.env.PI_TURN_DIGEST_AFTER` at the dispatch boundary to override
+ * (a small K — typically 1 or 2 — to force-digest tool results after
+ * K Pi-turns have elapsed).
+ *
+ * The constant lives in `policy.ts` (the pure-logic module) so the
+ * default value travels with the rest of the recency/threshold
+ * constants; the env-var read is in `index.ts` (the wiring surface).
+ * Purity contract preserved: no `process.*`, no I/O.
+ */
+export const PI_TURN_DIGEST_AFTER = Number.POSITIVE_INFINITY;
+
+/**
+ * T-2720 — Per-Pi-turn retire-after threshold (the M knob).
+ *
+ * Same shape as `PI_TURN_DIGEST_AFTER` — the default is Infinity for
+ * the parent (the per-Pi-turn retire clause is a no-op), and the
+ * subagent dispatch sets `process.env.PI_TURN_RETIRE_AFTER` to a
+ * finite N to force-retire the oldest tool outputs after N Pi-turns
+ * have elapsed.
+ */
+export const PI_TURN_RETIRE_AFTER = Number.POSITIVE_INFINITY;
+
 // ─── Public types ───────────────────────────────────────────────────────────
 
 /**

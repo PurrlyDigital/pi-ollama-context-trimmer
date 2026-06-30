@@ -1,7 +1,7 @@
 /**
- * T-2717 — Context-trimmer extension entrypoint.
+ * T-2717 + T-2720 — Context-trimmer extension entrypoint.
  *
- * Redesign of the T-2703 / T-2706 / T-2707 extension into the
+ * T-2717 redesigned the T-2703 / T-2706 / T-2707 extension into the
  * keep/digest/retire lifecycle. The shipped T-2703 design was
  * source-digesting at `tool_result` (T-2704 Placement A) — the agent
  * saw the digest, not the verbatim output, on the producing turn.
@@ -12,6 +12,27 @@
  * adds a pinned tier (auto-pin by convention) for always-present
  * essentials, and reframes the recency threshold as a comfort knob
  * (no longer a compaction trigger).
+ *
+ * T-2720 adds a per-Pi-turn cadence to the lifecycle. A subagent
+ * is a single-prompt run with many Pi-turns; the T-2717 user-turn
+ * cadence never fires inside a subagent, so every tool result a
+ * subagent produces stays `verbatim` for the entire subagent run.
+ * T-2720 adds:
+ *   - A `piTurnIndex` counter bumped at `turn_end` (the Pi-turn
+ *     boundary; sibling to `currentTurnIndex` bumped at
+ *     `before_agent_start`).
+ *   - A `piTurnAge` field on `ToolOutputRecord` and the persisted
+ *     message shape, stamped at `tool_result` time.
+ *   - A `piTurnAge <= K` clause in `applyLifecycleState` (the K
+ *     knob: `PI_TURN_DIGEST_AFTER`, default `Infinity` for the
+ *     parent, subagent override via env).
+ *   - A `piTurnAge > M` clause in `applyLifecycleState` (the M
+ *     knob: `PI_TURN_RETIRE_AFTER`, default `Infinity` for the
+ *     parent, subagent override via env).
+ *   - An optional hard token cap (Layer 4 of the `context` handler):
+ *     force-retire oldest tool outputs when the per-LLM-call view
+ *     exceeds `MAX_SESSION_TOKENS` (default 800_000) or
+ *     `PI_SESSION_TOKENS` (subagent override).
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Five paths (AC-5 — the cross-path contract)
@@ -104,7 +125,12 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { trimConversation, type ConversationMessage } from "./policy.ts";
+import {
+	trimConversation,
+	type ConversationMessage,
+	PI_TURN_DIGEST_AFTER,
+	PI_TURN_RETIRE_AFTER,
+} from "./policy.ts";
 import { digestToolResult, type DigestibleToolResult } from "./digest.ts";
 import {
 	createLifecycleState,
@@ -141,6 +167,24 @@ let pinnedTier: PinnedTier = createPinnedTier();
  *  lifecycle engine can compare to the current turn. */
 let currentTurnIndex = 0;
 
+/** T-2720 — Per-session per-Pi-turn counter (monotonic, resets on
+ *  `session_start`, bumped at `turn_end`). Sibling to `currentTurnIndex`
+ *  but tracks a different cadence: `currentTurnIndex` is bumped at
+ *  `before_agent_start` (the user-turn boundary, one bump per user
+ *  prompt); `piTurnIndex` is bumped at `turn_end` (the Pi-turn boundary,
+ *  one bump per LLM-response cycle).
+ *
+ *  Why two counters: a subagent is a single-prompt run with many
+ *  Pi-turns but exactly one user-turn boundary. Reusing
+ *  `currentTurnIndex` for both would confl ate the two cadences
+ *  and undo the `1202d53` regression fix (which moved the user-turn
+ *  bump to `before_agent_start` to keep same-user-turn tool results
+ *  verbatim across the agent's work on that prompt). The per-Pi-turn
+ *  counter is the load-bearing primitive that lets the lifecycle
+ *  engine apply the per-Pi-turn cap inside a subagent where the
+ *  user-turn boundary never fires. */
+let piTurnIndex = 0;
+
 // ─── Public entry point ────────────────────────────────────────────────────
 
 /**
@@ -150,16 +194,44 @@ let currentTurnIndex = 0;
  * The factory is sync — handlers are async, but registration is not.
  */
 export default function contextTrimmerExtension(pi: ExtensionAPI): void {
-	// ── `context` handler (AC-1 + AC-2 + AC-3 + AC-4) ───────────────────
+	// ── `context` handler (AC-1 + AC-2 + AC-3 + AC-4 + T-2720) ──────────
 	// Fired before each LLM call. The handler applies the four layers
 	// in order:
 	//   1. trimConversation (recency comfort window; AC-4)
-	//   2. applyLifecycleState (verbatim/digest/kept/dropped swap; AC-1+2)
+	//   2. applyLifecycleState (verbatim/digest/kept/dropped swap;
+	//      AC-1+2; T-2720 adds the per-Pi-turn cap to the engine)
 	//   3. Pinned-tier injection (auto-pin by convention; AC-3)
+	//   4. T-2720 token-cap check (force-retire oldest tool outputs
+	//      when the per-LLM-call view exceeds the configured token
+	//      budget; the `or` clause in the per-L7 unified retire rule)
 	// The four layers compose: the recency filter carves the candidate
-	// set, the lifecycle engine applies the per-message swap, and the
-	// pinned-tier message is prepended to the result.
+	// set, the lifecycle engine applies the per-message swap, the
+	// pinned-tier message is prepended, and the token cap is the
+	// last-resort ceiling.
 	pi.on("context", (event, ctx) => {
+		// T-2720: read the per-Pi-turn knobs and the token cap at the
+		// top of the handler. The parent leaves the env vars unset
+		// and gets the Infinity defaults (the per-Pi-turn clause
+		// becomes a no-op, preserving the T-2717 user-turn-bounded
+		// behavior). The subagent dispatch sets the env vars at the
+		// dispatch boundary to override. Reading order:
+		//   PI_TURN_DIGEST_AFTER → K (digest threshold)
+		//   PI_TURN_RETIRE_AFTER → M (retire threshold)
+		//   PI_SESSION_TOKENS    → subagent token cap
+		//   MAX_SESSION_TOKENS   → parent token cap (default 800_000)
+		const piTurnDigestAfter = readEnvNumber(
+			"PI_TURN_DIGEST_AFTER",
+			PI_TURN_DIGEST_AFTER,
+		);
+		const piTurnRetireAfter = readEnvNumber(
+			"PI_TURN_RETIRE_AFTER",
+			PI_TURN_RETIRE_AFTER,
+		);
+		const sessionTokensCap = readEnvNumber(
+			"PI_SESSION_TOKENS",
+			readEnvNumber("MAX_SESSION_TOKENS", 800_000),
+		);
+
 		// Bridge: the policy's structural `ConversationMessage` accepts
 		// Pi's `AgentMessage` (the policy documents this — the shape
 		// is discriminated on `role`; extra fields pass through). We
@@ -172,17 +244,23 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// signal.
 		const result = trimConversation(messages);
 
-		// Layer 2: lifecycle state (AC-1 + AC-2). The engine reads the
-		// current turn index, the per-message `age` stamp (written at
-		// `tool_result` time), and the agent's keep/drop overrides.
-		// The output is a fresh `retain` array where each tool-result
-		// message has been swapped to its per-age payload (verbatim
-		// on the producing turn, digest on later turns, kept →
-		// verbatim regardless, dropped → excluded).
+		// Layer 2: lifecycle state (AC-1 + AC-2 + T-2720). The engine
+		// reads the current turn index, the per-message `age` stamp
+		// (written at `tool_result` time), the per-message `piTurnAge`
+		// stamp (T-2720), the per-Pi-turn thresholds (K, M), and the
+		// agent's keep/drop overrides. The output is a fresh `retain`
+		// array where each tool-result message has been swapped to
+		// its per-age payload (verbatim on the producing turn and
+		// within K, digest when prior user turn OR piTurnAge > K,
+		// excluded when piTurnAge > M, kept → verbatim regardless,
+		// dropped → excluded).
 		const withLifecycle = applyLifecycleState(
 			result.retain as unknown as LifecycleMessage[],
 			lifecycleState,
 			currentTurnIndex,
+			piTurnIndex,
+			piTurnDigestAfter,
+			piTurnRetireAfter,
 		);
 
 		// Layer 3: pinned-tier injection (AC-3). The synthetic message
@@ -191,12 +269,29 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// the top of every call. The pinned message is `display: false`
 		// so the TUI does not render it as a visible line.
 		const pinnedMessage: PinnedMessage = pinnedTier.buildPinnedMessage();
-		const finalMessages = [
+		let finalMessages: LifecycleMessage[] = [
 			// `custom` role so the LLM sees the content; Pi's existing
 			// custom-message support handles this without a new role.
 			pinnedMessage as unknown as LifecycleMessage,
 			...withLifecycle,
 		];
+
+		// Layer 4: T-2720 token-cap check (the per-L7 "or token cap
+		// hit" clause in the retire branch). The cap is the
+		// last-resort ceiling that runs after the per-Pi-turn cadence
+		// and the recency filter have done their per-message work. If
+		// the per-LLM-call view's approximate token count exceeds the
+		// cap, the handler force-retires the oldest tool-result
+		// messages (by `piTurnAge` descending) until the count is
+		// under the cap. The "force-retire" is a per-call exclusion
+		// from the view, NOT a state mutation — the engine stays pure.
+		// Approximate token count: `text.length / 4` for each text
+		// block (the standard `chars/4` heuristic). The cap is
+		// applied LAST so the per-Pi-turn cadence and the recency
+		// filter get first crack at trimming.
+		if (Number.isFinite(sessionTokensCap)) {
+			finalMessages = applyTokenCap(finalMessages, sessionTokensCap);
+		}
 
 		// Surface a low-noise status-bar item for the operator. The
 		// status carries the tool-output count; it does not need UI
@@ -213,7 +308,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		return { messages: finalMessages as unknown as typeof event.messages };
 	});
 
-	// ── `turn_end` handler (AC-3) ───────────────────────────────────────
+	// ── `turn_end` handler (AC-3 + T-2720) ─────────────────────────────
 	// Fired for each Pi turn (one LLM response + tool calls). The
 	// user-turn boundary is `before_agent_start` (one bump per user
 	// prompt), NOT here — a single user prompt spans many Pi turns
@@ -222,7 +317,20 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	// the agent finished using them (the regression this fix
 	// corrects). `turn_end` only refreshes the pinned tier's last-N
 	// tracker cache (best-effort; newly-created tickets picked up).
+	//
+	// T-2720 adds a SECOND counter that DOES bump here: the per-Pi-turn
+	// counter. The Pi-turn cadence is the right granularity for the
+	// per-Pi-turn cap (a subagent has one user-turn boundary but many
+	// Pi-turns; the cap needs the higher-resolution signal to fire
+	// inside a subagent). The bump is the FIRST line of the handler
+	// (per the AC-5 async seam: the next `context` event must see the
+	// incremented value).
 	pi.on("turn_end", async (_event, _ctx) => {
+		// T-2720: per-Pi-turn cadence. Bumped first so the next
+		// `context` event reads the incremented value (the AC-5 async
+		// seam: the next `context` event must see the incremented
+		// value).
+		piTurnIndex += 1;
 		pinnedTier.bumpTurn();
 		// Refresh the tracker cache on each turn so the pinned
 		// message always reflects the latest work. The refresh is
@@ -231,16 +339,19 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		pinnedTier.refresh();
 	});
 
-	// ── `session_start` handler (AC-2 + AC-3) ───────────────────────────
+	// ── `session_start` handler (AC-2 + AC-3 + T-2720) ─────────────────
 	// Fired when a session is started, loaded, or reloaded. The
-	// handler resets the lifecycle state, the pinned tier, and the
-	// turn counter to honor the session-scope contract (a dropped
-	// tool result in a previous session is dropped in this session
-	// until the agent re-produces it).
+	// handler resets the lifecycle state, the pinned tier, and BOTH
+	// turn counters (user-turn + per-Pi-turn) to honor the session-
+	// scope contract (a dropped tool result in a previous session is
+	// dropped in this session until the agent re-produces it).
 	pi.on("session_start", async () => {
 		lifecycleState = createLifecycleState();
 		pinnedTier = createPinnedTier();
 		currentTurnIndex = 0;
+		// T-2720: reset the per-Pi-turn counter alongside the user-turn
+		// counter. Both are session-scoped; both are reset together.
+		piTurnIndex = 0;
 		// First refresh: populate the personality + last-N tracker
 		// cache so the first `context` call sees a populated pinned
 		// message. The refresh is best-effort.
@@ -258,12 +369,15 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		lifecycleState.resetSession();
 	});
 
-	// ── `tool_result` handler (AC-1 + AC-2) ─────────────────────────────
+	// ── `tool_result` handler (AC-1 + AC-2 + T-2720) ─────────────────
 	// Fired after tool execution finishes. The handler:
 	//   1. Records the tool output in the lifecycle state (so the
-	//      engine knows about it for the view-time swap).
+	//      engine knows about it for the view-time swap). The record
+	//      carries both stamps: the user-turn `turnIndex` (for the
+	//      T-2717 user-turn-bounded swap) and the per-Pi-turn
+	//      `piTurnAge` (for the T-2720 per-Pi-turn cap).
 	//   2. Computes the side-by-side envelope
-	//      (`{ content: verbatim, details: { digest, toolCallId, turnIndex } }`)
+	//      (`{ content: verbatim, details: { digest, toolCallId, turnIndex, piTurnAge } }`)
 	//      and returns it as the partial-patch. Pi persists both
 	//      payloads naturally through the existing partial-patch
 	//      contract (Storage Shape A — the per-AC tension resolution;
@@ -281,18 +395,28 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// is the agent's keep/drop affordance handle (path for
 		// read/write/edit, command for bash, pattern+path for
 		// grep/find, path for ls, tool id for MCP-generic).
+		//
+		// T-2720: pass the current `piTurnIndex` as the per-Pi-turn
+		// stamp. The value is frozen at `recordToolResult` time; the
+		// engine reads it at view time to apply the per-Pi-turn cap.
 		const key = extractToolKey(event_);
 		lifecycleState.recordToolResult(
 			event_.toolName,
 			event_.toolCallId,
 			key,
 			currentTurnIndex,
+			piTurnIndex,
 		);
 
 		// Build the side-by-side envelope. The verbatim content
 		// goes in `content`; the pre-computed digest goes in
-		// `details.digest`. Pi persists both.
-		const envelope = buildToolResultEnvelope(event_, currentTurnIndex);
+		// `details.digest`; the per-Pi-turn stamp goes in
+		// `details.piTurnAge`. Pi persists all three.
+		//
+		// T-2720: pass `piTurnIndex` so the envelope carries the
+		// per-Pi-turn stamp. The stamp travels with the persisted
+		// message; the engine reads it at view time.
+		const envelope = buildToolResultEnvelope(event_, currentTurnIndex, piTurnIndex);
 		return {
 			content: envelope.content as unknown as { type: "text"; text: string }[],
 			details: envelope.details,
@@ -372,6 +496,109 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 }
 
 // ─── Internal helpers ──────────────────────────────────────────────────────
+
+/**
+ * T-2720 — Read a numeric env var with a fallback default. The function
+ * is the seam the per-Pi-turn knobs (K, M) and the token cap use to
+ * reach the engine. The function lives in `index.ts` (the wiring
+ * surface) because the env read is the wiring; the pure-logic modules
+ * (`policy.ts`, `lifecycle-state.ts`) stay process-free.
+ *
+ * A non-integer or non-parseable value falls back to the default
+ * (the parent's Infinity default, or the token cap's 800_000 default).
+ * The fallback is documented behavior — the env var is best-effort,
+ * not a hard contract.
+ */
+function readEnvNumber(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined || raw === "") return fallback;
+	const parsed = Number(raw);
+	if (!Number.isFinite(parsed)) return fallback;
+	return parsed;
+}
+
+/**
+ * T-2720 — Apply the optional hard token cap (Layer 4 of the
+ * `context` handler). If the per-LLM-call view's approximate token
+ * count exceeds the cap, the function force-retires the oldest
+ * tool-result messages (by `piTurnAge` descending) until the count
+ * is under the cap. Non-tool-result messages (user, assistant,
+ * pinned, custom) are never retired by the cap — the cap is a
+ * per-L7 "or token cap hit" clause for tool outputs.
+ *
+ * The "force-retire" is a per-call exclusion from the view, NOT a
+ * state mutation — the engine stays pure. The function returns a
+ * fresh array; if no exclusion is needed, the array is shallow-copied.
+ *
+ * Token counting heuristic: `Math.ceil(text.length / 4)` per text
+ * block (the standard `chars/4` heuristic Pi's `estimateTokens` uses
+ * in `compaction.ts`). The heuristic is approximate; the cap is a
+ * safety net, not a precise budget.
+ */
+function applyTokenCap(
+	messages: LifecycleMessage[],
+	cap: number,
+): LifecycleMessage[] {
+	if (messages.length === 0) return messages.slice();
+	const total = approximateMessageTokens(messages);
+	if (total <= cap) return messages.slice();
+
+	// Walk and exclude oldest tool-results by `piTurnAge` desc until
+	// under cap. The loop preserves order (splice, not rearrangements);
+	// non-tool-result messages and tool-results without a stamp are
+	// skipped (they are not candidates for the cap-driven retire).
+	const working = messages.slice();
+	while (approximateMessageTokens(working) > cap) {
+		let oldestIdx = -1;
+		let oldestAge = -Infinity;
+		for (let i = 0; i < working.length; i++) {
+			const m = working[i];
+			if (!m || m.role !== "toolResult") continue;
+			const details = m.details;
+			if (!details || typeof details !== "object") continue;
+			const age = details.piTurnAge;
+			if (typeof age !== "number" || !Number.isFinite(age)) continue;
+			if (age > oldestAge) {
+				oldestIdx = i;
+				oldestAge = age;
+			}
+		}
+		if (oldestIdx === -1) break; // No more tool-results to retire.
+		working.splice(oldestIdx, 1);
+	}
+	return working;
+}
+
+/**
+ * T-2720 — Approximate the total token count of a messages array.
+ * The heuristic is `Math.ceil(text.length / 4)` per text block,
+ * summed across all messages. Non-text content (images, etc.) is
+ * counted as 0 — the cap is a safety net for textual tool outputs,
+ * not a precise budget for multimedia. The function is pure (no
+ * mutation, no I/O).
+ */
+function approximateMessageTokens(messages: LifecycleMessage[]): number {
+	let total = 0;
+	for (const m of messages) {
+		const content = m.content;
+		if (typeof content === "string") {
+			total += Math.ceil(content.length / 4);
+			continue;
+		}
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (
+				block &&
+				typeof block === "object" &&
+				(block as { type?: string }).type === "text" &&
+				typeof (block as { text?: unknown }).text === "string"
+			) {
+				total += Math.ceil((block as { text: string }).text.length / 4);
+			}
+		}
+	}
+	return total;
+}
 
 /**
  * Extract the agent-facing key for a tool result. The key is the
