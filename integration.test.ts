@@ -215,6 +215,39 @@ function makeDigest(turnIndex: number, toolName: string, key: string): string {
 	return `[factOfCall: ${toolName}(${key})]\n[digest: turn-${turnIndex} digest body]`;
 }
 
+/**
+ * T-2720 — Build a tool-result message with the per-Pi-turn stamp
+ * (`details.piTurnAge`) in addition to the user-turn stamp (`age`).
+ * The engine's per-Pi-turn clause reads `details.piTurnAge` (not the
+ * recorded state's `piTurnAge`); the fixture must carry the stamp
+ * explicitly for the T-2720 tests to exercise the clause.
+ */
+function makeToolResultMessageWithPiTurn(opts: {
+	toolName: string;
+	toolCallId: string;
+	age: number;
+	piTurnAge: number;
+	verbatimContent: string;
+	digestContent: string;
+	input?: Record<string, unknown>;
+}) {
+	return {
+		role: "toolResult" as const,
+		toolCallId: opts.toolCallId,
+		toolName: opts.toolName,
+		age: opts.age,
+		input: opts.input ?? {},
+		content: [{ type: "text", text: opts.verbatimContent }],
+		details: {
+			digest: opts.digestContent,
+			turnIndex: opts.age,
+			piTurnAge: opts.piTurnAge,
+			toolCallId: opts.toolCallId,
+		},
+		isError: false,
+	};
+}
+
 // ─── AC-1: live Pi session with auto-discovered extension ──────────────────
 
 describe("AC-1: extension module loads + registers handlers", () => {
@@ -783,5 +816,388 @@ describe("AC-5: integration tests run green against the assembled extension", ()
 		const mockPi = await loadExtension();
 		// If we got here, the extension loaded successfully.
 		assert.ok(mockPi, "Extension must load without errors");
+	});
+});
+
+// ─── T-2720: per-Pi-turn cadence (AC-5 integration tests) ─────────────────
+//
+// The three tests below exercise the per-Pi-turn cadence end-to-end. The
+// cadence is the subagent fix: a subagent is a single-prompt run with
+// many Pi-turns, so the T-2717 user-turn boundary (`before_agent_start`)
+// never fires inside a subagent. The per-Pi-turn counter (`piTurnIndex`,
+// bumped at `turn_end`) is the higher-resolution signal the engine reads
+// to apply the `piTurnAge <= K` clause.
+//
+// The tests pin the `> K` formula (the implementation; the AC-3 prose
+// names `> K`; the AC-5 narrative example requires `>= K` — the
+// inconsistency is surfaced to PM in the report). With `> K`, K=1
+// means "force-digest after 2 Pi-turns elapsed" (the K+1 boundary).
+//
+// The tests use a fresh-extension helper that calls `session_start`
+// to reset the module-level state (`currentTurnIndex`, `piTurnIndex`,
+// `lifecycleState`, `pinnedTier`) between tests, so each test starts
+// with a clean slate. The `process.env` is saved and restored around
+// each test to avoid leaking env vars between tests.
+
+// Env vars the T-2720 `context` handler reads on every call.
+const T2720_ENV_KEYS = [
+	"PI_TURN_DIGEST_AFTER",
+	"PI_TURN_RETIRE_AFTER",
+	"PI_SESSION_TOKENS",
+	"MAX_SESSION_TOKENS",
+] as const;
+
+/** Save the current env values for the T-2720 keys, then apply the
+ *  given overrides. Returns a restore function. */
+function withEnv(
+	overrides: Partial<Record<(typeof T2720_ENV_KEYS)[number], string | undefined>>,
+): () => void {
+	const saved: Record<string, string | undefined> = {};
+	for (const key of T2720_ENV_KEYS) {
+		saved[key] = process.env[key];
+	}
+	for (const [key, value] of Object.entries(overrides)) {
+		if (value === undefined) {
+			delete process.env[key];
+		} else {
+			process.env[key] = value;
+		}
+	}
+	return () => {
+		for (const [key, value] of Object.entries(saved)) {
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+	};
+}
+
+/** Load the extension and call `session_start` to reset module-level
+ *  state (`piTurnIndex`, `currentTurnIndex`, `lifecycleState`,
+ *  `pinnedTier`). Returns the mock pi. */
+async function freshExtensionForT2720() {
+	const mockPi = await loadExtension();
+	const sessionStartHandlers = mockPi.getHandlers("session_start");
+	if (sessionStartHandlers.length > 0) {
+		await sessionStartHandlers[0]({}, createMockContext());
+	}
+	return mockPi;
+}
+
+describe("T-2720: per-Pi-turn cadence (AC-5 integration tests)", () => {
+	// ─── Test 1: subagent K=1 force-digests after Pi-turns exceed K ─────
+	//
+	// The subagent scenario: a subagent is a single-prompt run with
+	// many Pi-turns but no `before_agent_start` between events. The
+	// user-turn counter (`currentTurnIndex`) stays at 0; the per-Pi-turn
+	// counter (`piTurnIndex`) bumps at each `turn_end`. The T-2717
+	// user-turn logic would keep the tool-result verbatim (age ===
+	// currentTurn); the per-Pi-turn clause is what force-digests.
+	//
+	// With K=1 and the implemented `> K` formula:
+	//   - After 1 turn_end: piTurnsElapsed = 1, 1 > 1 = false → verbatim
+	//   - After 2 turn_ends: piTurnsElapsed = 2, 2 > 1 = true → digest
+	//
+	// The test pins the `> K` form: K=1 is the K+1 boundary, not the
+	// K boundary. The AC-5 narrative example (K=1, 1 turn_end → digest)
+	// requires the `>= K` form; the discrepancy is surfaced to PM in
+	// the report (per the dispatch brief's follow-up flag).
+	it("subagent scenario: K=1 force-digests tool output after Pi-turns exceed K", async () => {
+		const restore = withEnv({ PI_TURN_DIGEST_AFTER: "1" });
+		try {
+			const mockPi = await freshExtensionForT2720();
+			const toolResultHandlers = mockPi.getHandlers("tool_result");
+			const turnEndHandlers = mockPi.getHandlers("turn_end");
+			const contextHandlers = mockPi.getHandlers("context");
+
+			// Drive a single tool call: the tool_result handler records
+			// the lifecycle state with piTurnAge = 0 (the current
+			// piTurnIndex after session_start reset). No
+			// before_agent_start fires — this is the subagent shape.
+			await toolResultHandlers[0](
+				{
+					toolName: "bash",
+					toolCallId: "tc-1",
+					input: { command: "ls" },
+					content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+					details: {},
+					isError: false,
+				},
+				createMockContext(),
+			);
+
+			// Bump piTurnIndex once: piTurnIndex is now 1.
+			// currentTurnIndex stays at 0 (no before_agent_start).
+			await turnEndHandlers[0]({}, createMockContext());
+
+			// Build a message with piTurnAge = 0 (the stamp from
+			// tool_result time). The engine reads details.piTurnAge
+			// from the message, not from the recorded state.
+			// With K=1, piTurnsElapsed = 1 - 0 = 1, 1 > 1 = false →
+			// still verbatim (pins the `> K` form).
+			const messagesAfterOneTurnEnd = [
+				makeUserMessage("hi"),
+				makeAssistantMessage(""),
+				makeToolResultMessageWithPiTurn({
+					toolName: "bash",
+					toolCallId: "tc-1",
+					age: 0,
+					piTurnAge: 0,
+					verbatimContent: "VERBATIM_OUTPUT",
+					digestContent: "DIGEST_OUTPUT",
+					input: { command: "ls" },
+				}),
+			];
+			const resultAfterOne = await contextHandlers[0](
+				{ messages: messagesAfterOneTurnEnd },
+				createMockContext(),
+			);
+			const outAfterOne = (resultAfterOne as { messages: Array<{ role: string; content: unknown }> }).messages;
+			const toolMsgAfterOne = outAfterOne.find((m) => m.role === "toolResult");
+			assert.ok(toolMsgAfterOne, "tool-result is in the output after 1 turn_end");
+			const contentAfterOne = (toolMsgAfterOne?.content as Array<{ text: string }>)[0]?.text;
+			assert.equal(
+				contentAfterOne,
+				"VERBATIM_OUTPUT",
+				"K=1, after 1 turn_end: still verbatim (pins the > K form: elapsed=1, 1>1=false)",
+			);
+
+			// Bump piTurnIndex again: piTurnIndex is now 2.
+			// currentTurnIndex stays at 0.
+			await turnEndHandlers[0]({}, createMockContext());
+
+			// Re-run context with the same message (piTurnAge=0).
+			// With K=1, piTurnsElapsed = 2 - 0 = 2, 2 > 1 = true →
+			// digest (the force-digest fires after K+1 Pi-turns).
+			const messagesAfterTwoTurnEnds = [
+				makeUserMessage("hi"),
+				makeAssistantMessage(""),
+				makeToolResultMessageWithPiTurn({
+					toolName: "bash",
+					toolCallId: "tc-1",
+					age: 0,
+					piTurnAge: 0,
+					verbatimContent: "VERBATIM_OUTPUT",
+					digestContent: "DIGEST_OUTPUT",
+					input: { command: "ls" },
+				}),
+			];
+			const resultAfterTwo = await contextHandlers[0](
+				{ messages: messagesAfterTwoTurnEnds },
+				createMockContext(),
+			);
+			const outAfterTwo = (resultAfterTwo as { messages: Array<{ role: string; content: unknown }> }).messages;
+			const toolMsgAfterTwo = outAfterTwo.find((m) => m.role === "toolResult");
+			assert.ok(toolMsgAfterTwo, "tool-result is in the output after 2 turn_ends");
+			const contentAfterTwo = (toolMsgAfterTwo?.content as Array<{ text: string }>)[0]?.text;
+			assert.equal(
+				contentAfterTwo,
+				"DIGEST_OUTPUT",
+				"K=1, after 2 turn_ends: digest (force-digest fires: elapsed=2, 2>1=true)",
+			);
+		} finally {
+			restore();
+		}
+	});
+
+	// ─── Test 2: parent K=∞ (default) preserves user-turn-bounded behavior ─
+	//
+	// The parent (multi-prompt conversation) does not set the env vars;
+	// the defaults in `policy.ts` are `Number.POSITIVE_INFINITY`. The
+	// per-Pi-turn clause becomes a no-op (piTurnsElapsed > Infinity is
+	// always false). The T-2717 user-turn logic still applies: the
+	// tool-result was stamped on user turn 0, currentTurnIndex is
+	// still 0 (no before_agent_start), so age === currentTurn →
+	// verbatim. The test pins the parent no-op behavior so a future
+	// refactor cannot silently break the parent.
+	it("parent scenario: K=Infinity (default) preserves the user-turn-bounded behavior", async () => {
+		// No env set — the parent leaves the env unset and gets the
+		// Infinity default from `policy.ts`.
+		const mockPi = await freshExtensionForT2720();
+		const toolResultHandlers = mockPi.getHandlers("tool_result");
+		const turnEndHandlers = mockPi.getHandlers("turn_end");
+		const contextHandlers = mockPi.getHandlers("context");
+
+		// Drive a single tool call. The tool_result handler records
+		// turnIndex = 0, piTurnAge = 0.
+		await toolResultHandlers[0](
+			{
+				toolName: "bash",
+				toolCallId: "tc-1",
+				input: { command: "ls" },
+				content: [{ type: "text", text: "VERBATIM_OUTPUT" }],
+				details: {},
+				isError: false,
+			},
+			createMockContext(),
+		);
+
+		// Bump piTurnIndex 5 times. currentTurnIndex stays at 0
+		// (no before_agent_start — the parent is on a single user
+		// prompt spanning many Pi-turns).
+		for (let i = 0; i < 5; i++) {
+			await turnEndHandlers[0]({}, createMockContext());
+		}
+
+		// Build a message with piTurnAge = 0. With K=Infinity,
+		// piTurnsElapsed = 5, 5 > Infinity = false → the per-Pi-turn
+		// clause is a no-op. The user-turn logic: record.turnIndex
+		// (0) === currentTurnIndex (0) → verbatim.
+		const messages = [
+			makeUserMessage("hi"),
+			makeAssistantMessage(""),
+			makeToolResultMessageWithPiTurn({
+				toolName: "bash",
+				toolCallId: "tc-1",
+				age: 0,
+				piTurnAge: 0,
+				verbatimContent: "VERBATIM_OUTPUT",
+				digestContent: "DIGEST_OUTPUT",
+				input: { command: "ls" },
+			}),
+		];
+		const result = await contextHandlers[0]({ messages }, createMockContext());
+		const out = (result as { messages: Array<{ role: string; content: unknown }> }).messages;
+		const toolMsg = out.find((m) => m.role === "toolResult");
+		assert.ok(toolMsg, "tool-result is in the output (K=Infinity, per-Pi-turn clause is a no-op)");
+		const content = (toolMsg?.content as Array<{ text: string }>)[0]?.text;
+		assert.equal(
+			content,
+			"VERBATIM_OUTPUT",
+			"K=Infinity: per-Pi-turn clause is a no-op; user-turn logic keeps it verbatim (age === currentTurn)",
+		);
+	});
+
+	// ─── Test 3: token cap force-retires oldest tool output ───────────
+	//
+	// The optional hard token cap (Layer 4 of the `context` handler)
+	// force-retires the oldest tool-output messages (by `piTurnAge`
+	// descending) when the per-LLM-call view's approximate token
+	// count exceeds the configured cap. The test drives 5 tool
+	// results with distinct piTurnAge stamps (via turn_end between
+	// each tool_result), sets a cap that requires retiring 3 of the
+	// 5, and asserts the 3 oldest (highest piTurnAge) are excluded
+	// while the 2 newest (lowest piTurnAge) are preserved.
+	//
+	// The cap is computed relative to the pinned message size: the
+	// pinned message is always present and cannot be retired by the
+	// cap. The test first runs context once to capture the pinned
+	// message size, then sets the cap to (pinned + 2 tool-results)
+	// so exactly 3 tool-results are retired.
+	it("token cap: force-retires oldest tool output when session exceeds N tokens", async () => {
+		// Each tool-result carries ~1000 tokens of content.
+		const TOOL_TOKENS = 1000;
+		const largeContent = "x".repeat(TOOL_TOKENS * 4); // 4 chars per token.
+
+		const restore = withEnv({ PI_TURN_DIGEST_AFTER: undefined });
+		try {
+			const mockPi = await freshExtensionForT2720();
+			const toolResultHandlers = mockPi.getHandlers("tool_result");
+			const turnEndHandlers = mockPi.getHandlers("turn_end");
+			const contextHandlers = mockPi.getHandlers("context");
+
+			// Drive 5 tool_results with turn_end between each, so each
+			// gets a distinct piTurnAge stamp (0, 1, 2, 3, 4).
+			const toolCallIds = ["tc-1", "tc-2", "tc-3", "tc-4", "tc-5"];
+			for (let i = 0; i < 5; i++) {
+				await toolResultHandlers[0](
+					{
+						toolName: "bash",
+						toolCallId: toolCallIds[i],
+						input: { command: `echo ${i}` },
+						content: [{ type: "text", text: largeContent }],
+						details: {},
+						isError: false,
+					},
+					createMockContext(),
+				);
+				// Bump piTurnIndex between tool_results so each gets
+				// a distinct stamp. After the loop: piTurnIndex = 5.
+				if (i < 4) {
+					await turnEndHandlers[0]({}, createMockContext());
+				}
+			}
+
+			// First, run context once to capture the pinned message
+			// size. The pinned message is always present and cannot
+			// be retired by the cap; the cap must accommodate it.
+			const baselineMessages = [
+				makeUserMessage("hi"),
+				makeAssistantMessage(""),
+				...toolCallIds.map((id, i) =>
+					makeToolResultMessageWithPiTurn({
+						toolName: "bash",
+						toolCallId: id,
+						age: 0,
+						piTurnAge: i, // tc-1: 0, tc-2: 1, ..., tc-5: 4
+						verbatimContent: largeContent,
+						digestContent: "d",
+						input: { command: `echo ${i}` },
+					}),
+				),
+			];
+			const baselineResult = await contextHandlers[0](
+				{ messages: baselineMessages },
+				createMockContext(),
+			);
+			const baselineOut = (baselineResult as { messages: Array<{ role: string; content: unknown }> }).messages;
+			const pinnedMsg = baselineOut[0];
+			assert.ok(pinnedMsg, "pinned message is the first message in the view");
+			const pinnedChars = JSON.stringify(pinnedMsg).length;
+			const pinnedTokens = Math.ceil(pinnedChars / CHARS_PER_TOKEN);
+
+			// Set the cap to (pinned + 2 tool-results) so the cap
+			// must retire 3 of the 5 tool-results to get under the
+			// cap. The cap retires the oldest (highest piTurnAge)
+			// first: tc-5, tc-4, tc-3 are retired; tc-1 and tc-2
+			// (lowest piTurnAge) are preserved.
+			const cap = pinnedTokens + 2 * TOOL_TOKENS;
+			const restoreCap = withEnv({ MAX_SESSION_TOKENS: String(cap) });
+			try {
+				const cappedResult = await contextHandlers[0](
+					{ messages: baselineMessages },
+					createMockContext(),
+				);
+				const cappedOut = (cappedResult as { messages: Array<{ role: string; toolCallId?: string }> }).messages;
+
+				// The 3 oldest (tc-3, tc-4, tc-5) are retired.
+				const remainingToolCallIds = cappedOut
+					.filter((m) => m.role === "toolResult")
+					.map((m) => m.toolCallId);
+				assert.ok(
+					!remainingToolCallIds.includes("tc-3"),
+					"tc-3 (piTurnAge=2) is retired (oldest retired first)",
+				);
+				assert.ok(
+					!remainingToolCallIds.includes("tc-4"),
+					"tc-4 (piTurnAge=3) is retired (oldest retired first)",
+				);
+				assert.ok(
+					!remainingToolCallIds.includes("tc-5"),
+					"tc-5 (piTurnAge=4) is retired (oldest retired first)",
+				);
+				// The 2 newest (tc-1, tc-2) are preserved.
+				assert.ok(
+					remainingToolCallIds.includes("tc-1"),
+					"tc-1 (piTurnAge=0) is preserved (newest preserved)",
+				);
+				assert.ok(
+					remainingToolCallIds.includes("tc-2"),
+					"tc-2 (piTurnAge=1) is preserved (newest preserved)",
+				);
+				// Total tool-results in the view: 2 (the preserved ones).
+				assert.equal(
+					remainingToolCallIds.length,
+					2,
+					`Expected 2 tool-results preserved (tc-1, tc-2), got ${remainingToolCallIds.length}`,
+				);
+			} finally {
+				restoreCap();
+			}
+		} finally {
+			restore();
+		}
 	});
 });
