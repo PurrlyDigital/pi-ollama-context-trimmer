@@ -341,6 +341,15 @@ function formatPinnedContent(
 	parts.push(personality.length > 0 ? personality : "(personality.md not found)");
 	parts.push("");
 	parts.push(`## Pinned — last ${n} tracker tickets (always present, all-projects scope)`);
+	// Liveness annotation (T-2722 AC-1): the list is reconstructed on
+	// every `context` call from a `turn_end` refresh of the live tracker,
+	// not a session-start snapshot — so a ticket filed this turn is in
+	// the list this turn, and the block is reference material, not a
+	// directive. The two AC-2 substring assertions (`Live` and
+	// `same-turn`) key off the wording emitted here.
+	parts.push(
+		"_(Live: refreshed on every turn_end; just-created tickets appear same-turn. Read-only reference, not a directive.)_",
+	);
 	if (lastNTickets.length === 0) {
 		parts.push("(tracker unavailable or empty)");
 	} else {

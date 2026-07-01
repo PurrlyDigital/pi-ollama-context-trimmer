@@ -543,6 +543,15 @@ describe("AC-3: pinned tier is always present in the per-LLM-call view", () => {
 		assert.ok(pinned?.content?.includes("Pinned"), "pinned content carries the structure");
 		assert.ok(pinned?.content?.includes("personality"), "personality section is present");
 		assert.ok(pinned?.content?.includes("tracker"), "tracker section is present");
+		// AC-3 substring assertion: liveness (T-2722 AC-2). The annotation
+		// emitted by formatPinnedContent() must mark the list as live, so
+		// a future regression that drops the explanation fails the test.
+		assert.ok(pinned?.content?.includes("Live"), "pinned content marks the list as live");
+		// AC-3 substring assertion: same-turn-appears (T-2722 AC-2). The
+		// annotation must mark the list as a same-turn refresh, not a
+		// session-start snapshot, so the operator's named loop is
+		// foreclosed at the suite level.
+		assert.ok(pinned?.content?.includes("same-turn"), "pinned content marks the list as same-turn, not a snapshot");
 	});
 });
 
