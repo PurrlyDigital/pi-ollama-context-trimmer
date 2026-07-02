@@ -119,6 +119,12 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				customType: PINNED_CUSTOM_TYPE,
 			},
 			...rawMessages.map((m, i) => ({
+				// Preserve all original pi-specific fields (usage, toolCallId,
+				// details, timestamp, id, parentId, model, …). Pi's downstream
+				// reads message.usage.totalTokens; reconstructing with only the
+				// trim fields dropped usage and threw "reading 'totalTokens'" on
+				// undefined. Spread the source, then layer the trim stamps on top.
+				...m,
 				role: stampedAges[i].role as TrimmableMessage["role"],
 				content: m.content,
 				userTurnAge: stampedAges[i].userTurnAge,
