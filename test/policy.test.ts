@@ -13,6 +13,7 @@ import {
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	extractText,
+	isPathPreserved,
 	isProtectedSlot,
 	totalTrimmableTokens,
 	VERBATIM_TIER_MAX_TOKENS,
@@ -46,6 +47,11 @@ function toolResultMsg(text: string): TrimmableMessage {
 /** Build a pinned-tier synthetic (the agent-def carrier). */
 function pinnedMsg(text: string): TrimmableMessage {
 	return { role: "custom", content: text, customType: "context-trimmer-pinned" };
+}
+
+/** Build a tool-result fixture carrying a stamped source path. */
+function toolResultWithPath(text: string, sourcePath: string): TrimmableMessage {
+	return { role: "toolResult", content: text, details: { sourcePath } };
 }
 
 /** Build a trimmable mass of roughly N tokens (chars = N * 4). */
@@ -414,6 +420,327 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 		const result = applyThreeTierTrim(messages, { summarizer });
 		// The fallback summarize path fires.
 		assert.ok(result.summarized >= 1);
+	});
+});
+
+// ─── isPathPreserved predicate (pure) ──────────────────────────────
+
+describe("isPathPreserved (pure path-match predicate)", () => {
+	it("matches a fuzzy pattern (no leading / or ~/) by basename", () => {
+		assert.equal(
+			isPathPreserved("/home/operator/project/AGENTS.md", ["AGENTS.md"]),
+			true,
+		);
+		assert.equal(
+			isPathPreserved("/var/lib/foo/AGENTS.md", ["AGENTS.md"]),
+			true,
+		);
+	});
+
+	it("does not match a fuzzy pattern when the basename differs", () => {
+		assert.equal(
+			isPathPreserved("/home/operator/project/CLAUDE.md", ["AGENTS.md"]),
+			false,
+		);
+	});
+
+	it("matches an absolute pattern (leading /) by path.normalize equality", () => {
+		assert.equal(
+			isPathPreserved("/home/operator/AGENTS.md", ["/home/operator/AGENTS.md"]),
+			true,
+		);
+		// Redundant separators collapse via path.normalize.
+		assert.equal(
+			isPathPreserved("/home/operator//AGENTS.md", ["/home/operator/AGENTS.md"]),
+			true,
+		);
+	});
+
+	it("does not match an absolute pattern when the normalized path differs", () => {
+		assert.equal(
+			isPathPreserved("/home/operator/CLAUDE.md", ["/home/operator/AGENTS.md"]),
+			false,
+		);
+	});
+
+	it("matches an absolute pattern with ~ (the wiring has expanded ~/)", () => {
+		// The wiring expands ~/ via os.homedir(); the predicate
+		// sees the expanded form on both sides. We test the
+		// predicate at its seam: the expanded pattern matches the
+		// expanded path.
+		assert.equal(
+			isPathPreserved("/home/operator/AGENTS.md", ["/home/operator/AGENTS.md"]),
+			true,
+		);
+	});
+
+	it("returns false when sourcePath is undefined", () => {
+		assert.equal(isPathPreserved(undefined, ["AGENTS.md"]), false);
+		assert.equal(isPathPreserved(undefined, ["/abs/path"]), false);
+	});
+
+	it("returns false when patterns is empty", () => {
+		assert.equal(isPathPreserved("/abs/AGENTS.md", []), false);
+	});
+
+	it("returns false when no pattern matches (all-or-nothing validation: an invalid entry is skipped, not a global no-op)", () => {
+		// Empty strings and non-string entries are skipped; a valid
+		// entry that does not match still leaves the predicate as
+		// false. The all-or-nothing contract is in the config
+		// layer; the predicate is permissive on shape.
+		assert.equal(
+			isPathPreserved("/abs/AGENTS.md", ["", "CLAUDE.md"]),
+			false,
+		);
+	});
+
+	it("returns true on first match in the patterns list", () => {
+		assert.equal(
+			isPathPreserved("/abs/AGENTS.md", ["CLAUDE.md", "AGENTS.md"]),
+			true,
+		);
+	});
+});
+
+// ─── isProtectedSlot with preservedPatterns ────────────────────────
+
+describe("isProtectedSlot — preservedPatterns channel", () => {
+	it("protects a message whose details.sourcePath matches a fuzzy pattern", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("contents of AGENTS.md", "/repo/AGENTS.md"),
+		];
+		assert.equal(
+			isProtectedSlot(messages[1], 1, messages, new Set(), true, ["AGENTS.md"]),
+			true,
+		);
+	});
+
+	it("protects a message whose details.sourcePath matches an absolute pattern", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("contents", "/home/operator/AGENTS.md"),
+		];
+		assert.equal(
+			isProtectedSlot(
+				messages[1],
+				1,
+				messages,
+				new Set(),
+				true,
+				["/home/operator/AGENTS.md"],
+			),
+			true,
+		);
+	});
+
+	it("does not protect a message whose sourcePath is absent", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultMsg("no source path"),
+		];
+		assert.equal(
+			isProtectedSlot(messages[1], 1, messages, new Set(), true, ["AGENTS.md"]),
+			false,
+		);
+	});
+
+	it("does not protect a message whose sourcePath does not match", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("contents", "/repo/CLAUDE.md"),
+		];
+		assert.equal(
+			isProtectedSlot(messages[1], 1, messages, new Set(), true, ["AGENTS.md"]),
+			false,
+		);
+	});
+
+	it("preservedPatterns is independent of the dispatch and customType channels", () => {
+		// A custom pinned message is still protected even when its
+		// sourcePath does not match a preserved pattern.
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("agent def"),
+			userMsg("dispatch", 0),
+			toolResultWithPath("contents", "/repo/CLAUDE.md"),
+		];
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		assert.equal(
+			isProtectedSlot(messages[0], 0, messages, protectedSet, true, ["AGENTS.md"]),
+			true,
+		);
+		// Dispatch is still protected by its own channel.
+		assert.equal(
+			isProtectedSlot(messages[1], 1, messages, protectedSet, true, ["AGENTS.md"]),
+			true,
+		);
+		// A trimmable message with a non-matching source path is not protected.
+		assert.equal(
+			isProtectedSlot(messages[2], 2, messages, protectedSet, true, ["AGENTS.md"]),
+			false,
+		);
+	});
+
+	it("preservedPatterns defaults to empty (no paths preserved)", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("contents", "/repo/AGENTS.md"),
+		];
+		// No preservedPatterns argument → no path protection.
+		assert.equal(
+			isProtectedSlot(messages[1], 1, messages, new Set(), true),
+			false,
+		);
+	});
+});
+
+// ─── Budget accounting with preservedPatterns ───────────────────────
+
+describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
+	it("subtracts tokens of a tool-result whose sourcePath matches a preserved pattern", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(2000), "/repo/AGENTS.md"),
+			assistantMsg("a".repeat(2000)),
+		];
+		// Without preservedPatterns, both the tool result and the
+		// assistant count: 2000/4 + 2000/4 = 1000.
+		assert.equal(totalTrimmableTokens(messages), 1000);
+		// With ["AGENTS.md"], the tool result is subtracted, leaving
+		// only the assistant: 2000/4 = 500.
+		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 500);
+	});
+
+	it("preserved tokens are not counted in the budget", () => {
+		// A session whose only over-budget contributor is a
+		// preserved-path message does not trigger a trim. Build
+		// exactly that: a preserved message is the only over-50k
+		// contributor; the rest is well under cap.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
+			assistantMsg("a".repeat(100 * 4)),
+		];
+		// Only the assistant (100 tokens) is trimmable. Under 50k.
+		assert.ok(
+			totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]) <
+				VERBATIM_TIER_MAX_TOKENS,
+		);
+	});
+});
+
+// ─── End-to-end preserved-paths across the three tiers ─────────────
+
+describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("preserves a message whose sourcePath matches a fuzzy pattern in tier 2 (summarize)", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(40_000 * 4), "/repo/AGENTS.md"),
+			assistantMsg("b".repeat(40_000 * 4)),
+		];
+		// Total trimmable without patterns: 80k. With ["AGENTS.md"],
+		// the tool result is subtracted: 40k only → verbatim tier.
+		// So this session should NOT trigger a summarize on the
+		// preserved message; the assistant, if over cap, would be
+		// the only candidate.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+		});
+		// The preserved tool result is verbatim (its content
+		// unchanged), and the budget was satisfied without trimming
+		// it. Find the preserved message in the output.
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preserved, "preserved tool result must be in the output");
+		assert.equal(preserved!.content, "a".repeat(40_000 * 4));
+	});
+
+	it("preserves a message whose sourcePath matches an absolute pattern in tier 3 (drop)", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath(
+				"a".repeat(60_000 * 4),
+				"/home/operator/CLAUDE.md",
+			),
+			assistantMsg("b".repeat(60_000 * 4)),
+		];
+		// Trimmable mass without patterns: 120k → tier 3. With the
+		// absolute pattern, only the assistant counts (60k) → tier 2.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["/home/operator/CLAUDE.md"],
+		});
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/home/operator/CLAUDE.md",
+		);
+		assert.ok(preserved, "preserved tool result must survive tier 3");
+		assert.equal(preserved!.content, "a".repeat(60_000 * 4));
+		// And no turns were dropped (the assistant was summarized
+		// instead, since the only trimmable mass is the assistant
+		// at 60k).
+		assert.equal(result.droppedTurns, 0);
+	});
+
+	it("a session whose only over-budget contributor is a preserved message does not trigger a trim", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
+			assistantMsg("short"),
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+		});
+		// Trimmable is just the assistant "short" (5 chars / 4 = 2
+		// tokens). Verbatim tier. No summarize, no drop.
+		assert.equal(result.summarized, 0);
+		assert.equal(result.droppedTurns, 0);
+	});
+
+	it("preservedPatterns and protectedCustomTypes are independent channels", () => {
+		// A custom pinned message stays protected even when its
+		// sourcePath does not match any preserved pattern.
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("agent def " + "p".repeat(20_000 * 4)),
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(30_000 * 4), "/repo/AGENTS.md"),
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+			preservedPatterns: ["AGENTS.md"],
+		});
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "pinned custom message must survive");
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preserved, "preserved tool result must survive");
+	});
+
+	it("preservedPatterns defaults to no paths preserved (no behavior change for callers)", () => {
+		// A tool result carrying a source path is not protected
+		// when preservedPatterns is not passed.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
+			assistantMsg("b".repeat(60_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		// Trimmable mass is 120k → tier 3, drops the first trimmable
+		// turn (the tool result). The preserved message is dropped.
+		assert.equal(preserved, undefined);
+		assert.ok(result.droppedTurns >= 1);
 	});
 });
 
