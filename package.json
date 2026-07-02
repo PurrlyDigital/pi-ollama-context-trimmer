@@ -1,0 +1,56 @@
+{
+  "name": "pi-ollama-context-trimmer",
+  "version": "0.1.0",
+  "description": "Pi extension that trims LLM-bound message streams against a three-tier token budget (verbatim / summa-summarize / hard-drop). Required for subagents to survive long tool-result tails.",
+  "author": "Purrly Digital",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PurrlyDigital/pi-ollama-context-trimmer.git"
+  },
+  "homepage": "https://github.com/PurrlyDigital/pi-ollama-context-trimmer#readme",
+  "bugs": {
+    "url": "https://github.com/PurrlyDigital/pi-ollama-context-trimmer/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "context-trimmer",
+    "tokens",
+    "trim",
+    "summarize",
+    "ai",
+    "agents",
+    "cli"
+  ],
+  "files": [
+    "*.ts",
+    "tsconfig.json",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "tsx --test policy.test.ts integration.test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "tsx": "^4.22.5"
+  }
+}

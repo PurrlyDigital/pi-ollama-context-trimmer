@@ -1,4 +1,4 @@
-// ─── Integration tests — T-2736 three-tier trim wiring ────────────────
+// ─── Integration tests — three-tier trim wiring ────────────────────────
 //
 // Exercises the extension end-to-end: load the default export, register
 // a `context` handler, invoke it with a synthetic conversation, and
@@ -88,19 +88,23 @@ describe("extension wiring", () => {
 // ─── End-to-end: verbatim tier ─────────────────────────────────────────
 
 describe("context handler — verbatim tier (small conversation)", () => {
-	it("returns the input unchanged for a small conversation", async () => {
+	it("returns the input plus a pinned-tier synthetic for a small conversation", async () => {
 		const pi = await loadExtension();
 		const event = {
 			messages: [userMsg("dispatch"), assistantMsg("hello")],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// The handler returns a `messages` array. Two messages out.
-		assert.equal(result.messages.length, 2);
-		// The first message is the dispatch task (still user, content unchanged).
-		assert.equal(result.messages[0].role, "user");
-		assert.equal(result.messages[0].content, "dispatch");
-		assert.equal(result.messages[1].role, "assistant");
-		assert.equal(result.messages[1].content, "hello");
+		// The handler returns a `messages` array. The pinned-tier
+		// synthetic is always prepended, so three messages out.
+		assert.equal(result.messages.length, 3);
+		// The first message is the pinned-tier synthetic.
+		assert.equal(result.messages[0].role, "custom");
+		assert.equal((result.messages[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
+		// The second message is the dispatch task (still user, content unchanged).
+		assert.equal(result.messages[1].role, "user");
+		assert.equal(result.messages[1].content, "dispatch");
+		assert.equal(result.messages[2].role, "assistant");
+		assert.equal(result.messages[2].content, "hello");
 	});
 });
 

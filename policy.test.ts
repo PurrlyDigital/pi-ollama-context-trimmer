@@ -1,4 +1,4 @@
-// ─── Policy tests — T-2736 three-tier trim ────────────────────────────
+// ─── Policy tests — three-tier trim ──────────────────────────────────
 //
 // Covers the three tiers, the protected slots (dispatch task +
 // pinned-tier synthetic), the per-message token accounting, the

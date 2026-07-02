@@ -1,5 +1,5 @@
 /**
- * T-2717 — Pinned tier module (auto-pin by convention).
+ * Pinned tier module (auto-pin by convention).
  *
  * Owns the auto-pinned content the agent always sees: `personality.md`
  * (the agent's voice/identity substrate in `~/.pi/agent/`) and the
@@ -12,9 +12,9 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * Why a pinned tier (AC-3 — the load-bearing motivation)
  *
- *   The operator's three original constraints (T-2703: keep it recent /
+ *   The operator's three original constraints (keep it recent /
  *   clean / helpful) require the agent to always have access to a small
- *   set of essentials. The T-2707 BACKUP `keep-mark.ts` opt-in keep-mark
+ *   set of essentials. The BACKUP `keep-mark.ts` opt-in keep-mark
  *   survives the trim, but it requires the agent to explicitly mark
  *   these essentials; the operator wants them auto-pinned by convention.
  *
@@ -33,7 +33,7 @@
  *      verbatim (the file is small; the convention treats it as
  *      "always-present file content," not as a tool result that ages).
  *      Path: `~/.pi/agent/personality.md` (the global location, per the
- *      T-2704 §5 placement decision which locks the trimmer as a global
+ *      the placement decision which locks the trimmer as a global
  *      artifact).
  *   2. Last-N tracker tickets — a digest of the last N tickets' titles
  *      and statuses. Read via the global tracker at
@@ -86,7 +86,7 @@ export const DEFAULT_PINNED_TRACKER_COUNT = 5;
  *  the same global tracker the rest of Purrly uses. */
 export const TRACKER_PATH = "/home/dez/purrly-platform-workspace/.tracker/tracker.py";
 
-/** Path to the agent's personality.md. Global location (T-2704 §5 lock). */
+/** Path to the agent's personality.md. Global location (placement lock). */
 export const PERSONALITY_MD_PATH = join(homedir(), ".pi/agent/personality.md");
 
 /** Custom type for the pinned-tier injection message. The `context`
@@ -322,8 +322,8 @@ function stripTrustWrap(value: string): string {
  *   <personality content verbatim>
  *
  *   ## Pinned — last 5 tracker tickets (always present)
- *   - T-1234 [in_progress] Title of the ticket
- *   - T-1230 [done] Older title
+ *   - <ticket-id> [in_progress] Title of the ticket
+ *   - <ticket-id> [done] Older title
  *   ...
  *
  * The pinned message is a `display: false` customType — the TUI
@@ -341,7 +341,7 @@ function formatPinnedContent(
 	parts.push(personality.length > 0 ? personality : "(personality.md not found)");
 	parts.push("");
 	parts.push(`## Pinned — last ${n} tracker tickets (always present, all-projects scope)`);
-	// Liveness annotation (T-2722 AC-1): the list is reconstructed on
+	// Liveness annotation: the list is reconstructed on
 	// every `context` call from a `turn_end` refresh of the live tracker,
 	// not a session-start snapshot — so a ticket filed this turn is in
 	// the list this turn, and the block is reference material, not a

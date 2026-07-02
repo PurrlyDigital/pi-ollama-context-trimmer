@@ -1,4 +1,4 @@
-// ─── Context Trimmer extension wiring (T-2736 amended design) ─────────
+// ─── Context Trimmer extension wiring (three-tier amended design) ───────
 //
 // The extension trims an LLM-bound message stream against a three-tier
 // budget:
