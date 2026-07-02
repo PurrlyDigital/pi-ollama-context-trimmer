@@ -34,6 +34,13 @@ export interface ContextTrimmerConfig {
 	readonly trackerPath?: string;
 	/** Dispatch-protection mode. */
 	readonly protectDispatch: ProtectDispatchMode;
+	/** Optional list of path patterns whose matching tool-result
+	 *  messages are protected from summary and drop and whose tokens
+	 *  are subtracted from the trimmable budget. Patterns are either
+	 *  bare filenames (fuzzy basename match) or absolute paths
+	 *  (leading `/` or `~/`, with home expansion at the wiring
+	 *  layer). Empty / unset means no paths are preserved. */
+	readonly preservedPaths?: readonly string[];
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -45,6 +52,7 @@ export const ENV = {
 	personalityPath: "PI_CONTEXT_TRIMMER_PERSONALITY_PATH",
 	trackerPath: "PI_CONTEXT_TRIMMER_TRACKER_PATH",
 	protectDispatch: "PI_CONTEXT_TRIMMER_PROTECT_DISPATCH",
+	preservedPaths: "PI_CONTEXT_TRIMMER_PRESERVED_PATHS",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -57,6 +65,7 @@ export interface ParsedConfigFile {
 	personalityPath?: string;
 	trackerPath?: string;
 	protectDispatch?: ProtectDispatchMode;
+	preservedPaths?: readonly string[];
 }
 
 /**
@@ -78,6 +87,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	const pd = o.protectDispatch;
 	if (pd === "auto" || pd === true || pd === false) {
 		out.protectDispatch = pd;
+	}
+	if (Array.isArray(o.preservedPaths) && o.preservedPaths.every(isNonEmptyString)) {
+		out.preservedPaths = o.preservedPaths as readonly string[];
 	}
 	return out;
 }
@@ -104,6 +116,9 @@ export function resolveConfig(opts: {
 	const trackerPath =
 		nonEmpty(env[ENV.trackerPath]) ?? file.trackerPath;
 
+	const preservedPaths =
+		parseListEnv(env[ENV.preservedPaths]) ?? file.preservedPaths;
+
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
 	if (envPd === "1") {
@@ -120,10 +135,28 @@ export function resolveConfig(opts: {
 		personalityPath,
 		trackerPath,
 		protectDispatch,
+		preservedPaths,
 	};
 }
 
 /** Return the string if non-empty, else undefined. */
 function nonEmpty(s: string | undefined): string | undefined {
 	return s && s.length > 0 ? s : undefined;
+}
+
+/** Type guard: a value is a non-empty string. Used to validate each
+ *  element of the `preservedPaths` array; the field is all-or-nothing
+ *  per the existing "badly-typed values are treated as absent" rule. */
+function isNonEmptyString(v: unknown): v is string {
+	return typeof v === "string" && v.length > 0;
+}
+
+/** Parse a comma-separated env value into a trimmed, non-empty list.
+ *  The empty string (and all-whitespace) returns `undefined` so the
+ *  caller can fall through to the next precedence layer. */
+function parseListEnv(s: string | undefined): readonly string[] | undefined {
+	const trimmed = nonEmpty(s);
+	if (trimmed === undefined) return undefined;
+	const parts = trimmed.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
+	return parts.length > 0 ? parts : undefined;
 }
