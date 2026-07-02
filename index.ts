@@ -57,6 +57,7 @@ import { join } from "node:path";
 import {
 	applyThreeTierTrim,
 	defaultSummaSummarizer,
+	isPathPreserved,
 	VERBATIM_TIER_MAX_TOKENS,
 	SUMMARIZE_TIER_MAX_TOKENS,
 	type TrimmableMessage,
@@ -69,6 +70,11 @@ import {
 	type ContextTrimmerConfig,
 	type ProtectDispatchMode,
 } from "./config.ts";
+import {
+	stampSourcePath,
+	rederiveStamp,
+	PRESERVED_CUSTOM_TYPE,
+} from "./path-stamp.ts";
 
 // ─── Per-message stamp: userTurnAge ────────────────────────────────────
 
@@ -112,6 +118,34 @@ const DEFAULT_CONFIG_PATH = join(homedir(), ".pi/agent/context-trimmer.json");
 /** Env var that overrides the config file path (test seam + operators
  *  who keep their config elsewhere). Unset → `DEFAULT_CONFIG_PATH`. */
 const CONFIG_PATH_ENV = "PI_CONTEXT_TRIMMER_CONFIG_PATH";
+
+/**
+ * Expand a list of preserved-path patterns at the wiring layer. The
+ * only `~/` expansion in the codebase lives here (the pure predicate
+ * in `policy.ts` never reads `os.homedir()` — it receives the
+ * expanded pattern as input). Patterns that do not begin with `~/`
+ * pass through unchanged; patterns that begin with `~/` have the
+ * leading `~/` replaced with the operator's home directory. Empty
+ * or undefined patterns yield an empty list.
+ */
+function expandPreservedPaths(
+	patterns: ReadonlyArray<string> | undefined,
+	home: string,
+): ReadonlyArray<string> {
+	if (!patterns || patterns.length === 0) return [];
+	const out: string[] = [];
+	for (const p of patterns) {
+		if (typeof p !== "string" || p.length === 0) continue;
+		if (p.startsWith("~/")) {
+			out.push(home + p.slice(1));
+		} else if (p === "~") {
+			out.push(home);
+		} else {
+			out.push(p);
+		}
+	}
+	return out;
+}
 
 /**
  * Read and parse the config file best-effort. Missing file, parse
@@ -211,31 +245,87 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// return `null` when neither personality nor tracker is
 		// configured. Only prepend when there is content to pin.
 		const pinned = pinnedTier.buildPinnedMessage();
-		const base: TrimmableMessage[] = rawMessages.map((m, i) => ({
-			// Preserve all original pi-specific fields (usage, toolCallId,
-			// details, timestamp, id, parentId, model, …). Pi's downstream
-			// reads message.usage.totalTokens; reconstructing with only the
-			// trim fields dropped usage and threw "reading 'totalTokens'" on
-			// undefined. Spread the source, then layer the trim stamps on top.
-			...m,
-			role: stampedAges[i].role as TrimmableMessage["role"],
-			content: m.content,
-			userTurnAge: stampedAges[i].userTurnAge,
-			customType: typeof m.customType === "string" ? m.customType : undefined,
-		}));
+		// Stamp each trimmable message with its source path so the
+		// preserved-paths predicate (pure, in `policy.ts`) can match
+		// by `details.sourcePath`. The source path is the union of:
+		//   1. `m.details.sourcePath` if the source message carried
+		//      one (e.g. a tool result that already shipped with a
+		//      source-path stamp from the tool-dispatch path).
+		//   2. The re-derived stamp for `m.toolCallId` (a tool result
+		//      that arrived on a prior turn and was persisted via
+		//      `persistStamp`).
+		// Either path yields the source path; the first non-empty
+		// wins. The stamp is on `details.sourcePath` (the locked
+		// decision — `details` over a new top-level field).
+		const home = homedir();
+		const expandedPreservedPatterns = expandPreservedPaths(cfg.preservedPaths, home);
+		const base: TrimmableMessage[] = rawMessages.map((m, i) => {
+			// Source-path extraction: read from `details.sourcePath` first,
+			// fall back to the re-derived stamp for `m.toolCallId`.
+			const detailsObj = m.details;
+			let sourcePath: string | undefined;
+			if (detailsObj && typeof detailsObj === "object") {
+				const fromDetails = (detailsObj as Record<string, unknown>).sourcePath;
+				if (typeof fromDetails === "string" && fromDetails.length > 0) {
+					sourcePath = fromDetails;
+				}
+			}
+			if (sourcePath === undefined) {
+				const toolCallId = (m as { toolCallId?: unknown }).toolCallId;
+				if (typeof toolCallId === "string" && toolCallId.length > 0) {
+					sourcePath = rederiveStamp(toolCallId);
+				}
+			}
+			// Build the trimmable message: spread the source (to
+			// preserve all pi-specific fields), then layer the trim
+			// stamps on top. The source-path stamp goes via the seam
+			// helper so the type contract is enforced.
+			const stamped = stampSourcePath(m, sourcePath) as TrimmableMessage;
+			return {
+				...stamped,
+				role: stampedAges[i].role as TrimmableMessage["role"],
+				content: m.content,
+				userTurnAge: stampedAges[i].userTurnAge,
+				customType: typeof m.customType === "string" ? m.customType : undefined,
+			};
+		});
+		// When a trimmable message's source path matches a preserved
+		// pattern, stamp it with the `PRESERVED_CUSTOM_TYPE` so the
+		// existing `protectedCustomTypes` channel protects it. The
+		// new channel rides the same machinery; no parallel
+		// accounting path needed (per the landscape's "Surrounding-
+		// code reality check" note).
+		const protectedTypes = new Set<string>([PINNED_CUSTOM_TYPE]);
+		if (expandedPreservedPatterns.length > 0) {
+			for (const m of base) {
+				const sourcePath = (m.details as Record<string, unknown> | undefined)?.sourcePath;
+				if (typeof sourcePath === "string" && sourcePath.length > 0) {
+					if (isPathPreserved(sourcePath, expandedPreservedPatterns)) {
+						m.customType = PRESERVED_CUSTOM_TYPE;
+					}
+				}
+			}
+			protectedTypes.add(PRESERVED_CUSTOM_TYPE);
+		}
 		const withPinned: TrimmableMessage[] = pinned
 			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...base]
 			: base;
 		// Run the three-tier trim. Production uses defaultSummaSummarizer
 		// (a Python `summa` subprocess). The pinned synthetic (when
-		// present) is excluded from the budget via `protectedCustomTypes`.
-		// Dispatch protection is resolved from config (auto/true/false).
+		// present) and any preserved-path message are excluded from
+		// the budget via `protectedCustomTypes`. Dispatch protection
+		// is resolved from config (auto/true/false). The preserved-
+		// paths channel is resolved from config (`preservedPaths`),
+		// with `~/` expanded at the wiring layer to the operator's
+		// home directory (the pure predicate receives the expanded
+		// pattern; it never reads `os.homedir()` itself).
 		const result = applyThreeTierTrim(withPinned, {
 			summarizer: defaultSummaSummarizer,
 			verbatimMaxTokens: VERBATIM_TIER_MAX_TOKENS,
 			summarizeMaxTokens: SUMMARIZE_TIER_MAX_TOKENS,
-			protectedCustomTypes: new Set([PINNED_CUSTOM_TYPE]),
+			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
+			preservedPatterns: expandedPreservedPatterns,
 		});
 		// Cast back to the session message shape and return. The
 		// pinned message rides out at the top (when injected); the rest
