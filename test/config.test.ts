@@ -123,3 +123,105 @@ describe("resolveConfig — precedence", () => {
 		assert.equal(cfg.protectDispatch, false);
 	});
 });
+
+describe("preservedPaths", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: well-typed array of non-empty strings is extracted", () => {
+		const f = parseConfigFile({ preservedPaths: ["AGENTS.md", "CLAUDE.md"] });
+		assert.deepEqual(f.preservedPaths, ["AGENTS.md", "CLAUDE.md"]);
+	});
+
+	it("file parse: array with a non-string element is rejected (field undefined)", () => {
+		const f = parseConfigFile({ preservedPaths: ["AGENTS.md", 42] });
+		assert.equal(f.preservedPaths, undefined);
+	});
+
+	it("file parse: array with an empty string element is rejected (field undefined)", () => {
+		const f = parseConfigFile({ preservedPaths: ["AGENTS.md", ""] });
+		assert.equal(f.preservedPaths, undefined);
+	});
+
+	it("file parse: non-array value is rejected (field undefined)", () => {
+		assert.equal(parseConfigFile({ preservedPaths: "AGENTS.md" }).preservedPaths, undefined);
+		assert.equal(parseConfigFile({ preservedPaths: { a: 1 } }).preservedPaths, undefined);
+		assert.equal(parseConfigFile({ preservedPaths: 42 }).preservedPaths, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		const f = parseConfigFile({ personalityPath: "/p" });
+		assert.equal(f.preservedPaths, undefined);
+	});
+
+	it("file parse: empty array is accepted (no patterns)", () => {
+		const f = parseConfigFile({ preservedPaths: [] });
+		assert.deepEqual(f.preservedPaths, []);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file (env present and non-empty)", () => {
+		const cfg = resolveConfig({
+			file: { preservedPaths: ["file-only"] },
+			env: { [ENV.preservedPaths]: "AGENTS.md,~/CLAUDE.md" } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md", "~/CLAUDE.md"]);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { preservedPaths: ["AGENTS.md"] },
+			env: { [ENV.preservedPaths]: "" } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md"]);
+	});
+
+	it("resolveConfig: file-only (no env) returns the file list", () => {
+		const cfg = resolveConfig({
+			file: { preservedPaths: ["AGENTS.md", "CLAUDE.md"] },
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md", "CLAUDE.md"]);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.preservedPaths, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: comma-separated, trimmed, empties filtered", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.preservedPaths]: "AGENTS.md, CLAUDE.md ,,~/secrets.md" } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md", "CLAUDE.md", "~/secrets.md"]);
+	});
+
+	it("env parse: single value (no commas) is a list of one", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.preservedPaths]: "AGENTS.md" } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md"]);
+	});
+
+	it("env parse: whitespace-only commas are dropped", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.preservedPaths]: "  ,  ,AGENTS.md,  " } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["AGENTS.md"]);
+	});
+
+	it("env parse: all-whitespace / all-commas env is treated as unset", () => {
+		const cfg = resolveConfig({
+			file: { preservedPaths: ["file-only"] },
+			env: { [ENV.preservedPaths]: " , , " } as EnvRecord,
+		});
+		assert.deepEqual(cfg.preservedPaths, ["file-only"]);
+	});
+
+	// --- ENV map ---
+
+	it("ENV.preservedPaths is the documented namespace", () => {
+		assert.equal(ENV.preservedPaths, "PI_CONTEXT_TRIMMER_PRESERVED_PATHS");
+	});
+});
