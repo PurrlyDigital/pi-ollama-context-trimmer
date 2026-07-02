@@ -2,6 +2,8 @@
 
 Pi extension that trims the LLM-bound message stream against a three-tier token budget. Required for subagents to survive long tool-result tails without blowing the model context window.
 
+This extension is currently targeting Ollama Cloud style per-request billing and does not currently discriminate between providers or models. **Use with token-based billing subscriptions is not recommended.** Anthropic and OpenAI (token-based billing) utilize caching based on the full text. This extension will break that caching model. Ollama bills based on request and how much GPU time a request took. This extension works against that.
+
 ## What it does
 
 Every time the LLM is about to be called, the extension inspects the message stream and applies a three-tier trim:
