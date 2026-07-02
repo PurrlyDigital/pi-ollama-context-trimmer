@@ -51,20 +51,24 @@ export const ENV = {
  *  object without pulling in NodeJS.ProcessEnv). */
 export type EnvRecord = Record<string, string | undefined>;
 
+/** The parsed config-file shape (mutable, for the builder). Mirrors the
+ *  non-readonly fields of `ContextTrimmerConfig` plus `protectDispatch`. */
+export interface ParsedConfigFile {
+	personalityPath?: string;
+	trackerPath?: string;
+	protectDispatch?: ProtectDispatchMode;
+}
+
 /**
  * Validate and extract the trimmer-relevant fields from a parsed config
  * file object. Unknown keys are ignored; badly-typed values are treated
  * as absent (the resolver falls back to the next precedence layer).
  * Returns a partial config with only the well-typed fields set.
  */
-export function parseConfigFile(obj: unknown): Partial<Omit<ContextTrimmerConfig, "protectDispatch">> & {
-	protectDispatch?: ProtectDispatchMode;
-} {
+export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (typeof obj !== "object" || obj === null) return {};
 	const o = obj as Record<string, unknown>;
-	const out: Partial<Omit<ContextTrimmerConfig, "protectDispatch">> & {
-		protectDispatch?: ProtectDispatchMode;
-	} = {};
+	const out: ParsedConfigFile = {};
 	if (typeof o.personalityPath === "string" && o.personalityPath.length > 0) {
 		out.personalityPath = o.personalityPath;
 	}
