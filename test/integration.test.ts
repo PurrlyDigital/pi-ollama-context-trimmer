@@ -431,13 +431,13 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const event = {
 			messages: [
 				userMsg("dispatch"),
-				readFileResult(pad("preserved content — AGENTS.md body", 60_000), "/home/dez/work/AGENTS.md"),
+				readFileResult(pad("preserved content — AGENTS.md body", 60_000), join(fixtureDir, "AGENTS.md")),
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
 		assert.ok(preserved, "preserved message must be stamped with PRESERVED_CUSTOM_TYPE");
-		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, "/home/dez/work/AGENTS.md");
+		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, join(fixtureDir, "AGENTS.md"));
 		const preservedText = typeof preserved.content === "string"
 			? preserved.content
 			: JSON.stringify(preserved.content);
@@ -454,13 +454,13 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const event = {
 			messages: [
 				userMsg("dispatch"),
-				shellCatResult(pad("preserved content — CLAUDE.md body", 60_000), "/home/dez/work/CLAUDE.md"),
+				shellCatResult(pad("preserved content — CLAUDE.md body", 60_000), join(fixtureDir, "CLAUDE.md")),
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
 		assert.ok(preserved, "preserved message must be stamped with PRESERVED_CUSTOM_TYPE");
-		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, "/home/dez/work/CLAUDE.md");
+		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, join(fixtureDir, "CLAUDE.md"));
 	});
 
 	it("subtracts preserved tokens from the budget — a session whose only over-budget contributor is the preserved message does not trim", async () => {
@@ -474,7 +474,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const event = {
 			messages: [
 				userMsg("dispatch"),
-				readFileResult(pad("preserved content", 60_000), "/home/dez/work/AGENTS.md"),
+				readFileResult(pad("preserved content", 60_000), join(fixtureDir, "AGENTS.md")),
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
@@ -500,11 +500,11 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 			messages: [
 				userMsg("dispatch"),
 				// Preserved (fuzzy match on AGENTS.md) — embedded in turn 1.
-				readFileResult(pad("preserved body — AGENTS.md", 60_000), "/home/dez/work/AGENTS.md"),
+				readFileResult(pad("preserved body — AGENTS.md", 60_000), join(fixtureDir, "AGENTS.md")),
 				// Trimmable mass pushing the trimmable total past 100k.
 				assistantMsg(pad("a", 60_000)), // 60k trimmable
 				// Preserved (fuzzy match on CLAUDE.md) — embedded in turn 1.
-				shellCatResult(pad("preserved body — CLAUDE.md", 60_000), "/home/dez/work/CLAUDE.md"),
+				shellCatResult(pad("preserved body — CLAUDE.md", 60_000), join(fixtureDir, "CLAUDE.md")),
 				// More trimmable mass to ensure tier 3 is reached.
 				toolResultMsg(pad("b", 60_000)), // 60k trimmable
 			],
@@ -526,7 +526,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		// The first preserved message (read_file shape, AGENTS.md) must survive.
 		const preservedAgents = result.messages.find(
 			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
-				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === "/home/dez/work/AGENTS.md",
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === join(fixtureDir, "AGENTS.md"),
 		);
 		assert.ok(preservedAgents, "preserved read_file result must survive tier-3 drop");
 		const agentsText = typeof preservedAgents.content === "string"
@@ -538,7 +538,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		// The second preserved message (shell cat shape, CLAUDE.md) must survive.
 		const preservedClaude = result.messages.find(
 			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
-				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === "/home/dez/work/CLAUDE.md",
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === join(fixtureDir, "CLAUDE.md"),
 		);
 		assert.ok(preservedClaude, "preserved shell-cat result must survive tier-3 drop");
 		const claudeText = typeof preservedClaude.content === "string"
