@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import contextTrimmerExtension from "../index.ts";
 import { CONFIG_ENV } from "../index.ts";
 import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
+import { PRESERVED_CUSTOM_TYPE } from "../path-stamp.ts";
 import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.ts";
 
 // ─── Pinned-tier opt-in fixture ────────────────────────────────────────
@@ -377,4 +378,228 @@ describe("default summa subprocess", () => {
 		// summarizer on failure).
 		assert.equal(typeof policy.lastSummarizerFailed, "boolean");
 	});
+// ─── Preserved-paths channel (AC-5 + AC-6) ────────────────────────────
+//
+// End-to-end coverage of the new preserved-paths channel. The wiring
+// reads `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` (env) or the config-file
+// `preservedPaths` field, expands `~/` at the wiring layer, and passes
+// the expanded patterns to the trim policy. Messages whose stamped
+// `details.sourcePath` matches a pattern ride out under the
+// `PRESERVED_CUSTOM_TYPE` customType stamp and are protected via the
+// existing `protectedCustomTypes` channel. The two ACs exercised here:
+//
+//   AC-5 — the wiring-layer path-stamp seam is callable; the seam
+//          stamps `details.sourcePath` from a synthetic source
+//          message's `details` field (or via `rederiveStamp` for
+//          `toolCallId`-keyed re-derivation), and the `~/` expansion
+//          happens at the wiring layer (not in the pure predicate).
+//   AC-6 — a preserved message survives tier-2 (verbatim content),
+//          survives tier-3 (in the drop output), its tokens are
+//          subtracted from the budget, and the same holds for at
+//          least two distinct tool-dispatch shapes (the AC-6 floor).
+
+describe("preserved-paths channel — AC-5 + AC-6", () => {
+	let sPreservedPaths: string | undefined;
+	beforeEach(() => {
+		sPreservedPaths = process.env[CONFIG_ENV.preservedPaths];
+	});
+	afterEach(() => {
+		if (sPreservedPaths === undefined) delete process.env[CONFIG_ENV.preservedPaths];
+		else process.env[CONFIG_ENV.preservedPaths] = sPreservedPaths;
+	});
+
+	// Tool-dispatch shape builders — AC-6 requires at least two
+	// distinct shapes. The seam is a single `details.sourcePath` stamp
+	// that any tool-dispatch path can call; the two shapes model a
+	// `read_file` result (with `details: { sourcePath }`) and a shell
+	// `cat` result (the same shape, with a `toolCallId` for the
+	// re-derive path — the seam is content-shape agnostic, which is
+	// the point).
+	function readFileResult(text: string, sourcePath: string): Record<string, unknown> {
+		return { role: "toolResult", content: text, details: { sourcePath } };
+	}
+	function shellCatResult(text: string, sourcePath: string): Record<string, unknown> {
+		return { role: "toolResult", content: text, details: { sourcePath }, toolCallId: `cat:${sourcePath}` };
+	}
+
+	it("preserves a `read_file`-shaped tool result whose `details.sourcePath` matches a fuzzy pattern (verbatim tier)", async () => {
+		// The preserved message alone is over the verbatim cap (60k
+		// tokens). With preserved-tokens subtracted, the trimmable
+		// total is 0 — the session stays in tier 1 (verbatim).
+		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				readFileResult(pad("preserved content — AGENTS.md body", 60_000), join(fixtureDir, "AGENTS.md")),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
+		assert.ok(preserved, "preserved message must be stamped with PRESERVED_CUSTOM_TYPE");
+		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, join(fixtureDir, "AGENTS.md"));
+		const preservedText = typeof preserved.content === "string"
+			? preserved.content
+			: JSON.stringify(preserved.content);
+		assert.ok(preservedText.includes("preserved content — AGENTS.md body"), "preserved content must be verbatim (no summa tag)");
+		assert.ok(!preservedText.includes("[summa:"), "preserved content must not be summarized");
+	});
+
+	it("preserves a shell-`cat`-shaped tool result whose `details.sourcePath` matches a fuzzy pattern (verbatim tier)", async () => {
+		// Second distinct tool-dispatch shape — same fuzzy pattern
+		// match, different shape (a `toolCallId`-keyed result). AC-6
+		// floor: at least two distinct shapes must be covered.
+		process.env[CONFIG_ENV.preservedPaths] = "CLAUDE.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				shellCatResult(pad("preserved content — CLAUDE.md body", 60_000), join(fixtureDir, "CLAUDE.md")),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
+		assert.ok(preserved, "preserved message must be stamped with PRESERVED_CUSTOM_TYPE");
+		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, join(fixtureDir, "CLAUDE.md"));
+	});
+
+	it("subtracts preserved tokens from the budget — a session whose only over-budget contributor is the preserved message does not trim", async () => {
+		// Verbatim tier = 50k trimmable tokens. The preserved message
+		// alone is 60k tokens; without subtraction, the session would
+		// land in tier 2. With subtraction, the trimmable total is 0,
+		// so the session stays in tier 1 (verbatim) and the preserved
+		// content is untouched.
+		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				readFileResult(pad("preserved content", 60_000), join(fixtureDir, "AGENTS.md")),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
+		assert.ok(preserved, "preserved message must survive");
+		const preservedText = typeof preserved.content === "string"
+			? preserved.content
+			: JSON.stringify(preserved.content);
+		assert.ok(!preservedText.includes("[summa:"), "preserved content must not be summarized when its tokens are subtracted from the budget");
+	});
+
+	it("preserves a tool result through the drop tier (tier-3) — AC-6 (b)", async () => {
+		// Build a session that lands in tier 3 (>100k trimmable). The
+		// preserved-path message sits inside the dropped trimmable
+		// turn slice; with the policy's carve-out in place
+		// (dropOldestTurns carves protected messages out of the
+		// dropped slice), the preserved message survives. The
+		// test exercises BOTH distinct tool-dispatch shapes
+		// (read_file + shell cat) per the AC-6 floor.
+		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md,CLAUDE.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				// Preserved (fuzzy match on AGENTS.md) — embedded in turn 1.
+				readFileResult(pad("preserved body — AGENTS.md", 60_000), join(fixtureDir, "AGENTS.md")),
+				// Trimmable mass pushing the trimmable total past 100k.
+				assistantMsg(pad("a", 60_000)), // 60k trimmable
+				// Preserved (fuzzy match on CLAUDE.md) — embedded in turn 1.
+				shellCatResult(pad("preserved body — CLAUDE.md", 60_000), join(fixtureDir, "CLAUDE.md")),
+				// More trimmable mass to ensure tier 3 is reached.
+				toolResultMsg(pad("b", 60_000)), // 60k trimmable
+			],
+		};
+		// Trimmable total: 60k + 60k = 120k (preserved messages are
+		// subtracted from the budget). Tier 3 (drop). Turn 1 spans
+		// indices [1, 5) (everything after the dispatch user anchor
+		// through end-of-stream). The wiring stamps PRESERVED_CUSTOM_TYPE
+		// on the two preserved messages; both must be carved out of
+		// the dropped turn slice and survive.
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+
+		// The dispatch must survive.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must survive the drop");
+
+		// The first preserved message (read_file shape, AGENTS.md) must survive.
+		const preservedAgents = result.messages.find(
+			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === join(fixtureDir, "AGENTS.md"),
+		);
+		assert.ok(preservedAgents, "preserved read_file result must survive tier-3 drop");
+		const agentsText = typeof preservedAgents.content === "string"
+			? preservedAgents.content
+			: JSON.stringify(preservedAgents.content);
+		assert.ok(agentsText.includes("preserved body — AGENTS.md"), "preserved AGENTS.md content must be verbatim (no summa tag)");
+		assert.ok(!agentsText.includes("[summa:"), "preserved AGENTS.md content must not be summarized");
+
+		// The second preserved message (shell cat shape, CLAUDE.md) must survive.
+		const preservedClaude = result.messages.find(
+			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === join(fixtureDir, "CLAUDE.md"),
+		);
+		assert.ok(preservedClaude, "preserved shell-cat result must survive tier-3 drop");
+		const claudeText = typeof preservedClaude.content === "string"
+			? preservedClaude.content
+			: JSON.stringify(preservedClaude.content);
+		assert.ok(claudeText.includes("preserved body — CLAUDE.md"), "preserved CLAUDE.md content must be verbatim (no summa tag)");
+		assert.ok(!claudeText.includes("[summa:"), "preserved CLAUDE.md content must not be summarized");
+
+		// The trimmable turn was dropped: the assistant and tool-result
+		// messages are gone. The drop counter reflects the whole-turn
+		// drop (counted as 1 turn dropped — the carve-out does not
+		// change the turn count, only which messages survive the
+		// slice). Note: the wiring stamps `customType: PRESERVED_CUSTOM_TYPE`
+		// on the carved-out messages but does NOT change their `role`
+		// (the role stays `toolResult`); the filter below checks the
+		// customType, not the role, to identify preserved messages.
+		const droppedTrimmable = result.messages.filter((m) => {
+			const customType = (m as { customType?: string }).customType;
+			if (customType === PINNED_CUSTOM_TYPE) return false;
+			if (customType === PRESERVED_CUSTOM_TYPE) return false;
+			if (m.role === "user") return false;
+			return true;
+		});
+		assert.equal(droppedTrimmable.length, 0, "all non-protected trimmable messages in the dropped turn must be gone");
+	});
+
+	it("expands `~/` at the wiring layer — an absolute `~/...` pattern matches the operator's home", async () => {
+		// The pure predicate in `policy.ts` never reads `os.homedir()`.
+		// The wiring expands `~/` patterns via `os.homedir()` and
+		// passes the expanded pattern to the predicate. Verify the
+		// expansion with a path under the actual `homedir()`.
+		const { homedir } = await import("node:os");
+		const home = homedir();
+		const absPath = `${home}/.pi/agent/AGENTS.md`;
+		process.env[CONFIG_ENV.preservedPaths] = "~/.pi/agent/AGENTS.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				readFileResult(pad("home-dir preserved content", 60_000), absPath),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const preserved = result.messages.find((m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE);
+		assert.ok(preserved, "a `~/` pattern must be expanded at the wiring layer and match the operator's home path");
+		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, absPath);
+	});
+
+	// ─── AC-6 (b) — preserved-path message inside a dropped trimmable turn ───
+	//
+	// The carve-out in `dropOldestTurns` keeps protected messages
+	// inside a dropped turn's [start, end) slice. The test above
+	// ("preserves a tool result through the drop tier (tier-3) — AC-6
+	// (b)") exercises both tool-dispatch shapes (read_file + shell
+	// cat) inside the dropped turn; both preserved messages survive.
+	// The carve-out calls `isProtectedSlot` per message, which is
+	// already OR'd with the preserved-paths channel in the unit-2
+	// work, so the same carve-out also protects dispatch-task and
+	// pinned-tier messages that happen to land inside a dropped turn
+	// (those are carve-out-safe by construction: the dispatch sits
+	// BEFORE the first trimmable turn, and pinned synthetics CLOSE a
+	// trimmable turn rather than sit inside it).
+});
 });

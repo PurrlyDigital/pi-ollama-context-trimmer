@@ -28,6 +28,7 @@
 // them with the token tiers alone.
 
 import { spawnSync } from "node:child_process";
+import * as path from "node:path";
 
 // ─── Constants ─────────────────────────────────────────────────────────
 
@@ -106,6 +107,17 @@ export type TrimOptions = {
 	 * protection above is independent of this flag.
 	 */
 	protectDispatch?: boolean;
+	/**
+	 * Path patterns that mark a message as a protected slot via its
+	 * stamped source path. A message whose `details.sourcePath` matches
+	 * a pattern (per the locked fuzzy-vs-absolute grammar; see
+	 * `isPathPreserved`) is excluded from the budget, never summarized,
+	 * and never dropped. The wiring layer passes the operator-resolved
+	 * `preservedPaths` (with `~/` already expanded via `os.homedir()`)
+	 * here. Defaults to `[]` (no paths preserved) so the predicate
+	 * shape is uniform across all internal call sites.
+	 */
+	preservedPatterns?: ReadonlyArray<string>;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -189,15 +201,90 @@ export function extractText(content: unknown): string {
  * agent-def carrier in this implementation, and it is protected by
  * the `customType` check.
  */
+
+// ─── Path-preserved predicate (preserved-paths channel) ───────────────
+
+/**
+ * A pattern is **absolute** iff it begins with `/` or `~/`. Absolute
+ * patterns match when the expanded, normalized form equals the
+ * source path's normalized form. A **fuzzy** pattern (no leading
+ * `/` or `~/`) matches when the source path's basename equals the
+ * pattern. The wiring layer expands `~/` to the operator's home
+ * directory before the pattern reaches this predicate — the predicate
+ * never reads `os.homedir()` and stays pure-functional.
+ *
+ * `node:path` is a pure-functional Node built-in (no I/O), so it is
+ * acceptable inside `policy.ts` per the AGENTS.md purity contract.
+ * `path.normalize` collapses redundant separators and `..` / `.`
+ * segments without touching the filesystem.
+ */
+function isAbsolutePattern(pattern: string): boolean {
+	return pattern.startsWith("/") || pattern.startsWith("~/");
+}
+
+/**
+ * Pure predicate: does `sourcePath` match any pattern in `patterns`?
+ * Empty `patterns` or `undefined` `sourcePath` short-circuit to
+ * `false`. The match grammar:
+ *
+ *   - Absolute pattern (leading `/` or `~/`): `path.normalize(pattern)
+ *     === path.normalize(sourcePath)`. The wiring has already
+ *     expanded `~/` to the operator's home directory.
+ *   - Fuzzy pattern (no leading `/` or `~/`):
+ *     `path.basename(sourcePath) === pattern`.
+ *
+ * Case-sensitive (Linux default). No glob support. No symlink
+ * resolution. All of those are deferred per AC-4.
+ */
+export function isPathPreserved(
+	sourcePath: string | undefined,
+	patterns: ReadonlyArray<string>,
+): boolean {
+	if (sourcePath === undefined) return false;
+	if (patterns.length === 0) return false;
+	for (const pattern of patterns) {
+		if (typeof pattern !== "string" || pattern.length === 0) continue;
+		if (isAbsolutePattern(pattern)) {
+			if (path.normalize(pattern) === path.normalize(sourcePath)) return true;
+		} else {
+			if (path.basename(sourcePath) === pattern) return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Extract the stamped source path from a TrimmableMessage's
+ * `details` field. The wiring stamps via `details.sourcePath`; the
+ * predicate signature is `sourcePath: string | undefined` regardless
+ * of where the value comes from.
+ */
+function extractSourcePath(msg: TrimmableMessage): string | undefined {
+	const details = msg.details;
+	if (!details || typeof details !== "object") return undefined;
+	const sourcePath = (details as Record<string, unknown>).sourcePath;
+	return typeof sourcePath === "string" ? sourcePath : undefined;
+}
+
+// ─── Protected-slot predicate ──────────────────────────────────────────
+
 export function isProtectedSlot(
 	msg: TrimmableMessage,
 	index: number,
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
+	preservedPatterns: ReadonlyArray<string> = [],
 ): boolean {
 	// Agent-def / pinned-tier synthetic.
 	if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
+		return true;
+	}
+	// Preserved-path slot: the message's stamped source path matches a
+	// preserved pattern. Independent of the dispatch / customType
+	// channels above — the OR is additive, the existing checks stay
+	// first so their semantics are unchanged.
+	if (isPathPreserved(extractSourcePath(msg), preservedPatterns)) {
 		return true;
 	}
 	// Dispatch task: the first user message. Only applies when dispatch
@@ -228,10 +315,11 @@ export function totalTrimmableTokens(
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
+	preservedPatterns: ReadonlyArray<string> = [],
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
 		total += approximateMessageTokens(messages[i]);
 	}
 	return total;
@@ -321,9 +409,10 @@ export function applyThreeTierTrim(
 	const summaWords = options.summaWords ?? SUMMA_WORDS;
 	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
 	const protectDispatch = options.protectDispatch ?? true;
+	const preservedPatterns = options.preservedPatterns ?? [];
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch);
+	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
 	// The "turn" is bounded by user messages: a turn is everything from
@@ -331,20 +420,20 @@ export function applyThreeTierTrim(
 	// including) the next user message. We carve whole turns from the
 	// oldest end.
 	if (total > summarizeMax) {
-		const { messages: dropped, droppedTurns } = dropOldestTurns(messages, summarizeMax, protectedCustomTypes, protectDispatch);
+		const { messages: dropped, droppedTurns } = dropOldestTurns(messages, summarizeMax, protectedCustomTypes, protectDispatch, preservedPatterns);
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch);
+		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns);
 		// If still over summarizeMax (a single trimmable turn is larger
 		// than the tier ceiling), summarize that turn's oldest messages
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch);
+			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch),
+				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns),
 			};
 		}
 		return {
@@ -358,12 +447,12 @@ export function applyThreeTierTrim(
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch);
+		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch),
+			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns),
 		};
 	}
 
@@ -395,6 +484,7 @@ function dropOldestTurns(
 	cap: number,
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
+	preservedPatterns: ReadonlyArray<string>,
 ): { messages: TrimmableMessage[]; droppedTurns: number } {
 	// First pass: identify the trimmable turns and their token mass.
 	// A trimmable turn starts immediately after a non-dispatch user
@@ -419,20 +509,20 @@ function dropOldestTurns(
 		if (isTurnAnchor) {
 			// Close any open trimmable turn at the previous boundary.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns));
 			}
 			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns));
 				turnStart = -1;
 			}
 		}
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
@@ -461,10 +551,10 @@ function dropOldestTurns(
 		// Count trimmable messages in the post-dispatch tail.
 		let trimmableCount = 0;
 		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) trimmableCount++;
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
@@ -477,12 +567,22 @@ function dropOldestTurns(
 		dropSet.add(t.start); // Marker: this turn's start index is dropped.
 		remaining -= t.tokens;
 	}
-	// Build the output: every message NOT inside a dropped turn.
+	// Build the output: every message NOT inside a dropped turn, PLUS
+	// any message inside a dropped turn that is itself a protected
+	// slot (per `isProtectedSlot`). A protected message is never
+	// dropped even when it sits inside a dropped turn's [start, end)
+	// slice — the existing predicate (dispatch / pinned customType /
+	// preserved-paths) carves the protected message out of the
+	// dropped slice so it survives. Without this carve-out, a
+	// preserved-path message that lands inside the oldest trimmable
+	// turn would be dropped with the rest of the turn, violating
+	// AC-6 (b) (a preserved message must survive tier-3 drop).
 	const out: TrimmableMessage[] = [];
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
-		// If this message is inside a dropped turn, skip it.
-		// A turn is dropped iff its start index is in dropSet.
+		// If this message is inside a dropped turn, skip it UNLESS
+		// the message is itself a protected slot. A turn is dropped
+		// iff its start index is in dropSet.
 		let inDroppedTurn = false;
 		for (const t of turns) {
 			if (dropSet.has(t.start) && i >= t.start && i < t.end) {
@@ -490,7 +590,8 @@ function dropOldestTurns(
 				break;
 			}
 		}
-		if (!inDroppedTurn) out.push(msg);
+		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		out.push(msg);
 	}
 	return { messages: out, droppedTurns: dropSet.size };
 }
@@ -505,10 +606,11 @@ function makeTurn(
 	end: number,
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
+	preservedPatterns: ReadonlyArray<string>,
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
 		tokens += approximateMessageTokens(messages[i]);
 	}
 	return { start, end, tokens };
@@ -533,6 +635,7 @@ function summarizeOldestUntilUnder(
 	summaWords: number,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
+	preservedPatterns: ReadonlyArray<string> = [],
 ): { messages: TrimmableMessage[]; summarized: number } {
 	const out = messages.map((m) => m);
 	let summarized = 0;
@@ -542,10 +645,10 @@ function summarizeOldestUntilUnder(
 	// infinite-loop: the replacement content is small, but the
 	// message remains the "oldest" candidate and gets re-picked).
 	let cursor = 0;
-	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch) > cap) {
+	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns) > cap) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor.
-		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, cursor);
+		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor);
 		if (target === -1) break; // Nothing left to summarize (degenerate: a single message is over cap).
 		const msg = out[target];
 		const original = extractText(msg.content);
@@ -585,10 +688,11 @@ function findOldestSummarizable(
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
+	preservedPatterns: ReadonlyArray<string> = [],
 	startFrom = 0,
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
 		return i;
 	}
 	return -1;

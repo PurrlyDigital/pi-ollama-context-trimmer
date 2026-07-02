@@ -83,10 +83,14 @@ Create `~/.pi/agent/context-trimmer.json`:
 {
   "personalityPath": "/absolute/path/to/personality.md",
   "trackerPath": "/absolute/path/to/tracker.py",
-  "protectDispatch": "auto"
+  "protectDispatch": "auto",
+  "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"]
 }
+```
 
 All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent (the resolver falls back to the other channel / defaults).
+
+`preservedPaths` is an optional list of patterns whose matching tool-result messages are protected from summary and drop and whose tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match — it matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match; the `~/` form is expanded to your home directory (e.g. `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`). When `preservedPaths` is unset, no paths are preserved; when set, the patterns above are protected from the trim budget.
 
 ### Environment variables (override the file)
 
@@ -95,6 +99,7 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` | Absolute path to a personality/voice file pinned verbatim on every LLM call. Unset/empty → falls back to the file, then no personality section. |
 | `PI_CONTEXT_TRIMMER_TRACKER_PATH` | Absolute path to a tracker CLI whose last-N ticket digest is pinned. Unset/empty → falls back to the file, then no tracker section. |
 | `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` | `1` forces dispatch protection ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"`. |
+| `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` | Comma-separated list of path patterns whose matching tool-result messages are protected from summary and drop. Bare filenames are fuzzy matches (e.g. `AGENTS.md` matches any AGENTS.md); patterns beginning with `/` or `~/` are absolute matches (e.g. `~/secrets/keys.md` matches that one file). Unset/empty → falls back to the file, then no paths preserved. |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
 When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The trim-policy thresholds below remain compile-time constants.
@@ -111,7 +116,7 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (62 tests, ~1.5s on a modern laptop):
+Run the test suite (104 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
