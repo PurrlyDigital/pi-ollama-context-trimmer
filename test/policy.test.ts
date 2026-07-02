@@ -742,6 +742,53 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.equal(preserved, undefined);
 		assert.ok(result.droppedTurns >= 1);
 	});
+
+	it("carves a preserved-path message out of a dropped trimmable turn (tier-3) — AC-6 (b)", () => {
+		// Build a session that lands in tier 3 (trimmable total > 100k).
+		// The preserved-path message sits inside the dropped trimmable
+		// turn slice. With the carve-out in `dropOldestTurns`
+		// (per the unit-3 fix), the preserved message is excluded from
+		// the dropped slice and survives; the rest of the turn is
+		// dropped as before. The carve-out calls `isProtectedSlot` per
+		// message in the dropped slice, so any of the three protected
+		// channels (dispatch, pinned customType, preserved-paths) keep
+		// a message alive when it lands inside the dropped turn.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			// Preserved (fuzzy match on AGENTS.md) — embedded in turn 1.
+			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
+			// Trimmable mass pushing the trimmable total past 100k.
+			assistantMsg("b".repeat(60_000 * 4)),
+			// Trimmable tail — ensures turn 1 is dropped whole.
+			toolResultMsg("c".repeat(60_000 * 4)),
+		];
+		// Trimmable total: 60k + 60k = 120k (preserved message is
+		// subtracted from the budget). Tier 3 (drop). Turn 1 spans
+		// indices [1, 4) (everything after the dispatch user anchor
+		// through end-of-stream). The preserved message at index 1
+		// must be carved out of the dropped slice and survive.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+		});
+		// The carve-out kept the preserved message alive.
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preserved, "preserved-path message must survive the drop when carved out of the dropped turn");
+		assert.equal(preserved!.content, "a".repeat(60_000 * 4));
+		// The trimmable assistant + tool result in the dropped turn
+		// are gone.
+		const trimmableInTurn = result.messages.filter((m) => {
+			if (m.role === "custom") return false;
+			if (m.role === "user") return false; // dispatch
+			return true;
+		});
+		assert.equal(trimmableInTurn.length, 1, "only the carved-out preserved message survives; the rest of the dropped turn is gone");
+		assert.equal(trimmableInTurn[0], preserved);
+		// The drop counter still reflects the whole-turn drop.
+		assert.equal(result.droppedTurns, 1);
+	});
 });
 
 // ─── Public constants ─────────────────────────────────────────────────

@@ -567,12 +567,22 @@ function dropOldestTurns(
 		dropSet.add(t.start); // Marker: this turn's start index is dropped.
 		remaining -= t.tokens;
 	}
-	// Build the output: every message NOT inside a dropped turn.
+	// Build the output: every message NOT inside a dropped turn, PLUS
+	// any message inside a dropped turn that is itself a protected
+	// slot (per `isProtectedSlot`). A protected message is never
+	// dropped even when it sits inside a dropped turn's [start, end)
+	// slice — the existing predicate (dispatch / pinned customType /
+	// preserved-paths) carves the protected message out of the
+	// dropped slice so it survives. Without this carve-out, a
+	// preserved-path message that lands inside the oldest trimmable
+	// turn would be dropped with the rest of the turn, violating
+	// AC-6 (b) (a preserved message must survive tier-3 drop).
 	const out: TrimmableMessage[] = [];
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
-		// If this message is inside a dropped turn, skip it.
-		// A turn is dropped iff its start index is in dropSet.
+		// If this message is inside a dropped turn, skip it UNLESS
+		// the message is itself a protected slot. A turn is dropped
+		// iff its start index is in dropSet.
 		let inDroppedTurn = false;
 		for (const t of turns) {
 			if (dropSet.has(t.start) && i >= t.start && i < t.end) {
@@ -580,7 +590,8 @@ function dropOldestTurns(
 				break;
 			}
 		}
-		if (!inDroppedTurn) out.push(msg);
+		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		out.push(msg);
 	}
 	return { messages: out, droppedTurns: dropSet.size };
 }

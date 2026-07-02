@@ -486,7 +486,84 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		assert.ok(!preservedText.includes("[summa:"), "preserved content must not be summarized when its tokens are subtracted from the budget");
 	});
 
-	it.todo("preserves a tool result through the drop tier (tier-3) — AC-6 (b) — see drift finding in .deliberations/T-2741/");
+	it("preserves a tool result through the drop tier (tier-3) — AC-6 (b)", async () => {
+		// Build a session that lands in tier 3 (>100k trimmable). The
+		// preserved-path message sits inside the dropped trimmable
+		// turn slice; with the policy's carve-out in place
+		// (dropOldestTurns carves protected messages out of the
+		// dropped slice), the preserved message survives. The
+		// test exercises BOTH distinct tool-dispatch shapes
+		// (read_file + shell cat) per the AC-6 floor.
+		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md,CLAUDE.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				// Preserved (fuzzy match on AGENTS.md) — embedded in turn 1.
+				readFileResult(pad("preserved body — AGENTS.md", 60_000), "/home/dez/work/AGENTS.md"),
+				// Trimmable mass pushing the trimmable total past 100k.
+				assistantMsg(pad("a", 60_000)), // 60k trimmable
+				// Preserved (fuzzy match on CLAUDE.md) — embedded in turn 1.
+				shellCatResult(pad("preserved body — CLAUDE.md", 60_000), "/home/dez/work/CLAUDE.md"),
+				// More trimmable mass to ensure tier 3 is reached.
+				toolResultMsg(pad("b", 60_000)), // 60k trimmable
+			],
+		};
+		// Trimmable total: 60k + 60k = 120k (preserved messages are
+		// subtracted from the budget). Tier 3 (drop). Turn 1 spans
+		// indices [1, 5) (everything after the dispatch user anchor
+		// through end-of-stream). The wiring stamps PRESERVED_CUSTOM_TYPE
+		// on the two preserved messages; both must be carved out of
+		// the dropped turn slice and survive.
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+
+		// The dispatch must survive.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must survive the drop");
+
+		// The first preserved message (read_file shape, AGENTS.md) must survive.
+		const preservedAgents = result.messages.find(
+			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === "/home/dez/work/AGENTS.md",
+		);
+		assert.ok(preservedAgents, "preserved read_file result must survive tier-3 drop");
+		const agentsText = typeof preservedAgents.content === "string"
+			? preservedAgents.content
+			: JSON.stringify(preservedAgents.content);
+		assert.ok(agentsText.includes("preserved body — AGENTS.md"), "preserved AGENTS.md content must be verbatim (no summa tag)");
+		assert.ok(!agentsText.includes("[summa:"), "preserved AGENTS.md content must not be summarized");
+
+		// The second preserved message (shell cat shape, CLAUDE.md) must survive.
+		const preservedClaude = result.messages.find(
+			(m) => (m as { customType?: string }).customType === PRESERVED_CUSTOM_TYPE
+				&& (m as { details?: Record<string, unknown> }).details?.sourcePath === "/home/dez/work/CLAUDE.md",
+		);
+		assert.ok(preservedClaude, "preserved shell-cat result must survive tier-3 drop");
+		const claudeText = typeof preservedClaude.content === "string"
+			? preservedClaude.content
+			: JSON.stringify(preservedClaude.content);
+		assert.ok(claudeText.includes("preserved body — CLAUDE.md"), "preserved CLAUDE.md content must be verbatim (no summa tag)");
+		assert.ok(!claudeText.includes("[summa:"), "preserved CLAUDE.md content must not be summarized");
+
+		// The trimmable turn was dropped: the assistant and tool-result
+		// messages are gone. The drop counter reflects the whole-turn
+		// drop (counted as 1 turn dropped — the carve-out does not
+		// change the turn count, only which messages survive the
+		// slice). Note: the wiring stamps `customType: PRESERVED_CUSTOM_TYPE`
+		// on the carved-out messages but does NOT change their `role`
+		// (the role stays `toolResult`); the filter below checks the
+		// customType, not the role, to identify preserved messages.
+		const droppedTrimmable = result.messages.filter((m) => {
+			const customType = (m as { customType?: string }).customType;
+			if (customType === PINNED_CUSTOM_TYPE) return false;
+			if (customType === PRESERVED_CUSTOM_TYPE) return false;
+			if (m.role === "user") return false;
+			return true;
+		});
+		assert.equal(droppedTrimmable.length, 0, "all non-protected trimmable messages in the dropped turn must be gone");
+	});
 
 	it("expands `~/` at the wiring layer — an absolute `~/...` pattern matches the operator's home", async () => {
 		// The pure predicate in `policy.ts` never reads `os.homedir()`.
@@ -510,30 +587,19 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		assert.equal((preserved as { details?: Record<string, unknown> }).details?.sourcePath, absPath);
 	});
 
-	// ─── Drift finding (AC-6 (b) — preserved INSIDE a dropped trimmable turn) ───
+	// ─── AC-6 (b) — preserved-path message inside a dropped trimmable turn ───
 	//
-	// The "preserves a tool result through the drop tier" test is
-	// marked `it.todo()` because the current `dropOldestTurns` drops
-	// the whole tail slice; a preserved message inside the tail is
-	// dropped with the rest because the policy's whole-turn drop
-	// logic does not carve protected messages out of the dropped
-	// slice.
-	//
-	// The fix is a one-block change in `policy.ts` `dropOldestTurns`:
-	// the output construction step (line ~580) currently copies every
-	// message NOT inside a dropped turn. It should also keep any
-	// message inside a dropped turn that is protected by
-	// `isProtectedSlot` (the existing predicate, already OR'd with
-	// preserved-paths support in the unit-2 work). The pure predicate
-	// correctly returns true for preserved messages; the drop path
-	// just doesn't honor that protection in the output.
-	//
-	// This is a unit-2 drift finding, not a unit-3 issue. The
-	// assembly-level senior review surfaces it to PM with a clear
-	// trace and a one-block fix recommendation. The build's
-	// AC-6 (b) coverage is partial until the policy is patched.
-	//
-	// See the .deliberations/T-2741/ senior implementation authority
-	// drift review for the full receipt.
+	// The carve-out in `dropOldestTurns` keeps protected messages
+	// inside a dropped turn's [start, end) slice. The test above
+	// ("preserves a tool result through the drop tier (tier-3) — AC-6
+	// (b)") exercises both tool-dispatch shapes (read_file + shell
+	// cat) inside the dropped turn; both preserved messages survive.
+	// The carve-out calls `isProtectedSlot` per message, which is
+	// already OR'd with the preserved-paths channel in the unit-2
+	// work, so the same carve-out also protects dispatch-task and
+	// pinned-tier messages that happen to land inside a dropped turn
+	// (those are carve-out-safe by construction: the dispatch sits
+	// BEFORE the first trimmable turn, and pinned synthetics CLOSE a
+	// trimmable turn rather than sit inside it).
 });
 });
