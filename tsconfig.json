@@ -30,9 +30,11 @@
   },
   "include": [
     "./policy.ts",
-    "./policy.test.ts",
+    "./config.ts",
     "./index.ts",
-    "./integration.test.ts",
-    "./pinned-tier.ts"
+    "./pinned-tier.ts",
+    "./test/policy.test.ts",
+    "./test/config.test.ts",
+    "./test/integration.test.ts"
   ]
 }

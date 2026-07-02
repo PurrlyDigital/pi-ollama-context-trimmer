@@ -7,12 +7,67 @@
 // production default (the real Python `summa` subprocess) on a small
 // corpus.
 
-import { describe, it, before } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
-import contextTrimmerExtension from "./index.ts";
-import { PINNED_CUSTOM_TYPE } from "./pinned-tier.ts";
-import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "./policy.ts";
+import { resolve, join } from "node:path";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import contextTrimmerExtension from "../index.ts";
+import { CONFIG_ENV } from "../index.ts";
+import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
+import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.ts";
+
+// ─── Pinned-tier opt-in fixture ────────────────────────────────────────
+//
+// The pinned synthetic (personality + tracker) and dispatch protection
+// are operator-opted-in via config (env overrides file). The tests use
+// the `PI_CONTEXT_TRIMMER_*` env vars to opt in, mirroring how an
+// operator enables the surfaces. Tests that exercise the opt-OUT path
+// (no pinned synthetic, no dispatch protection) restore the unset env
+// per-suite below.
+//
+// Config-file isolation: the resolver also reads a global config file
+// (`~/.pi/agent/context-trimmer.json`). To stop the tests from picking
+// up the operator's real config file on this machine, every suite
+// points `PI_CONTEXT_TRIMMER_CONFIG_PATH` at a non-existent temp path so
+// the file channel is empty; the env channel is the only input.
+
+let fixtureDir: string;
+let savedPersonalityEnv: string | undefined;
+let savedTrackerEnv: string | undefined;
+let savedProtectEnv: string | undefined;
+let savedConfigPathEnv: string | undefined;
+
+before(() => {
+	fixtureDir = mkdtempSync(join(tmpdir(), "ctx-trimmer-"));
+	writeFileSync(join(fixtureDir, "personality.md"), "test personality substrate\n");
+	savedPersonalityEnv = process.env[CONFIG_ENV.personalityPath];
+	savedTrackerEnv = process.env[CONFIG_ENV.trackerPath];
+	savedProtectEnv = process.env[CONFIG_ENV.protectDispatch];
+	savedConfigPathEnv = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	// Point the config file at a non-existent path so the file channel
+	// is empty for every test (env is the only input).
+	process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+	process.env[CONFIG_ENV.personalityPath] = join(fixtureDir, "personality.md");
+	// No tracker configured — the tracker section is omitted; the
+	// pinned synthetic still carries the personality section.
+	delete process.env[CONFIG_ENV.trackerPath];
+	// Dispatch protection ON (simulates pi-subagents being installed).
+	process.env[CONFIG_ENV.protectDispatch] = "1";
+});
+
+after(() => {
+	for (const [k, v] of [
+		[CONFIG_ENV.personalityPath, savedPersonalityEnv],
+		[CONFIG_ENV.trackerPath, savedTrackerEnv],
+		[CONFIG_ENV.protectDispatch, savedProtectEnv],
+		["PI_CONTEXT_TRIMMER_CONFIG_PATH", savedConfigPathEnv],
+	] as const) {
+		if (v === undefined) delete process.env[k];
+		else process.env[k] = v;
+	}
+	rmSync(fixtureDir, { recursive: true, force: true });
+});
 
 // ─── Mock pi ───────────────────────────────────────────────────────────
 
@@ -95,7 +150,8 @@ describe("context handler — verbatim tier (small conversation)", () => {
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// The handler returns a `messages` array. The pinned-tier
-		// synthetic is always prepended, so three messages out.
+		// synthetic is prepended (personality env is set in the
+		// module-level before hook), so three messages out.
 		assert.equal(result.messages.length, 3);
 		// The first message is the pinned-tier synthetic.
 		assert.equal(result.messages[0].role, "custom");
@@ -144,7 +200,8 @@ describe("context handler — pinned-tier injection", () => {
 
 	it("preserves the dispatch task through any tier", async () => {
 		// Build a session that lands in the drop tier (>100k). The
-		// dispatch task must survive.
+		// dispatch task must survive (dispatch protection is ON via the
+		// module-level PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=1).
 		const pi = await loadExtension();
 		const event = {
 			messages: [
@@ -189,6 +246,83 @@ describe("context handler — drop tier with protected slots", () => {
 	});
 });
 
+// ─── Opt-out path (no env configured) ─────────────────────────────────
+//
+// When no personality/tracker env is set and the config file is empty,
+// `buildPinnedMessage` returns `null` and the context handler skips the
+// pinned injection entirely. When `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`
+// is unset and no `subagent` tool is registered (the mock pi registers
+// none), dispatch protection is OFF. These tests isolate that path by
+// unsetting the env per-test (the config-file path stays pointed at the
+// non-existent temp path set in the module-level `before`).
+
+describe("context handler — opt-out path (nothing configured)", () => {
+	let sPersonality: string | undefined;
+	let sTracker: string | undefined;
+	let sProtect: string | undefined;
+
+	beforeEach(() => {
+		sPersonality = process.env[CONFIG_ENV.personalityPath];
+		sTracker = process.env[CONFIG_ENV.trackerPath];
+		sProtect = process.env[CONFIG_ENV.protectDispatch];
+		delete process.env[CONFIG_ENV.personalityPath];
+		delete process.env[CONFIG_ENV.trackerPath];
+		delete process.env[CONFIG_ENV.protectDispatch];
+	});
+	afterEach(() => {
+		for (const [k, v] of [
+			[CONFIG_ENV.personalityPath, sPersonality],
+			[CONFIG_ENV.trackerPath, sTracker],
+			[CONFIG_ENV.protectDispatch, sProtect],
+		] as const) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	});
+
+	it("emits no pinned synthetic when neither surface is configured", async () => {
+		const pi = await loadExtension();
+		const event = { messages: [userMsg("hello"), assistantMsg("hi")] };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.equal(pinned, undefined, "no pinned synthetic when nothing is configured");
+		// The user + assistant pass through verbatim (verbatim tier),
+		// with no prepended synthetic.
+		assert.equal(result.messages.length, 2);
+		assert.equal(result.messages[0].role, "user");
+		assert.equal(result.messages[1].role, "assistant");
+	});
+
+	it("does not treat the first user message as a protected dispatch slot", async () => {
+		// With dispatch protection OFF, the first user message is an
+		// ordinary turn anchor (not exempted). A session that lands in
+		// the drop tier drops the post-anchor turn; the first user
+		// message survives as an anchor (it is not "protected," it is
+		// simply not inside a trimmable turn slice).
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("first prompt"),
+				assistantMsg(pad("a", 60_000)), // 60k trimmable
+				toolResultMsg(pad("b", 60_000)), // 60k (total 120k → drop)
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// No pinned synthetic (nothing configured).
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.equal(pinned, undefined, "no pinned synthetic in opt-out path");
+		// The 120k trimmable turn was dropped; only the anchor user
+		// message remains.
+		assert.equal(result.messages.length, 1);
+		assert.equal(result.messages[0].role, "user");
+		assert.equal(result.messages[0].content, "first prompt");
+	});
+});
+
 // ─── Tier behavior via the policy constants ────────────────────────────
 
 describe("tier constants drive the trim boundaries", () => {
@@ -214,7 +348,7 @@ describe("default summa subprocess", () => {
 		// directly. We do this via dynamic import to keep the path
 		// test-only and avoid pulling the policy into the harness
 		// startup.
-		const policyPath = resolve(import.meta.dirname ?? ".", "policy.ts");
+		const policyPath = resolve(import.meta.dirname ?? ".", "..", "policy.ts");
 		const policy = await import(policyPath);
 		const summarizer = policy.defaultSummaSummarizer;
 		const longText = [
@@ -237,7 +371,7 @@ describe("default summa subprocess", () => {
 	});
 
 	it("the lastSummarizerFailed flag is the diagnostic export", async () => {
-		const policyPath = resolve(import.meta.dirname ?? ".", "policy.ts");
+		const policyPath = resolve(import.meta.dirname ?? ".", "..", "policy.ts");
 		const policy = await import(policyPath);
 		// The export must be a boolean (it's mutated by the default
 		// summarizer on failure).

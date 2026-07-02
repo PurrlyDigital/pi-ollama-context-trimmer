@@ -31,7 +31,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "tsx --test policy.test.ts integration.test.ts"
+    "test": "tsx --test test/policy.test.ts test/config.test.ts test/integration.test.ts"
   },
   "pi": {
     "extensions": [

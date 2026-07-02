@@ -19,7 +19,7 @@ import {
 	SUMMARIZE_TIER_MAX_TOKENS,
 	SUMMA_WORDS,
 	type TrimmableMessage,
-} from "./policy.ts";
+} from "../policy.ts";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -150,6 +150,23 @@ describe("isProtectedSlot", () => {
 		];
 		assert.equal(isProtectedSlot(messages[0], 0, messages), true);
 		assert.equal(isProtectedSlot(messages[1], 1, messages), false);
+	});
+
+	it("does NOT protect the first user message when protectDispatch is false", () => {
+		const messages = [dispatch, assistant];
+		assert.equal(isProtectedSlot(dispatch, 0, messages, new Set(), false), false);
+		assert.equal(isProtectedSlot(assistant, 1, messages, new Set(), false), false);
+	});
+
+	it("still protects a pinned customType when protectDispatch is false", () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [pinned, dispatch, assistant];
+		assert.equal(isProtectedSlot(pinned, 0, messages, protectedSet, false), true);
+		// dispatch is NOT protected when protectDispatch is false, even
+		// with a protected customType set present (the two protections
+		// are independent).
+		assert.equal(isProtectedSlot(dispatch, 1, messages, protectedSet, false), false);
+		assert.equal(isProtectedSlot(assistant, 2, messages, protectedSet, false), false);
 	});
 });
 

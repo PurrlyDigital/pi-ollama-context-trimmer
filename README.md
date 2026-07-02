@@ -16,10 +16,10 @@ Every time the LLM is about to be called, the extension inspects the message str
 
 Subagent protected inputs are **never** counted in the budget, **never** summarized, **never** dropped:
 
-1. **The agent def / pinned-tier synthetic** — travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option.
-2. **The dispatch instructions** — the first user message (identified by `userTurnAge === 0`). The trim policy subtracts its tokens from the cap total so a session whose only over-budget contributor is the dispatch does not trigger a trim.
+1. **The agent def / pinned-tier synthetic** — travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option. This protection applies whenever the pinned synthetic is injected (i.e. when at least one pinned surface is configured).
+2. **The dispatch instructions** — the first user message (identified by `userTurnAge === 0`). The trim policy subtracts its tokens from the cap total so a session whose only over-budget contributor is the dispatch does not trigger a trim. **This protection only applies when the `pi-subagents` extension is installed** — the dispatch concept only exists in a subagent session, so a plain parent session leaves the first user prompt treated as ordinary trimmable content. Detection is automatic (see Config); default is ON when pi-subagents is present.
 
-The extension also injects a **pinned-tier message** on every LLM call: the agent's `personality.md` content plus a live digest of the last 5 tracker tickets across all projects. The injection is reconstructed on every `context` event from the file system + the global tracker; it is not persisted in the session file.
+The extension also injects a **pinned-tier message** on every LLM call: the agent's `personality.md` content (when configured) plus a live digest of the last 5 tracker tickets (when a tracker is configured). The injection is reconstructed on every `context` event from the file system (+ the tracker, if configured); it is not persisted in the session file. **Both pinned surfaces are optional and opt-in** — the extension ships no default paths, and when neither is configured the pinned-tier injection is skipped entirely (no empty placeholder is prepended). See Config below.
 
 ## Prerequisites
 
@@ -50,7 +50,7 @@ The extension is global — once installed, every Pi session (parent and subagen
 ## How the protected inputs are wired
 
 - The agent def travels as a **synthetic `custom` message** (`customType: "context-trimmer-pinned"`) prepended to the per-LLM-call view. The trim policy's `protectedCustomTypes` option matches that customType and excludes the synthetic from the budget.
-- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from summary and drop. The dispatch's tokens are also subtracted from the cap total.
+- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from summary and drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
 - A session that contains ONLY the dispatch + the pinned synthetic + a single short trimmable message (e.g. a freshly dispatched subagent) never enters the trim path: the trimmable mass is under 50k, so the messages are returned verbatim.
 
 ## Config
@@ -63,16 +63,43 @@ The extension's trim policy exposes three constants in `policy.ts`:
 | `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this fall into the drop tier. |
 | `SUMMA_WORDS` | `60` | Word budget for each summa in-place summary. |
 
-The pinned tier exposes four constants in `pinned-tier.ts`:
+The pinned tier exposes two constants in `pinned-tier.ts`:
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `DEFAULT_PINNED_TRACKER_COUNT` | `5` | Number of most-recently-updated tracker tickets injected. |
-| `TRACKER_PATH` | `/home/dez/purrly-platform-workspace/.tracker/tracker.py` | The global tracker CLI. |
-| `PERSONALITY_MD_PATH` | `~/.pi/agent/personality.md` | The agent's pinned voice/identity file. |
+| `DEFAULT_PINNED_TRACKER_COUNT` | `5` | Number of most-recently-updated tracker tickets injected (when a tracker is configured). Currently only works with Purrly's internal tracker. |
 | `PINNED_CUSTOM_TYPE` | `"context-trimmer-pinned"` | The customType stamp on the synthetic pinned message. |
 
-**These are compile-time constants, not environment variables.** To change a threshold, edit the constant in the source file and reinstall. There is no `PI_*` environment-variable knob surface.
+Neither pinned surface ships a default path. Both the personality file and the tracker CLI are **opt-in** — machine-specific, carrying no defaults. There are two config channels, with a fixed precedence (highest first):
+
+1. **Environment variables** (`PI_CONTEXT_TRIMMER_*`) — useful for ad-hoc runs, CI, and tests.
+2. **Global config file** `~/.pi/agent/context-trimmer.json` — the persistent, filesystem-based channel. This is the channel to use when pi is launched by a non-interactive supervisor (systemd, launchd, a container orchestrator) that does not inherit your shell environment: put the paths in the JSON file instead of exporting them in a shell rc the supervisor never sources.
+
+### Config file
+
+Create `~/.pi/agent/context-trimmer.json`:
+
+```json
+{
+  "personalityPath": "/absolute/path/to/personality.md",
+  "trackerPath": "/absolute/path/to/tracker.py",
+  "protectDispatch": "auto"
+}
+
+All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent (the resolver falls back to the other channel / defaults).
+
+### Environment variables (override the file)
+
+| Env var | Effect |
+|---------|--------|
+| `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` | Absolute path to a personality/voice file pinned verbatim on every LLM call. Unset/empty → falls back to the file, then no personality section. |
+| `PI_CONTEXT_TRIMMER_TRACKER_PATH` | Absolute path to a tracker CLI whose last-N ticket digest is pinned. Unset/empty → falls back to the file, then no tracker section. |
+| `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` | `1` forces dispatch protection ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"`. |
+| `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
+
+When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The trim-policy thresholds below remain compile-time constants.
+
+**The trim-policy thresholds are compile-time, not environment variables.** To change a threshold, edit the constant in the source file and reinstall.
 
 The summarize callback can be overridden per-call by passing a `summarizer` option to `applyThreeTierTrim` (this is the test seam — production wires `defaultSummaSummarizer`, which is a Python `summa` subprocess). The `defaultSummaSummarizer` exports a diagnostic flag `lastSummarizerFailed` (let-binding) that flips to `true` if the subprocess errors; consumers can read it after a trim call to surface a warning to the user.
 
@@ -80,11 +107,11 @@ The summarize callback can be overridden per-call by passing a `summarizer` opti
 
 The extension uses a simple approximation: per message, `Math.ceil(text_length / 4)` where `text_length` is the extracted text content (string content is taken as-is; array content is concatenated across `{ type: "text", text: string }` blocks; tool-result blocks are stringified). Non-text content blocks contribute their JSON-stringified length, which undercounts multi-modal content — that bias is the safe direction (we trim sooner rather than later).
 
-The trimmable total is the sum of per-message tokens **minus** the protected-slot tokens (dispatch + any pinned custom). The budget is measured against the trimmable mass, not the raw mass.
+The trimmable total is the sum of per-message tokens **minus** the protected-slot tokens (the pinned synthetic when injected, and the dispatch task when dispatch protection is enabled). The budget is measured against the trimmable mass, not the raw mass.
 
 ## Development
 
-Run the test suite (45 tests, ~1.5s on a modern laptop):
+Run the test suite (62 tests, ~1.5s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
@@ -97,10 +124,12 @@ Project structure:
 
 ```
 index.ts              # Extension wiring: registers session_start / turn_end / context handlers
+config.ts             # Pure config resolver (parse file + merge env over file)
 policy.ts             # Three-tier trim policy (the trim algorithm)
 pinned-tier.ts        # Pinned content reader (personality + last-N tracker tickets)
-policy.test.ts        # Unit tests for the trim policy
-integration.test.ts   # End-to-end tests for the context handler wiring
+test/policy.test.ts    # Unit tests for the trim policy
+test/config.test.ts    # Unit tests for config resolution (precedence + parsing)
+test/integration.test.ts # End-to-end tests for the context handler wiring
 tsconfig.json         # TypeScript config for the extension
 tsconfig.policy.json  # Narrower TypeScript config for the policy module
 package.json          # Pi extension manifest (name, pi-package keyword, pi.extensions, peerDependencies)

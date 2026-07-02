@@ -95,6 +95,17 @@ export type TrimOptions = {
 	 * pinning customType (e.g. `"context-trimmer-pinned"`) here.
 	 */
 	protectedCustomTypes?: ReadonlySet<string>;
+	/**
+	 * Whether to protect the first user message as a subagent dispatch
+	 * slot (exempting it from summary/drop and subtracting its tokens
+	 * from the budget). Defaults to `true`. The wiring layer sets this
+	 * based on whether the `pi-subagents` extension is installed — the
+	 * protection only makes sense in a subagent session, so a plain
+	 * parent session with no subagent tool leaves the first user prompt
+	 * treated as ordinary trimmable content. The customType-based
+	 * protection above is independent of this flag.
+	 */
+	protectDispatch?: boolean;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -183,13 +194,16 @@ export function isProtectedSlot(
 	index: number,
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
+	protectDispatch = true,
 ): boolean {
 	// Agent-def / pinned-tier synthetic.
 	if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 		return true;
 	}
-	// Dispatch task: the first user message.
+	// Dispatch task: the first user message. Only applies when dispatch
+	// protection is enabled (i.e. pi-subagents is installed).
 	if (msg.role !== "user") return false;
+	if (!protectDispatch) return false;
 	if (typeof msg.userTurnAge === "number" && msg.userTurnAge === 0) return true;
 	// Fallback for pre-stamp sessions: first user message by position.
 	if (typeof msg.userTurnAge !== "number") {
@@ -213,10 +227,11 @@ export function isProtectedSlot(
 export function totalTrimmableTokens(
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
+	protectDispatch = true,
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
 		total += approximateMessageTokens(messages[i]);
 	}
 	return total;
@@ -305,9 +320,10 @@ export function applyThreeTierTrim(
 	const summarizer = options.summarizer ?? defaultSummaSummarizer;
 	const summaWords = options.summaWords ?? SUMMA_WORDS;
 	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
+	const protectDispatch = options.protectDispatch ?? true;
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messages, protectedCustomTypes);
+	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
 	// The "turn" is bounded by user messages: a turn is everything from
@@ -315,20 +331,20 @@ export function applyThreeTierTrim(
 	// including) the next user message. We carve whole turns from the
 	// oldest end.
 	if (total > summarizeMax) {
-		const { messages: dropped, droppedTurns } = dropOldestTurns(messages, summarizeMax, protectedCustomTypes);
+		const { messages: dropped, droppedTurns } = dropOldestTurns(messages, summarizeMax, protectedCustomTypes, protectDispatch);
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(dropped, protectedCustomTypes);
+		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch);
 		// If still over summarizeMax (a single trimmable turn is larger
 		// than the tier ceiling), summarize that turn's oldest messages
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes);
+			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes),
+				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch),
 			};
 		}
 		return {
@@ -342,12 +358,12 @@ export function applyThreeTierTrim(
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes);
+		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes),
+			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch),
 		};
 	}
 
@@ -378,13 +394,15 @@ function dropOldestTurns(
 	messages: ReadonlyArray<TrimmableMessage>,
 	cap: number,
 	protectedCustomTypes: ReadonlySet<string>,
+	protectDispatch: boolean,
 ): { messages: TrimmableMessage[]; droppedTurns: number } {
 	// First pass: identify the trimmable turns and their token mass.
 	// A trimmable turn starts immediately after a non-dispatch user
 	// message and runs to either the next non-dispatch user message
 	// (exclusive) or to a protected custom slot, whichever comes
-	// first. The dispatch (userTurnAge === 0) is NOT a trimmable
-	// turn anchor.
+	// first. When dispatch protection is OFF, every user message is a
+	// turn anchor (there is no special dispatch slot); when ON, the
+	// dispatch (userTurnAge === 0) is NOT a trimmable turn anchor.
 	//
 	// The post-dispatch tail (everything after the dispatch, when
 	// there is no follow-up user message yet) is also a trimmable
@@ -397,37 +415,40 @@ function dropOldestTurns(
 	let turnStart = -1;
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
-		if (msg.role === "user" && msg.userTurnAge !== 0) {
+		const isTurnAnchor = msg.role === "user" && (protectDispatch ? msg.userTurnAge !== 0 : true);
+		if (isTurnAnchor) {
 			// Close any open trimmable turn at the previous boundary.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch));
 			}
 			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch));
 				turnStart = -1;
 			}
 		}
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
 	// synthesize a trimmable turn spanning the post-dispatch tail.
 	// This handles sessions where no follow-up user message has
 	// arrived yet — a real and common shape when the context
-	// handler runs mid-LLM-response.
+	// handler runs mid-LLM-response. Only applies when dispatch
+	// protection is ON (the tail is "post-dispatch"); with protection
+	// OFF, any user message already anchored a turn above.
 	//
 	// Exception: a SINGLE trimmable message is left for the
 	// summarize-fallback path (the policy summarizes it instead of
 	// dropping it, since dropping the only trimmable content would
 	// leave the session empty). 2+ trimmable messages are bundled
 	// into a synthetic trimmable turn and dropped whole.
-	if (turns.length === 0) {
+	if (turns.length === 0 && protectDispatch) {
 		// Find the dispatch (first user message with userTurnAge === 0).
 		let dispatchIdx = -1;
 		for (let i = 0; i < messages.length; i++) {
@@ -440,10 +461,10 @@ function dropOldestTurns(
 		// Count trimmable messages in the post-dispatch tail.
 		let trimmableCount = 0;
 		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes)) trimmableCount++;
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
@@ -483,10 +504,11 @@ function makeTurn(
 	start: number,
 	end: number,
 	protectedCustomTypes: ReadonlySet<string>,
+	protectDispatch: boolean,
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
 		tokens += approximateMessageTokens(messages[i]);
 	}
 	return { start, end, tokens };
@@ -510,6 +532,7 @@ function summarizeOldestUntilUnder(
 	summarizer: (text: string, words: number) => string,
 	summaWords: number,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
+	protectDispatch = true,
 ): { messages: TrimmableMessage[]; summarized: number } {
 	const out = messages.map((m) => m);
 	let summarized = 0;
@@ -519,10 +542,10 @@ function summarizeOldestUntilUnder(
 	// infinite-loop: the replacement content is small, but the
 	// message remains the "oldest" candidate and gets re-picked).
 	let cursor = 0;
-	while (totalTrimmableTokens(out, protectedCustomTypes) > cap) {
+	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch) > cap) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor.
-		const target = findOldestSummarizable(out, protectedCustomTypes, cursor);
+		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, cursor);
 		if (target === -1) break; // Nothing left to summarize (degenerate: a single message is over cap).
 		const msg = out[target];
 		const original = extractText(msg.content);
@@ -561,10 +584,11 @@ function summarizeOldestUntilUnder(
 function findOldestSummarizable(
 	messages: ReadonlyArray<TrimmableMessage>,
 	protectedCustomTypes: ReadonlySet<string>,
+	protectDispatch: boolean,
 	startFrom = 0,
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch)) continue;
 		return i;
 	}
 	return -1;
