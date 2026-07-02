@@ -1,356 +1,415 @@
-/**
- * T-2717 — Trim policy unit tests (recency comfort window).
- *
- * Runner: Node's built-in `node:test` (no project install required).
- * Run: `node --experimental-strip-types --test policy.test.ts`
- *
- * The tests cover the redesigned `policy.ts` (per AC-4 of T-2717):
- *   - The recency comfort window is the only retention signal.
- *   - The threshold gate is REMOVED; the filter runs unconditionally.
- *   - `RECENCY_COMFORT_WINDOW = 20` (the renamed default).
- *   - The function is pure: no Pi imports, no I/O, no `Date.now()`.
- *
- * The tests import the same `policy.ts` the production code imports
- * from — no duplicate constants, no shadow modules. The contract is
- * asserted directly on the public API.
- */
+// ─── Policy tests — T-2736 three-tier trim ────────────────────────────
+//
+// Covers the three tiers, the protected slots (dispatch task +
+// pinned-tier synthetic), the per-message token accounting, the
+// oldest-first whole-turn drop, and the summarize-loop semantics.
+// The Python `summa` subprocess is mocked via a deterministic
+// `summarizer` callback; the integration test in
+// `integration.test.ts` exercises the production default separately.
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-
 import {
-	RECENCY_BASIS,
-	RECENCY_COMFORT_WINDOW,
-	DEFAULT_RECENCY_WINDOW,
-	trimConversation,
-	type ConversationMessage,
-	type TrimOptions,
-	type TrimResult,
+	applyThreeTierTrim,
+	approximateMessageTokens,
+	extractText,
+	isProtectedSlot,
+	totalTrimmableTokens,
+	VERBATIM_TIER_MAX_TOKENS,
+	SUMMARIZE_TIER_MAX_TOKENS,
+	SUMMA_WORDS,
+	type TrimmableMessage,
 } from "./policy.ts";
 
-// ─── Test fixtures ──────────────────────────────────────────────────────────
+// ─── Helpers ───────────────────────────────────────────────────────────
 
-/** Build a synthetic user message at index `i`. */
-function user(i: number): ConversationMessage {
-	return { role: "user", content: `user-${i}`, timestamp: i };
+/** A test summarizer that returns a fixed short summary string. */
+function makeTrimmingSummarizer(_words: number = 10) {
+	return (_text: string) => "summary";
 }
 
-/** Build a synthetic assistant message at index `i`. */
-function assistant(i: number): ConversationMessage {
-	return { role: "assistant", content: `assistant-${i}`, timestamp: i };
+/** Build a user-message fixture. */
+function userMsg(text: string, userTurnAge?: number): TrimmableMessage {
+	return { role: "user", content: text, userTurnAge };
 }
 
-/** Build a synthetic tool-result message at index `i`. */
-function toolResult(i: number): ConversationMessage {
-	return { role: "toolResult", content: `tool-${i}`, timestamp: i };
+/** Build an assistant-message fixture. */
+function assistantMsg(text: string): TrimmableMessage {
+	return { role: "assistant", content: text };
 }
 
-/**
- * Build a synthetic conversation of `turnCount` user-message-initiated turns.
- * Each turn is one user message + one assistant message + one tool result.
- * Returns a flat `Message[]`-shaped array.
- */
-function conversation(turnCount: number): ConversationMessage[] {
-	const out: ConversationMessage[] = [];
-	for (let t = 0; t < turnCount; t++) {
-		out.push(user(t));
-		out.push(assistant(t));
-		out.push(toolResult(t));
-	}
-	return out;
+/** Build a tool-result fixture. */
+function toolResultMsg(text: string): TrimmableMessage {
+	return { role: "toolResult", content: text };
 }
 
-// ─── AC-1: constants are named and self-describing ─────────────────────────
+/** Build a pinned-tier synthetic (the agent-def carrier). */
+function pinnedMsg(text: string): TrimmableMessage {
+	return { role: "custom", content: text, customType: "context-trimmer-pinned" };
+}
 
-describe("AC-1 — recency-window measurement basis and default", () => {
-	it("exports RECENCY_BASIS as a named, non-empty string", () => {
-		assert.equal(typeof RECENCY_BASIS, "string");
-		assert.ok(RECENCY_BASIS.length > 0, "RECENCY_BASIS must be a non-empty string");
-		// The named unit is documented in the module header; assert it matches
-		// the load-bearing choice. If the basis changes, update the test name
-		// and the assertion message together.
-		assert.equal(RECENCY_BASIS, "turns", "RECENCY_BASIS must be 'turns' (the basis picked with rationale in the module header)");
+/** Build a trimmable mass of roughly N tokens (chars = N * 4). */
+function trimmableMass(n: number): TrimmableMessage[] {
+	// Build a single trimmable message of n tokens. The dispatch
+	// is a small constant that the policy protects.
+	const targetChars = n * 4;
+	return [
+		userMsg("dispatch task — do X", 0),
+		assistantMsg("a".repeat(targetChars)),
+	];
+}
+
+// ─── Per-message token accounting ─────────────────────────────────────
+
+describe("approximateMessageTokens (chars / 4)", () => {
+	it("returns ceil(chars / 4) for a string content", () => {
+		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 3);
 	});
 
-	it("exports RECENCY_COMFORT_WINDOW as a positive integer named in turns", () => {
-		assert.equal(typeof RECENCY_COMFORT_WINDOW, "number");
-		assert.ok(Number.isInteger(RECENCY_COMFORT_WINDOW), "RECENCY_COMFORT_WINDOW must be an integer (turns are countable)");
-		assert.ok(RECENCY_COMFORT_WINDOW > 0, "RECENCY_COMFORT_WINDOW must be positive (a zero/negative window would trim everything)");
-		// The default value is named in the module header. Pin it here so a
-		// silent change to the constant is caught at test time.
-		assert.equal(RECENCY_COMFORT_WINDOW, 20, "RECENCY_COMFORT_WINDOW must equal 20 (the named default in the module header)");
+	it("sums text across an array of content blocks", () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "hello " },
+				{ type: "text", text: "world" },
+			],
+		};
+		assert.equal(approximateMessageTokens(msg), 3);
 	});
 
-	it("DEFAULT_RECENCY_WINDOW is a back-compat alias for RECENCY_COMFORT_WINDOW", () => {
-		// The T-2705 default constant is preserved as a back-compat alias
-		// so any external consumer that imported `DEFAULT_RECENCY_WINDOW`
-		// (test files, downstream extensions) keeps working.
-		assert.equal(
-			DEFAULT_RECENCY_WINDOW,
-			RECENCY_COMFORT_WINDOW,
-			"DEFAULT_RECENCY_WINDOW must equal RECENCY_COMFORT_WINDOW (back-compat alias)",
-		);
+	it("returns 0 for an empty string content", () => {
+		assert.equal(approximateMessageTokens({ role: "user", content: "" }), 0);
+	});
+
+	it("extracts text from object content via JSON.stringify fallback", () => {
+		const msg: TrimmableMessage = {
+			role: "custom",
+			content: { foo: "bar" },
+		};
+		// JSON.stringify({foo:"bar"}) → 13 chars → ceil(13/4) = 4
+		assert.equal(approximateMessageTokens(msg), 4);
 	});
 });
 
-// ─── AC-2: recency-only retention (threshold gate removed) ─────────────────
+describe("extractText", () => {
+	it("returns a string content as-is", () => {
+		assert.equal(extractText("hello"), "hello");
+	});
 
-describe("AC-2 — recency-only retention (threshold gate removed)", () => {
-	it("no THRESHOLD constant is exported (the gate is removed per AC-4)", () => {
-		// The threshold gate is removed. Assert the constant is NOT on
-		// the public surface. If a future ticket re-introduces a
-		// threshold (e.g. a per-model hard cap), the test should be
-		// updated to assert the new constant's contract.
+	it("concatenates text blocks from an array", () => {
 		assert.equal(
-			(trimConversation as unknown as { THRESHOLD?: unknown }).THRESHOLD,
-			undefined,
-			"THRESHOLD must NOT be exported (the gate is removed per AC-4)",
+			extractText([
+				{ type: "text", text: "foo " },
+				{ type: "text", text: "bar" },
+			]),
+			"foo bar",
 		);
 	});
 
-	it("the filter runs unconditionally — there is no token gate", () => {
-		// 30 turns of 3 messages each = 90 messages total. The filter
-		// carves the most recent 20 turns; 20*3=60 retained, 10*3=30
-		// trimmed. There is no metrics parameter; the filter runs
-		// regardless of any token count.
-		const messages = conversation(30);
-		const result = trimConversation(messages);
-		assert.equal(result.retain.length, 20 * 3, "filter runs unconditionally; recency window is the only signal");
-		assert.equal(result.trim.length, 10 * 3, "trim is the 10 oldest turns (10 turns * 3 messages/turn)");
-	});
-
-	it("the filter accepts a caller override on the recency window", () => {
-		// 30 turns; caller asks for 10 turns retained. The filter must
-		// honor the override (the function exposes `recencyWindow` as
-		// a parameter; the caller — `index.ts` — owns the override
-		// decision).
-		const messages = conversation(30);
-		const result = trimConversation(messages, { recencyWindow: 10 });
-		assert.equal(result.retain.length, 10 * 3, "caller-overridden window carves 10 turns = 30 messages");
-		assert.equal(result.trim.length, 20 * 3, "the carve is the 20 oldest turns");
+	it("falls back to JSON.stringify for non-text object content", () => {
+		assert.equal(extractText({ a: 1 }), '{"a":1}');
 	});
 });
 
-// ─── AC-3: pure function contract ──────────────────────────────────────────
+// ─── Protected-slot predicate ─────────────────────────────────────────
 
-describe("AC-3 — pure function contract (determinism, no side effects)", () => {
-	it("is deterministic: identical inputs produce identical outputs across calls", () => {
-		const messages = conversation(40);
-		const a = trimConversation(messages);
-		const b = trimConversation(messages);
-		// Deep-equal on the output shape, not just the references.
-		assert.deepEqual(a, b, "two calls with identical inputs must return deep-equal results");
+describe("isProtectedSlot", () => {
+	const dispatch: TrimmableMessage = userMsg("dispatch", 0);
+	const followUp: TrimmableMessage = userMsg("follow-up", 1);
+	const pinned: TrimmableMessage = pinnedMsg("agent def");
+	const assistant: TrimmableMessage = assistantMsg("hi");
+
+	it("protects the first user message (userTurnAge === 0)", () => {
+		const messages = [dispatch, assistant];
+		assert.equal(isProtectedSlot(dispatch, 0, messages), true);
+		assert.equal(isProtectedSlot(assistant, 1, messages), false);
 	});
 
-	it("does not mutate the input array", () => {
-		const messages = conversation(40);
-		const snapshot = messages.slice();
-		trimConversation(messages);
-		// Compare element-by-element — the input array is not the output
-		// array, and neither reorders nor rewrites the input.
-		assert.equal(messages.length, snapshot.length, "input length is unchanged");
-		for (let i = 0; i < messages.length; i++) {
-			assert.equal(messages[i], snapshot[i], `input[${i}] is the same reference (no in-place mutation)`);
-		}
+	it("does not protect a follow-up user message", () => {
+		const messages = [dispatch, followUp];
+		assert.equal(isProtectedSlot(followUp, 1, messages), false);
 	});
 
-	it("returns fresh arrays on the recency path (no aliasing of the input)", () => {
-		const messages = conversation(40);
-		const result = trimConversation(messages);
-		// The contract says "returns," not "aliases."
-		assert.notEqual(result.retain, messages, "retain is a fresh array, not the input aliased");
-		assert.notEqual(result.trim, messages, "trim is a fresh array, not the input aliased");
+	it("protects a context-trimmer-pinned synthetic when its customType is in the protected set", () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [pinned, dispatch, assistant];
+		assert.equal(isProtectedSlot(pinned, 0, messages, protectedSet), true);
+		assert.equal(isProtectedSlot(dispatch, 1, messages, protectedSet), true);
+		assert.equal(isProtectedSlot(assistant, 2, messages, protectedSet), false);
 	});
 
-	it("honors the union-equals-input invariant on the recency path", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages);
-		// Every message in the input must appear in exactly one of the two
-		// output sets. The union is a partition; nothing is lost, nothing
-		// is invented.
-		assert.equal(
-			result.retain.length + result.trim.length,
-			messages.length,
-			"retain.length + trim.length must equal messages.length (no messages lost, no messages invented)",
-		);
-		// Disjoint: no element is in both sets.
-		const retainSet = new Set(result.retain);
-		const trimSet = new Set(result.trim);
-		for (const m of result.retain) {
-			assert.ok(!trimSet.has(m), "a message is in retain — must not also be in trim");
-		}
-		// Covering: every input element is in one of the two sets.
-		for (let i = 0; i < messages.length; i++) {
-			const m = messages[i];
-			assert.ok(
-				retainSet.has(m) || trimSet.has(m),
-				`input[${i}] must appear in either retain or trim (no losses)`,
-			);
-		}
-		// No extras: every output element is from the input.
-		for (let i = 0; i < result.retain.length; i++) {
-			assert.ok(
-				messages.includes(result.retain[i]),
-				`retain[${i}] is an input element (no invented messages)`,
-			);
-		}
-		for (let i = 0; i < result.trim.length; i++) {
-			assert.ok(
-				messages.includes(result.trim[i]),
-				`trim[${i}] is an input element (no invented messages)`,
-			);
-		}
-		// Order within each side is preserved (slices, not rearrangements):
-		// the trim side is the oldest slice, retain is the newest slice.
-		const expectedTrim = messages.slice(0, result.trim.length);
-		const expectedRetain = messages.slice(result.trim.length);
-		assert.deepEqual(
-			result.trim,
-			expectedTrim,
-			"trim is the oldest slice of the input (order preserved)",
-		);
-		assert.deepEqual(
-			result.retain,
-			expectedRetain,
-			"retain is the newest slice of the input (order preserved)",
-		);
-	});
-});
-
-// ─── AC-4: recency boundary cases ──────────────────────────────────────────
-
-describe("AC-4 — recency boundary cases", () => {
-	it("boundary === 0 messages: empty input returns retain=[], trim=[] without throwing", () => {
-		const result = trimConversation([]);
-		assert.deepEqual(result.retain, [], "empty input → retain is empty");
-		assert.deepEqual(result.trim, [], "empty input → trim is empty");
-		assert.equal(result.retain.length + result.trim.length, 0, "empty input → union is empty");
+	it("does not protect a custom message whose customType is not in the protected set", () => {
+		const messages = [pinned, dispatch, assistant];
+		assert.equal(isProtectedSlot(pinned, 0, messages, new Set()), false);
 	});
 
-	it("boundary — recency window larger than available turns: retain all, trim none", () => {
-		// 5 turns, window of 20. The window exceeds the available turns;
-		// the recency filter cannot carve what does not exist. The whole
-		// input is retained; trim is empty.
-		const messages = conversation(5);
-		const result = trimConversation(messages);
-		assert.deepEqual(result.retain, messages, "window > available turns → retain all");
-		assert.deepEqual(result.trim, [], "window > available turns → trim is empty");
-		// Union-equals-input holds.
-		assert.equal(result.retain.length + result.trim.length, messages.length, "partition union equals input");
-	});
-
-	it("boundary — recency window equal to available turns: retain all, trim none", () => {
-		// 20 turns, window of 20. Boundary case: the window matches the
-		// available turns exactly. The carve is at index 0; everything
-		// is retained.
-		const messages = conversation(20);
-		const result = trimConversation(messages);
-		assert.deepEqual(result.retain, messages, "window = available turns → retain all");
-		assert.deepEqual(result.trim, [], "window = available turns → trim is empty");
-	});
-
-	it("boundary — one turn beyond the window: trim exactly one turn", () => {
-		// 21 turns, window of 20. One turn is over the window; exactly
-		// one turn (3 messages) is trimmed.
-		const messages = conversation(21);
-		const result = trimConversation(messages);
-		assert.equal(result.retain.length, 20 * 3, "one turn over window → retain the most recent 20 turns");
-		assert.equal(result.trim.length, 1 * 3, "one turn over window → trim exactly the oldest turn (3 messages)");
-	});
-
-	it("boundary — no user messages in the conversation: recency filter has no anchor, fall back to no-op", () => {
-		// A session composed entirely of tool-results / assistant messages
-		// (no user-role message). The recency contract keys on user turns;
-		// without any, the filter cannot anchor. Documented behavior: fall
-		// back to the no-op path (retain all, trim none).
-		const messages: ConversationMessage[] = [
-			assistant(0),
-			toolResult(0),
-			assistant(1),
-			toolResult(1),
-			assistant(2),
+	it("falls back to 'first user message by position' when userTurnAge is missing", () => {
+		const messages = [
+			{ role: "user", content: "first" } as TrimmableMessage,
+			{ role: "user", content: "second" } as TrimmableMessage,
 		];
-		const result = trimConversation(messages);
-		assert.deepEqual(result.retain, messages, "no user messages → fall back to no-op retain");
-		assert.deepEqual(result.trim, [], "no user messages → trim is empty");
-	});
-
-	it("boundary — single-turn conversation: the lone turn is retained (window ≥ turns)", () => {
-		// 1 turn (3 messages), default window 20. The window exceeds the
-		// available turns; everything is retained.
-		const messages = conversation(1);
-		const result = trimConversation(messages);
-		assert.deepEqual(result.retain, messages, "single turn → retain all");
-		assert.deepEqual(result.trim, [], "single turn → trim is empty");
+		assert.equal(isProtectedSlot(messages[0], 0, messages), true);
+		assert.equal(isProtectedSlot(messages[1], 1, messages), false);
 	});
 });
 
-// ─── Defensive-options test (documents the malformed-input behavior) ───────
+// ─── Budget accounting ────────────────────────────────────────────────
 
-describe("defensive — malformed options collapse to defaults without throwing", () => {
-	it("recencyWindow of 0 collapses to the default (positive integer requirement)", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { recencyWindow: 0 });
-		// Default window = 20; the carve is the same as the no-override test.
-		assert.equal(result.retain.length, 20 * 3, "recencyWindow=0 collapses to RECENCY_COMFORT_WINDOW");
+describe("totalTrimmableTokens", () => {
+	it("sums per-message tokens for trimmable messages", () => {
+		const messages = [
+			userMsg("hi", 0),
+			assistantMsg("hello"),
+		];
+		// user "hi" is protected; assistant "hello" = 6 chars / 4 = 2 tokens.
+		assert.equal(totalTrimmableTokens(messages), 2);
 	});
 
-	it("non-integer recencyWindow collapses to the default (integer requirement)", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { recencyWindow: 7.5 });
-		assert.equal(result.retain.length, 20 * 3, "recencyWindow=7.5 collapses to RECENCY_COMFORT_WINDOW");
-	});
-
-	it("negative recencyWindow collapses to the default", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { recencyWindow: -3 });
-		assert.equal(result.retain.length, 20 * 3, "recencyWindow=-3 collapses to RECENCY_COMFORT_WINDOW");
-	});
-});
-
-// ─── Type-level smoke test (compile-time check via runtime assertion) ──────
-
-describe("type surface — public API is consumable from the documented contract", () => {
-	it("trimConversation accepts the ConversationMessage shape and returns a TrimResult", () => {
-		// The type-level guarantee is enforced by the TypeScript compiler.
-		// The runtime assertion is a smoke test that the function returns
-		// the documented shape (the destructurable `{ retain, trim }`).
-		const messages = conversation(5);
-		const result: TrimResult<ConversationMessage> = trimConversation(messages);
-		assert.ok(Array.isArray(result.retain), "TrimResult.retain is an array");
-		assert.ok(Array.isArray(result.trim), "TrimResult.trim is an array");
-		// Destructurable: callers can pull either set off the return.
-		const { retain, trim }: { retain: ConversationMessage[]; trim: ConversationMessage[] } = result;
-		assert.ok(Array.isArray(retain), "destructured retain is an array");
-		assert.ok(Array.isArray(trim), "destructured trim is an array");
-	});
-
-	it("the exported constants are the values the production code imports (no shadow module)", () => {
-		// The implementer should use the same module path the production
-		// code uses. The constants are the literal values from `policy.ts`:
-		// a future change to the constants in `policy.ts` flows to this
-		// assertion automatically.
-		assert.equal(typeof RECENCY_BASIS, "string", "RECENCY_BASIS is a string");
-		assert.equal(typeof RECENCY_COMFORT_WINDOW, "number", "RECENCY_COMFORT_WINDOW is a number");
+	it("subtracts protected-slot tokens from the total", () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [
+			pinnedMsg("agent def " + "x".repeat(1000)),
+			userMsg("dispatch", 0),
+			assistantMsg("hello"),
+		];
+		// Only the assistant message (6 chars / 4 = 2 tokens) is trimmable.
+		assert.equal(totalTrimmableTokens(messages, protectedSet), 2);
 	});
 });
 
-// ─── Options type guard (compile-time only; runtime smoke) ────────────────
+// ─── Verbatim tier (0–50k) ─────────────────────────────────────────────
 
-// The `TrimOptions` type is exported for the caller (`index.ts`) to type its
-// override payload. The runtime smoke below is a touch-up that the
-// optional options object flows through correctly.
-describe("options object — index.ts's per-call override payload flows through", () => {
-	it("an empty options object uses the module defaults", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, {});
-		assert.equal(result.retain.length, 20 * 3, "empty options → RECENCY_COMFORT_WINDOW");
+describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("returns the input unchanged for a small conversation", () => {
+		const messages = [userMsg("dispatch", 0), assistantMsg("hi")];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(result.summarized, 0);
+		assert.equal(result.droppedTurns, 0);
+		assert.equal(result.messages.length, messages.length);
+		assert.equal(result.messages[0].content, "dispatch");
+		assert.equal(result.messages[1].content, "hi");
 	});
 
-	it("an options object with recencyWindow honors the override", () => {
-		const messages = conversation(50);
-		const result = trimConversation(messages, { recencyWindow: 5 });
-		assert.equal(result.retain.length, 5 * 3, "caller-overridden window honored");
-		assert.equal(result.trim.length, 45 * 3, "trim is the rest");
+	it("does not invoke the summarizer in the verbatim tier", () => {
+		let called = false;
+		const tracking = (text: string) => {
+			called = true;
+			return text;
+		};
+		const messages = [userMsg("dispatch", 0), assistantMsg("hello world")];
+		applyThreeTierTrim(messages, { summarizer: tracking });
+		assert.equal(called, false);
+	});
+
+	it("boundary at exactly 50k total tokens is verbatim", () => {
+		const messages = trimmableMass(VERBATIM_TIER_MAX_TOKENS);
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(result.summarized, 0);
+		assert.equal(result.droppedTurns, 0);
+	});
+});
+
+// ─── Summarize tier (50k–100k) ─────────────────────────────────────────
+
+describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("summarizes the oldest non-protected trimmable message when over 50k", () => {
+		const messages = trimmableMass(60_000);
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// The assistant message is oldest non-protected (after the
+		// dispatch). The summarizer should fire on it.
+		assert.ok(result.summarized >= 1);
+		// The dispatch is preserved.
+		assert.equal(result.messages[0].content, "dispatch task — do X");
+	});
+
+	it("preserves the dispatch task through summarization", () => {
+		const messages = trimmableMass(60_000);
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// The first message is the dispatch — content unchanged.
+		const first = result.messages[0];
+		assert.equal(first.role, "user");
+		assert.equal(first.userTurnAge, 0);
+		assert.equal(first.content, "dispatch task — do X");
+	});
+
+	it("loops until total ≤ 50k, summarizing multiple messages if needed", () => {
+		// Build a session with several trimmable turns at ~20k each.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("a".repeat(30_000 * 4)),
+			toolResultMsg("b".repeat(30_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// 60k total — at least one summarization should bring us under 50k.
+		assert.ok(result.summarized >= 1);
+		// Re-check: after summarize, total is under 50k.
+		assert.ok(totalTrimmableTokens(result.messages) <= VERBATIM_TIER_MAX_TOKENS);
+	});
+
+	it("protects a context-trimmer-pinned synthetic in the summarize tier", () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [
+			pinnedMsg("agent def " + "p".repeat(20_000 * 4)),
+			userMsg("dispatch", 0),
+			assistantMsg("x".repeat(30_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+		});
+		// The pinned message must still be present and unchanged.
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "pinned message must be preserved");
+		assert.equal(pinned!.content, messages[0].content);
+	});
+
+	it("the budget excludes protected-slot tokens", () => {
+		// A session whose only over-budget contributor is the pinned
+		// message (the agent def) should NOT trigger a trim.
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [
+			pinnedMsg("agent def " + "p".repeat(60_000 * 4)),
+			userMsg("dispatch", 0),
+			assistantMsg("short"),
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+		});
+		// The assistant "short" is the only trimmable mass (6 chars
+		// / 4 = 2 tokens). Total trimmable is 2 — well under 50k.
+		// No summarize fires.
+		assert.equal(result.summarized, 0);
+	});
+
+	it("boundary at exactly 50k+1 tokens triggers a single summarize pass", () => {
+		const messages = trimmableMass(50_001);
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.ok(result.summarized >= 1);
+	});
+});
+
+// ─── Drop tier (100k+) ─────────────────────────────────────────────────
+
+describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("hard-drops the oldest trimmable turn when over 100k", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("a".repeat(60_000 * 4)), // First trimmable turn.
+			toolResultMsg("b".repeat(60_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// Total trimmable is ~120k, which is > 100k. The first
+		// trimmable turn should be dropped.
+		assert.ok(result.droppedTurns >= 1);
+		// The dispatch is preserved.
+		assert.equal(result.messages[0].content, "dispatch");
+		// After drop, total is under 100k.
+		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
+	});
+
+	it("preserves the pinned-tier synthetic through a drop", () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [
+			pinnedMsg("agent def " + "p".repeat(1000)),
+			userMsg("dispatch", 0),
+			assistantMsg("a".repeat(60_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+		});
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "pinned message must survive the drop");
+	});
+
+	it("drops multiple oldest trimmable turns if needed to reach 100k", () => {
+		// Build a session with three trimmable turns, each ~40k tokens.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("a".repeat(40_000 * 4)), // Turn 1: 40k
+			toolResultMsg("b".repeat(40_000 * 4)),
+			assistantMsg("c".repeat(40_000 * 4)), // Turn 2: 40k
+			toolResultMsg("d".repeat(40_000 * 4)),
+			assistantMsg("e".repeat(40_000 * 4)), // Turn 3: 40k
+			toolResultMsg("f".repeat(40_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// 120k total → must drop at least one oldest trimmable turn.
+		assert.ok(result.droppedTurns >= 1);
+		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
+	});
+});
+
+// ─── Degenerate cases ─────────────────────────────────────────────────
+
+describe("applyThreeTierTrim — degenerate cases", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("returns an empty array for an empty input", () => {
+		const result = applyThreeTierTrim([], { summarizer });
+		assert.equal(result.messages.length, 0);
+		assert.equal(result.summarized, 0);
+		assert.equal(result.droppedTurns, 0);
+		assert.equal(result.totalTokens, 0);
+	});
+
+	it("returns the dispatch task unchanged when it is the only message", () => {
+		const messages = [userMsg("dispatch", 0)];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(result.messages.length, 1);
+		assert.equal(result.messages[0].content, "dispatch");
+	});
+
+	it("does not infinite-loop when the summarizer returns the source unchanged", () => {
+		// Pathological summarizer: always returns the input. The
+		// loop's defensive bound (`summaryTokens >= originalTokens`)
+		// bails after one iteration, so the function returns.
+		const noProgress = (text: string) => text;
+		const messages = trimmableMass(60_000);
+		const result = applyThreeTierTrim(messages, { summarizer: noProgress });
+		// The first eligible message IS summarized (the summarize
+		// path runs once), but the post-summarize content has the
+		// same length, so the loop bails. The function returns.
+		assert.equal(result.summarized, 1);
+		assert.ok(typeof result.totalTokens === "number");
+	});
+
+	it("a single oversized message (over 100k) is summarized, not dropped", () => {
+		// One trimmable message, all by itself, is larger than the
+		// drop tier. The policy's fallback summarizes it (since
+		// dropping the only trimmable message would leave the
+		// dispatch alone and the session no better off).
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("x".repeat(150_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// The fallback summarize path fires.
+		assert.ok(result.summarized >= 1);
+	});
+});
+
+// ─── Public constants ─────────────────────────────────────────────────
+
+describe("exported constants", () => {
+	it("VERBATIM_TIER_MAX_TOKENS is 50_000", () => {
+		assert.equal(VERBATIM_TIER_MAX_TOKENS, 50_000);
+	});
+	it("SUMMARIZE_TIER_MAX_TOKENS is 100_000", () => {
+		assert.equal(SUMMARIZE_TIER_MAX_TOKENS, 100_000);
+	});
+	it("SUMMA_WORDS is positive", () => {
+		assert.ok(SUMMA_WORDS > 0);
 	});
 });
