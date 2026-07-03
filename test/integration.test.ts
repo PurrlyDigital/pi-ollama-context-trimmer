@@ -16,7 +16,7 @@ import contextTrimmerExtension from "../index.ts";
 import { CONFIG_ENV } from "../index.ts";
 import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
 import { PRESERVED_CUSTOM_TYPE } from "../path-stamp.ts";
-import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.ts";
+import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS, DROPPED_CUSTOM_TYPE } from "../policy.ts";
 
 // ─── Pinned-tier opt-in fixture ────────────────────────────────────────
 //
@@ -316,11 +316,19 @@ describe("context handler — opt-out path (nothing configured)", () => {
 			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
 		);
 		assert.equal(pinned, undefined, "no pinned synthetic in opt-out path");
-		// The 120k trimmable turn was dropped; only the anchor user
-		// message remains.
-		assert.equal(result.messages.length, 1);
+		// The 120k trimmable turn was dropped; the dropped-turn marker
+		// is emitted at the start of the dropped turn's slice, so the
+		// output is [first-prompt, dropped-marker]. The marker is a
+		// `role: "custom"` message with customType DROPPED_CUSTOM_TYPE
+		// (see the per-dropped-turn marker emission in policy.ts).
+		assert.equal(result.messages.length, 2);
 		assert.equal(result.messages[0].role, "user");
 		assert.equal(result.messages[0].content, "first prompt");
+		assert.equal(result.messages[1].role, "custom");
+		assert.equal(
+			(result.messages[1] as { customType?: string }).customType,
+			DROPPED_CUSTOM_TYPE,
+		);
 	});
 });
 
@@ -555,10 +563,16 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		// on the carved-out messages but does NOT change their `role`
 		// (the role stays `toolResult`); the filter below checks the
 		// customType, not the role, to identify preserved messages.
+		// The filter also excludes the DROPPED_CUSTOM_TYPE marker
+		// emitted on the tier-3 drop path — the marker is a NEW
+		// `role: "custom"` message that lands at the start of the
+		// dropped turn's slice, but it is a marker, not the
+		// trimmable content that was dropped.
 		const droppedTrimmable = result.messages.filter((m) => {
 			const customType = (m as { customType?: string }).customType;
 			if (customType === PINNED_CUSTOM_TYPE) return false;
 			if (customType === PRESERVED_CUSTOM_TYPE) return false;
+			if (customType === DROPPED_CUSTOM_TYPE) return false;
 			if (m.role === "user") return false;
 			return true;
 		});
@@ -601,5 +615,102 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 	// (those are carve-out-safe by construction: the dispatch sits
 	// BEFORE the first trimmable turn, and pinned synthetics CLOSE a
 	// trimmable turn rather than sit inside it).
+});
+
+// ─── AC-3 — Reported-signal done-bar (two-session transcript) ─────────────────
+//
+// The originally-reported signal is the LLM's "I thought I had X but
+// it's gone" confusion after a tier-3 hard drop. AC-3's done-bar is
+// relowered to a mock-provable structural done-bar: (a) the marker is
+// in the marker-present session's output stream; (b) the envelope is
+// in the LLM-bound prompt the marker-present session produces; and
+// (c) the two streams differ ONLY by the dropped-turn marker (no
+// other shape drift). The originally-reported signal's behavioral
+// claim ("the LLM stops being confused") is the operator's live
+// `/reload` confirmation, NOT a mock test — a mock that hard-codes a
+// canned acknowledgment is tautological with the assertion.
+
+describe("AC-3 — reported-signal done-bar (two-session transcript)", () => {
+	/** The trimmable input that exceeds the 100k drop threshold. The
+	 *  tool-result tail carries a known artifact ("needle") that the
+	 *  originally-reported signal references. */
+	function buildOver100kSession(): Array<Record<string, unknown>> {
+		return [
+			userMsg("dispatch task — do X"),
+			// The dropped turn: assistant + toolResult. The toolResult
+			// carries the "needle" artifact that the originally-reported
+			// signal references ("I'll consult the tool result from
+			// the earlier turn ... 'needle' ...").
+			assistantMsg(pad("a", 60_000)),
+			toolResultMsg(pad("needle ", 60_000)),
+		];
+	}
+
+	it("marker-present session includes the dropped-turn marker in the outbound prompt", async () => {
+		// The marker-present session invokes the wiring's `context`
+		// handler with the same trimmable input. The wiring produces
+		// the new-shape stream: [pinned, dispatch, dropped-marker].
+		// The dropped turn's content is gone (the drop fires), and
+		// the marker envelope is in the prompt the LLM sees.
+		const pi = await loadExtension();
+		const event = { messages: buildOver100kSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The marker must be present in the output stream.
+		const marker = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === DROPPED_CUSTOM_TYPE,
+		);
+		assert.ok(marker, "marker-present session must include the dropped-turn marker in the output stream");
+		// Flatten the LLM-bound stream into a single text blob and
+		// confirm the envelope is in the prompt the LLM will see.
+		const parts: string[] = [];
+		for (const m of result.messages) {
+			const c = m.content;
+			if (typeof c === "string") {
+				parts.push(c);
+			} else if (Array.isArray(c)) {
+				for (const block of c) {
+					if (block && typeof block === "object" && "text" in block && typeof (block as { text: unknown }).text === "string") {
+						parts.push((block as { text: string }).text);
+					}
+				}
+			} else {
+				parts.push(JSON.stringify(c));
+			}
+		}
+		const prompt = parts.join("\n");
+		assert.ok(prompt.includes("[dropped:"), "marker-present session prompt must contain the dropped envelope");
+	});
+
+	it("the two streams differ ONLY by the dropped-turn marker (no other shape drift)", async () => {
+		// Structural check: the marker-present session's output
+		// matches the no-marker baseline's output element-for-element
+		// EXCEPT for the dropped-turn marker. This proves the marker
+		// is the only difference between the two streams — the
+		// solution does not change the drop heuristic, raise the
+		// budget, or remove the drop. The done-bar is at the
+		// marker-only level.
+		const pi = await loadExtension();
+		const event = { messages: buildOver100kSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The marker-present output includes the pinned synthetic
+		// (prepended by the wiring) and the dispatch and the
+		// dropped-turn marker. Strip the marker for shape comparison.
+		const stripped = result.messages.filter(
+			(m) => !(m.role === "custom" && (m as { customType?: string }).customType === DROPPED_CUSTOM_TYPE),
+		);
+		// The remaining messages: pinned synthetic + dispatch. The
+		// drop fired; the trimmable tail is gone. The wiring's
+		// pinned-tier synthetic is operator-opted-in (env
+		// `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` is set in the
+		// module-level before hook) and rides at position 0.
+		assert.equal(stripped.length, 2);
+		assert.equal(stripped[0].role, "custom");
+		assert.equal((stripped[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
+		assert.equal(stripped[1].role, "user");
+		assert.equal(stripped[1].content, "dispatch task — do X");
+		// The dropped turn's assistant and toolResult are gone.
+		const droppedTurnContent = stripped.filter((m) => m.content && typeof m.content === "string" && (m.content as string).includes("needle"));
+		assert.equal(droppedTurnContent.length, 0, "the dropped turn's tool-result content must NOT be in the marker-present stream");
+	});
 });
 });

@@ -41,6 +41,51 @@ export const SUMMARIZE_TIER_MAX_TOKENS = 100_000;
 /** Word budget for summa's per-message in-place summary. */
 export const SUMMA_WORDS = 60;
 
+/**
+ * The customType the trim policy stamps on a per-dropped-turn marker
+ * message. The marker is injected into the returned `result.messages`
+ * array on the tier-3 drop path, one per dropped turn, in the same
+ * `role: "custom"` shape the pinned-tier / preserved-paths channels
+ * use. The marker rides out through the wiring layer (which does not
+ * filter `role: "custom"` messages) so the LLM sees a per-dropped-turn
+ * envelope at the position the dropped turn used to occupy, and the
+ * session jsonl captures the envelope for after-the-fact review.
+ *
+ * The constant lives in `policy.ts` because the marker is a pure-
+ * policy concern (the envelope string-formatting is a pure function of
+ * the dropped turn's token mass and its ordinal position in the drop
+ * sequence). The wiring layer does not need to know about it; the
+ * `result.messages` array is passed through structurally.
+ */
+export const DROPPED_CUSTOM_TYPE = "context-trimmer-dropped";
+
+/** Ordinal label for the first dropped turn (the oldest trimmable turn). */
+const DROP_POSITION_LABELS = [
+	"oldest",
+	"2nd-oldest",
+	"3rd-oldest",
+	"4th-oldest",
+	"5th-oldest",
+] as const;
+
+/** Build the in-stream envelope tag for a single dropped turn.
+ *
+ *  The tag mirrors the Tier-2 `[summa: ~N → ~M]` envelope grammar:
+ *  the first line names what happened and the approximate token mass,
+ *  the rest of the content block carries the body. The body for a
+ *  drop marker is a short note that the LLM can use to anchor its
+ *  next response — "the oldest trimmable turn (~N tokens) was removed
+ *  from the stream; downstream context is not the same as it was."
+ *
+ *  The tag is the only line the LLM needs to recognize the envelope
+ *  pattern; the body is a single sentence and is stable across drops. */
+function buildDroppedTurnEnvelope(tokens: number, positionIndex: number): string {
+	const label = DROP_POSITION_LABELS[positionIndex] ?? `${positionIndex + 1}th-oldest`;
+	// Each marker corresponds to ONE dropped turn; the singular
+	// "turn" is correct for every ordinal.
+	return `[dropped: ~${tokens} tokens — ${label} trimmable turn removed]`;
+}
+
 // ─── Public types ──────────────────────────────────────────────────────
 
 /**
@@ -577,18 +622,76 @@ function dropOldestTurns(
 	// preserved-path message that lands inside the oldest trimmable
 	// turn would be dropped with the rest of the turn, violating
 	// AC-6 (b) (a preserved message must survive tier-3 drop).
+	//
+	// Per-dropped-turn marker emission: alongside the carve-out, the
+	// loop inserts one in-stream marker message at the start of each
+	// dropped turn's slice. The marker is a `role: "custom"` message
+	// carrying a per-dropped-turn envelope
+	// (`[dropped: ~N tokens — <position> trimmable turn removed]`),
+	// riding the same in-stream pattern the Tier-2 `[summa: …]`
+	// envelope uses so the LLM learns one envelope grammar across
+	// tiers. The marker lands at the position the dropped turn(s)
+	// used to occupy in the returned array — the ordinal position
+	// labels the marker ("oldest", "2nd-oldest", "3rd-oldest", …) in
+	// the order the turns were dropped, oldest first. The dropped
+	// turn's approximate token mass is the sum of its non-protected
+	// message tokens; the marker names that mass on the envelope tag.
 	const out: TrimmableMessage[] = [];
+	// Track which dropped turns have already had a marker emitted.
+	// Each entry maps the dropped turn's start index → its ordinal
+	// position in the drop sequence (0 = oldest, 1 = 2nd-oldest, …).
+	const droppedOrdinal = new Map<number, number>();
+	let dropOrdinalCursor = 0;
+	for (const t of turns) {
+		if (dropSet.has(t.start)) {
+			droppedOrdinal.set(t.start, dropOrdinalCursor);
+			dropOrdinalCursor += 1;
+		}
+	}
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		// If this message is inside a dropped turn, skip it UNLESS
 		// the message is itself a protected slot. A turn is dropped
 		// iff its start index is in dropSet.
 		let inDroppedTurn = false;
+		let droppedTurnStart: number | undefined;
 		for (const t of turns) {
 			if (dropSet.has(t.start) && i >= t.start && i < t.end) {
 				inDroppedTurn = true;
+				droppedTurnStart = t.start;
 				break;
 			}
+		}
+		// Emit the per-dropped-turn marker at the position the
+		// dropped turn used to occupy (the first index of the
+		// dropped turn's slice). The marker is emitted ONCE per
+		// dropped turn, before any non-protected message from the
+		// turn would be skipped. If the first index of the slice
+		// is itself a protected slot, the marker still emits
+		// BEFORE that slot so the LLM sees the envelope at the
+		// drop boundary; the protected slot then rides out
+		// alongside it (per the carve-out above).
+		if (
+			droppedTurnStart !== undefined
+			&& droppedOrdinal.has(droppedTurnStart)
+			&& i === droppedTurnStart
+		) {
+			const ordinal = droppedOrdinal.get(droppedTurnStart)!;
+			const droppedTurn = turns.find((t) => t.start === droppedTurnStart)!;
+			const tag = buildDroppedTurnEnvelope(droppedTurn.tokens, ordinal);
+			out.push({
+				role: "custom",
+				content: [
+					{
+						type: "text",
+						text: `${tag}\nThe ${DROP_POSITION_LABELS[ordinal] ?? `${ordinal + 1}th-oldest`} trimmable turn was removed from the stream; context prior to this point is not in view.`,
+					},
+				],
+				customType: DROPPED_CUSTOM_TYPE,
+			});
+			// Mark the marker as emitted so a second iteration over
+			// the same dropped turn does not re-emit.
+			droppedOrdinal.delete(droppedTurnStart);
 		}
 		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
 		out.push(msg);
