@@ -41,6 +41,29 @@ export const SUMMARIZE_TIER_MAX_TOKENS = 100_000;
 /** Word budget for summa's per-message in-place summary. */
 export const SUMMA_WORDS = 60;
 
+/**
+ * The plain-English aggregate prune reminder the policy injects at
+ * the start of the tier-3 prune pass when any turns are dropped.
+ * The reminder is a single, model-facing message that lets the LLM
+ * know that older trimmable context was pruned; without it, a
+ * model can spin ("I thought I had X but it's gone") when the
+ * trimmable tail it expected to consult is no longer in view. The
+ * reminder names (a) the extension, (b) the action, (c) the scope,
+ * and (d) a conditional "get it fresh" retrieval hint — phrased
+ * as a possibility, not a directive, so the model treats retrieval
+ * as one option among many, not a mandate.
+ *
+ * The constant lives in `policy.ts` because the reminder is a
+ * pure-policy concern: the string is a pure function of the drop
+ * event, not of any operator state. No env reads, no fs I/O — the
+ * purity contract (AGENTS.md rule 7) holds. The wiring layer does
+ * not need to know about the constant; `result.messages` carries
+ * the reminder out structurally.
+ */
+const PRUNE_REMINDER_TEXT =
+	"The Context Trimmer extension has automatically pruned older things in context that weren't asked to be kept. " +
+	"If you need something that was cut, get it fresh.";
+
 // ─── Public types ──────────────────────────────────────────────────────
 
 /**
@@ -577,7 +600,23 @@ function dropOldestTurns(
 	// preserved-path message that lands inside the oldest trimmable
 	// turn would be dropped with the rest of the turn, violating
 	// AC-6 (b) (a preserved message must survive tier-3 drop).
+	//
+	// Aggregate prune reminder: when any turns are dropped
+	// (`dropSet.size > 0`), one plain-English reminder message is
+	// prepended to the output. The reminder is a real entry in the
+	// returned `result.messages` array — a `role: "user"` piece of
+	// model-facing text that names the extension, the action, the
+	// scope, and a conditional "get it fresh" retrieval hint. The
+	// reminder is emitted ONCE per drop event (not per dropped turn)
+	// so a multi-turn drop is one model-facing note, not a sequence
+	// of per-turn envelopes. The reminder does NOT mirror the
+	// Tier-2 `[summa: …]` envelope grammar: no bracket tag, no
+	// ordinals, no token mass. The "get it fresh" clause is
+	// conditional ("if you need …"), not a directive.
 	const out: TrimmableMessage[] = [];
+	if (dropSet.size > 0) {
+		out.push({ role: "user", content: PRUNE_REMINDER_TEXT });
+	}
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		// If this message is inside a dropped turn, skip it UNLESS

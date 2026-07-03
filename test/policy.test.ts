@@ -333,8 +333,14 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 		// Total trimmable is ~120k, which is > 100k. The first
 		// trimmable turn should be dropped.
 		assert.ok(result.droppedTurns >= 1);
-		// The dispatch is preserved.
-		assert.equal(result.messages[0].content, "dispatch");
+		// The aggregate plain-English prune reminder is prepended;
+		// the dispatch is preserved at position 1.
+		assert.equal(result.messages[0].role, "user");
+		assert.ok(
+			typeof result.messages[0].content === "string" && (result.messages[0].content as string).includes("Context Trimmer extension"),
+			"the reminder is at the start of the returned array",
+		);
+		assert.equal(result.messages[1].content, "dispatch");
 		// After drop, total is under 100k.
 		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
 	});
@@ -371,6 +377,125 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 		// 120k total → must drop at least one oldest trimmable turn.
 		assert.ok(result.droppedTurns >= 1);
 		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
+	});
+});
+
+// ─── Aggregate plain-English prune reminder (AC-1) ────────────────────
+//
+// Tier-3's hard drop emits ONE plain-English reminder at the start of
+// the returned message array (per drop event, not per dropped turn).
+// The reminder is a `role: "user"` message naming the extension, the
+// action, the scope, and a conditional "get it fresh" retrieval hint
+// — phrased as a possibility, not a directive. No bracket tag, no
+// ordinals, no token mass, no `customType`.
+
+describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	function reminderCount(messages: ReadonlyArray<TrimmableMessage>): number {
+		let count = 0;
+		for (const m of messages) {
+			if (m.role === "user" && typeof m.content === "string" && m.content.includes("Context Trimmer extension")) {
+				count += 1;
+			}
+		}
+		return count;
+	}
+
+	it("emits exactly one reminder when droppedTurns > 0 (single drop event)", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("a".repeat(60_000 * 4)),
+			toolResultMsg("b".repeat(60_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// The drop fires; one reminder is emitted at the start of the
+		// returned array. Exactly one — not N (aggregate, not per-turn).
+		assert.equal(reminderCount(result.messages), 1);
+		// The reminder is the first message in the returned array.
+		const reminder = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Context Trimmer extension"),
+		);
+		assert.ok(reminder, "reminder must be present");
+		assert.equal(result.messages[0], reminder, "reminder must be at the start of the returned array");
+		// The reminder contains the operator's load-bearing elements.
+		const text = String(reminder.content);
+		assert.ok(text.includes("Context Trimmer extension"), "reminder must name the extension");
+		assert.ok(/prun/i.test(text), "reminder must name the action (prune / pruning)");
+		assert.ok(text.includes("context"), "reminder must reference context");
+		// Conditional "get it fresh" clause — present, not directive.
+		assert.ok(/if you need/i.test(text), "reminder must use conditional 'if you need' phrasing");
+		assert.ok(/get it fresh/i.test(text), "reminder must include the 'get it fresh' clause");
+		// No directive language: the clause offers retrieval as a
+		// possibility, not as a mandate.
+		assert.ok(!/you must/i.test(text), "reminder must not use directive 'you must' language");
+		assert.ok(!/you should/i.test(text), "reminder must not use directive 'you should' language");
+		// No envelope tag, no ordinals, no token mass.
+		assert.ok(!text.includes("["), "reminder must not have a bracket tag");
+		assert.ok(!/oldest/i.test(text), "reminder must not use ordinals ('oldest')");
+		assert.ok(!/~?\d+\s*tokens/i.test(text), "reminder must not name a token mass");
+		// The reminder is a plain `role: "user"` message — no
+		// `customType` stamp (the policy uses the user role to
+		// surface the reminder directly to the LLM).
+		assert.equal(reminder.customType, undefined, "reminder must not carry a customType stamp");
+		// The drop fired; the dropped turn's content is gone; the
+		// reminder + the dispatch task remain.
+		assert.ok(result.droppedTurns >= 1, "the drop must fire when trimmable total > 100k");
+		const droppedContent = result.messages.filter(
+			(m) => typeof m.content === "string" && /^a+$|^b+$/.test(m.content),
+		);
+		assert.equal(droppedContent.length, 0, "the dropped turn's content must be gone");
+	});
+
+	it("emits exactly one reminder for a multi-turn drop (aggregate, not per-turn)", () => {
+		// 4 distinct trimmable turns of 60k each → 240k total →
+		// drops the oldest three to land at 60k (under 100k, no
+		// summarize-fallback fires). ONE reminder total, not three.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			userMsg("u1", 1),
+			assistantMsg("a".repeat(30_000 * 4)),
+			toolResultMsg("b".repeat(30_000 * 4)),
+			userMsg("u2", 2),
+			assistantMsg("c".repeat(30_000 * 4)),
+			toolResultMsg("d".repeat(30_000 * 4)),
+			userMsg("u3", 3),
+			assistantMsg("e".repeat(30_000 * 4)),
+			toolResultMsg("f".repeat(30_000 * 4)),
+			userMsg("u4", 4),
+			assistantMsg("g".repeat(30_000 * 4)),
+			toolResultMsg("h".repeat(30_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// 3 turns dropped, but only 1 reminder (aggregate).
+		assert.equal(result.droppedTurns, 3);
+		assert.equal(reminderCount(result.messages), 1, "one reminder total for a multi-turn drop");
+	});
+
+	it("does NOT emit a reminder on the tier-2 summarize path (only tier-3 drops emit)", () => {
+		const messages = trimmableMass(60_000);
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-2 summarize path");
+	});
+
+	it("does NOT emit a reminder on the tier-1 verbatim path", () => {
+		const messages = [userMsg("dispatch", 0), assistantMsg("hi")];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-1 verbatim path");
+	});
+
+	it("does NOT emit a reminder on the tier-3 summarize-fallback path (single oversized turn)", () => {
+		// A single trimmable turn, all by itself, is over 100k. The
+		// policy falls into the summarize-fallback (not the drop
+		// path). No drop, no reminder; the existing Tier-2
+		// `[summa: …]` envelope covers it.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("x".repeat(150_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(result.droppedTurns, 0, "the summarize-fallback path does not drop any turns");
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-3 summarize-fallback path");
 	});
 });
 
