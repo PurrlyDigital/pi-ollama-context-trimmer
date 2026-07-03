@@ -57,7 +57,6 @@ import { join } from "node:path";
 import {
 	applyThreeTierTrim,
 	defaultSummaSummarizer,
-	DROPPED_CUSTOM_TYPE,
 	isPathPreserved,
 	VERBATIM_TIER_MAX_TOKENS,
 	SUMMARIZE_TIER_MAX_TOKENS,
@@ -296,7 +295,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// new channel rides the same machinery; no parallel
 		// accounting path needed (per the landscape's "Surrounding-
 		// code reality check" note).
-		const protectedTypes = new Set<string>([PINNED_CUSTOM_TYPE, DROPPED_CUSTOM_TYPE]);
+		const protectedTypes = new Set<string>([PINNED_CUSTOM_TYPE]);
 		if (expandedPreservedPatterns.length > 0) {
 			for (const m of base) {
 				const sourcePath = (m.details as Record<string, unknown> | undefined)?.sourcePath;

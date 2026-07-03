@@ -9,7 +9,6 @@
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { resolve } from "node:path";
 import {
 	applyThreeTierTrim,
 	approximateMessageTokens,
@@ -334,8 +333,14 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 		// Total trimmable is ~120k, which is > 100k. The first
 		// trimmable turn should be dropped.
 		assert.ok(result.droppedTurns >= 1);
-		// The dispatch is preserved.
-		assert.equal(result.messages[0].content, "dispatch");
+		// The aggregate plain-English prune reminder is prepended;
+		// the dispatch is preserved at position 1.
+		assert.equal(result.messages[0].role, "user");
+		assert.ok(
+			typeof result.messages[0].content === "string" && (result.messages[0].content as string).includes("Context Trimmer extension"),
+			"the reminder is at the start of the returned array",
+		);
+		assert.equal(result.messages[1].content, "dispatch");
 		// After drop, total is under 100k.
 		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
 	});
@@ -375,246 +380,122 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 	});
 });
 
-// ─── Per-dropped-turn marker envelope (AC-1) ────────────────────────────────
+// ─── Aggregate plain-English prune reminder (AC-1) ────────────────────
 //
-// Tier-3's hard drop emits one in-stream marker per dropped turn at the
-// position the dropped turn used to occupy, in the same per-message
-// envelope pattern the Tier-2 `[summa: …]` path uses. The marker is a
-// `role: "custom"` message carrying a `[dropped: ~N tokens — <position>
-// trimmable turn removed]` tag plus a short body. The LLM sees one
-// envelope grammar across tiers; the session jsonl captures the
-// envelope for after-the-fact review.
+// Tier-3's hard drop emits ONE plain-English reminder at the start of
+// the returned message array (per drop event, not per dropped turn).
+// The reminder is a `role: "user"` message naming the extension, the
+// action, the scope, and a conditional "get it fresh" retrieval hint
+// — phrased as a possibility, not a directive. No bracket tag, no
+// ordinals, no token mass, no `customType`.
 
-describe("applyThreeTierTrim — per-dropped-turn marker (AC-1)", () => {
+describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
-	const DROPPED_TYPE = "context-trimmer-dropped";
 
-	function firstContentLine(msg: TrimmableMessage): string {
-		const c = msg.content;
-		if (typeof c === "string") return c.split("\n", 1)[0];
-		if (Array.isArray(c)) {
-			for (const block of c) {
-				if (block && typeof block === "object" && "text" in block && typeof (block as { text: unknown }).text === "string") {
-					return (block as { text: string }).text.split("\n", 1)[0];
-				}
+	function reminderCount(messages: ReadonlyArray<TrimmableMessage>): number {
+		let count = 0;
+		for (const m of messages) {
+			if (m.role === "user" && typeof m.content === "string" && m.content.includes("Context Trimmer extension")) {
+				count += 1;
 			}
 		}
-		return "";
+		return count;
 	}
 
-	it("emits one marker per dropped turn at the start of the dropped slice (single drop)", () => {
+	it("emits exactly one reminder when droppedTurns > 0 (single drop event)", () => {
 		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
-			assistantMsg("a".repeat(60_000 * 4)), // First trimmable turn.
-			toolResultMsg("b".repeat(60_000 * 4)),
-		];
-		const result = applyThreeTierTrim(messages, { summarizer });
-		// The dropped turn is the assistant + toolResult slice. The
-		// marker is emitted at the start of that slice (just after the
-		// dispatch). The output is [dispatch, marker]; the dropped
-		// turn's content is gone.
-		assert.equal(result.messages.length, 2);
-		assert.equal(result.messages[0].role, "user");
-		assert.equal(result.messages[0].content, "dispatch");
-		assert.equal(result.messages[1].role, "custom");
-		assert.equal(result.messages[1].customType, DROPPED_TYPE);
-		// The marker carries the per-dropped-turn envelope tag on the
-		// first line of its content block.
-		const tag = firstContentLine(result.messages[1]);
-		assert.match(tag, /^\[dropped: ~120000 tokens — oldest trimmable turn removed\]$/);
-	});
-
-	it("emits one marker per dropped turn, with ordinal labels in drop order", () => {
-		// 4 distinct trimmable turns of 60k each (each turn = one
-		// assistant 30k + one toolResult 30k) → 240k total → drops
-		// the oldest three to land at 60k (under 100k, no
-		// summarize-fallback fires). Three markers, with labels
-		// "oldest", "2nd-oldest", and "3rd-oldest" in drop order.
-		// Each turn is bracketed by a follow-up user message so the
-		// turn-anchor logic identifies the boundaries cleanly.
-		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
-			userMsg("u1", 1),
-			assistantMsg("a".repeat(30_000 * 4)), // Turn 1: 30k + 30k = 60k
-			toolResultMsg("b".repeat(30_000 * 4)),
-			userMsg("u2", 2),
-			assistantMsg("c".repeat(30_000 * 4)), // Turn 2: 60k
-			toolResultMsg("d".repeat(30_000 * 4)),
-			userMsg("u3", 3),
-			assistantMsg("e".repeat(30_000 * 4)), // Turn 3: 60k
-			toolResultMsg("f".repeat(30_000 * 4)),
-			userMsg("u4", 4),
-			assistantMsg("g".repeat(30_000 * 4)), // Turn 4: 60k
-			toolResultMsg("h".repeat(30_000 * 4)),
-		];
-		const result = applyThreeTierTrim(messages, { summarizer });
-		assert.equal(result.droppedTurns, 3);
-		// Three markers, one per dropped turn, in drop order. The
-		// markers ride at the positions their dropped turns used to
-		// occupy.
-		const markers = result.messages.filter(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.equal(markers.length, 3);
-		assert.match(firstContentLine(markers[0]), /oldest trimmable turn/);
-		assert.match(firstContentLine(markers[1]), /2nd-oldest trimmable turn/);
-		assert.match(firstContentLine(markers[2]), /3rd-oldest trimmable turn/);
-	});
-
-	it("the marker carries a `role: \"custom\"` message with the DROPPED_CUSTOM_TYPE customType", () => {
-		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
+			userMsg("dispatch task — do X", 0),
 			assistantMsg("a".repeat(60_000 * 4)),
 			toolResultMsg("b".repeat(60_000 * 4)),
 		];
 		const result = applyThreeTierTrim(messages, { summarizer });
-		const marker = result.messages.find(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
+		// The drop fires; one reminder is emitted at the start of the
+		// returned array. Exactly one — not N (aggregate, not per-turn).
+		assert.equal(reminderCount(result.messages), 1);
+		// The reminder is the first message in the returned array.
+		const reminder = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && m.content.includes("Context Trimmer extension"),
 		);
-		assert.ok(marker, "marker must be a `role: \"custom\"` message with DROPPED_CUSTOM_TYPE");
-		// The content is a single text block (mirroring the Tier-2
-		// envelope shape).
-		assert.ok(Array.isArray(marker.content), "marker content must be an array of text blocks");
-		const blocks = marker.content as Array<{ type?: string; text?: string }>;
-		assert.equal(blocks[0].type, "text");
-		assert.match(blocks[0].text ?? "", /^\[dropped:/);
+		assert.ok(reminder, "reminder must be present");
+		assert.equal(result.messages[0], reminder, "reminder must be at the start of the returned array");
+		// The reminder contains the operator's load-bearing elements.
+		const text = String(reminder.content);
+		assert.ok(text.includes("Context Trimmer extension"), "reminder must name the extension");
+		assert.ok(/prun/i.test(text), "reminder must name the action (prune / pruning)");
+		assert.ok(text.includes("context"), "reminder must reference context");
+		// Conditional "get it fresh" clause — present, not directive.
+		assert.ok(/if you need/i.test(text), "reminder must use conditional 'if you need' phrasing");
+		assert.ok(/get it fresh/i.test(text), "reminder must include the 'get it fresh' clause");
+		// No directive language: the clause offers retrieval as a
+		// possibility, not as a mandate.
+		assert.ok(!/you must/i.test(text), "reminder must not use directive 'you must' language");
+		assert.ok(!/you should/i.test(text), "reminder must not use directive 'you should' language");
+		// No envelope tag, no ordinals, no token mass.
+		assert.ok(!text.includes("["), "reminder must not have a bracket tag");
+		assert.ok(!/oldest/i.test(text), "reminder must not use ordinals ('oldest')");
+		assert.ok(!/~?\d+\s*tokens/i.test(text), "reminder must not name a token mass");
+		// The reminder is a plain `role: "user"` message — no
+		// `customType` stamp (the policy uses the user role to
+		// surface the reminder directly to the LLM).
+		assert.equal(reminder.customType, undefined, "reminder must not carry a customType stamp");
+		// The drop fired; the dropped turn's content is gone; the
+		// reminder + the dispatch task remain.
+		assert.ok(result.droppedTurns >= 1, "the drop must fire when trimmable total > 100k");
+		const droppedContent = result.messages.filter(
+			(m) => typeof m.content === "string" && /^a+$|^b+$/.test(m.content),
+		);
+		assert.equal(droppedContent.length, 0, "the dropped turn's content must be gone");
 	});
 
-	it("does not emit a marker on the tier-2 summarize path (only tier-3 drops emit)", () => {
-		// 60k trimmable → tier 2 (summarize) → no drop, no marker.
+	it("emits exactly one reminder for a multi-turn drop (aggregate, not per-turn)", () => {
+		// 4 distinct trimmable turns of 60k each → 240k total →
+		// drops the oldest three to land at 60k (under 100k, no
+		// summarize-fallback fires). ONE reminder total, not three.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			userMsg("u1", 1),
+			assistantMsg("a".repeat(30_000 * 4)),
+			toolResultMsg("b".repeat(30_000 * 4)),
+			userMsg("u2", 2),
+			assistantMsg("c".repeat(30_000 * 4)),
+			toolResultMsg("d".repeat(30_000 * 4)),
+			userMsg("u3", 3),
+			assistantMsg("e".repeat(30_000 * 4)),
+			toolResultMsg("f".repeat(30_000 * 4)),
+			userMsg("u4", 4),
+			assistantMsg("g".repeat(30_000 * 4)),
+			toolResultMsg("h".repeat(30_000 * 4)),
+		];
+		const result = applyThreeTierTrim(messages, { summarizer });
+		// 3 turns dropped, but only 1 reminder (aggregate).
+		assert.equal(result.droppedTurns, 3);
+		assert.equal(reminderCount(result.messages), 1, "one reminder total for a multi-turn drop");
+	});
+
+	it("does NOT emit a reminder on the tier-2 summarize path (only tier-3 drops emit)", () => {
 		const messages = trimmableMass(60_000);
 		const result = applyThreeTierTrim(messages, { summarizer });
-		const markers = result.messages.filter(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.equal(markers.length, 0, "no drop-marker on the tier-2 summarize path");
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-2 summarize path");
 	});
 
-	it("does not emit a marker on the tier-1 verbatim path", () => {
+	it("does NOT emit a reminder on the tier-1 verbatim path", () => {
 		const messages = [userMsg("dispatch", 0), assistantMsg("hi")];
 		const result = applyThreeTierTrim(messages, { summarizer });
-		const markers = result.messages.filter(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.equal(markers.length, 0, "no drop-marker on the tier-1 verbatim path");
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-1 verbatim path");
 	});
 
-	it("does not emit a marker on the tier-3 summarize-fallback path (single oversized turn)", () => {
-		// One trimmable turn, all by itself, is over 100k. The policy
-		// falls into the summarize-fallback (not the drop path). No
-		// marker; the existing Tier-2 `[summa: …]` envelope covers it.
+	it("does NOT emit a reminder on the tier-3 summarize-fallback path (single oversized turn)", () => {
+		// A single trimmable turn, all by itself, is over 100k. The
+		// policy falls into the summarize-fallback (not the drop
+		// path). No drop, no reminder; the existing Tier-2
+		// `[summa: …]` envelope covers it.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			assistantMsg("x".repeat(150_000 * 4)),
 		];
 		const result = applyThreeTierTrim(messages, { summarizer });
-		const dropMarkers = result.messages.filter(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.equal(dropMarkers.length, 0, "no drop-marker on the tier-3 summarize-fallback path");
-	});
-
-	it("preserves the marker when the wiring layer passes the result through (the wiring does not filter custom roles)", () => {
-		// Unit test of the wiring seam: the policy returns
-		// `result.messages` containing the marker; the wiring (in
-		// `index.ts`) maps over `result.messages` structurally without
-		// filtering `role: "custom"`. The marker is preserved through
-		// the wiring's cast.
-		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
-			assistantMsg("a".repeat(60_000 * 4)),
-			toolResultMsg("b".repeat(60_000 * 4)),
-		];
-		const result = applyThreeTierTrim(messages, { summarizer });
-		// The wiring would map over result.messages with a structural
-		// cast; simulate that and confirm the marker survives.
-		const out = result.messages.map((m) => ({ ...m }));
-		const marker = out.find(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.ok(marker, "marker must survive the wiring's structural cast");
-	});
-
-	it("the marker token mass equals the dropped turn's non-protected token mass", () => {
-		// 60k assistant + 60k toolResult = 120k dropped turn. The
-		// marker envelope tag names ~120000 tokens (the dropped
-		// turn's mass, not the per-message breakdown).
-		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
-			assistantMsg("a".repeat(60_000 * 4)),
-			toolResultMsg("b".repeat(60_000 * 4)),
-		];
-		const result = applyThreeTierTrim(messages, { summarizer });
-		const marker = result.messages.find(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.ok(marker);
-		const tag = firstContentLine(marker);
-		assert.match(tag, /~120000 tokens/);
-	});
-
-	it("a dropped-turn marker is protected from a subsequent trim (cross-pass protection)", () => {
-		// Defensive: the marker is a synthetic the policy emits on
-		// the tier-3 drop path. If a subsequent trim call sees the
-		// marker as part of the input (e.g. a later tier-3 drop
-		// fires, or a later tier-2 summarize fires), the marker
-		// must NOT be summarized or dropped — it's a piece of
-		// replacement content, not original trimmable data. The
-		// wiring passes `DROPPED_CUSTOM_TYPE` in `protectedCustomTypes`
-		// so the existing protected-slot machinery keeps the marker
-		// alive across passes. This test exercises that contract at
-		// the policy level: a marker in the input is exempt from
-		// the budget (it does not contribute to the trimmable total)
-		// and is preserved through a drop.
-		const protectedSet = new Set([DROPPED_TYPE]);
-		// Build a session that lands in tier 3: a synthetic dropped
-		// marker (from a prior trim) + 120k of trimmable content.
-		// The marker should be subtracted from the budget; with the
-		// subtraction, the trimmable total is 120k, which lands in
-		// tier 3. The drop fires; the marker must survive.
-		const messages: TrimmableMessage[] = [
-			userMsg("dispatch", 0),
-			// Marker from a prior trim — `role: "custom"`,
-			// `customType: DROPPED_TYPE`. ~250 chars, ~63 tokens.
-			{
-				role: "custom",
-				content: [
-					{
-						type: "text",
-						text: "[dropped: ~120000 tokens — oldest trimmable turn removed]\nThe oldest trimmable turn was removed from the stream; context prior to this point is not in view.",
-					},
-				],
-				customType: DROPPED_TYPE,
-			},
-			assistantMsg("a".repeat(60_000 * 4)),
-			toolResultMsg("b".repeat(60_000 * 4)),
-		];
-		// With the marker in protectedCustomTypes, it is subtracted
-		// from the budget. Trimmable total = 120k → tier 3 → drop.
-		// The marker must survive the drop (it is a protected slot
-		// inside the dropped turn's [start, end) slice, so the
-		// carve-out keeps it alive).
-		const result = applyThreeTierTrim(messages, {
-			summarizer,
-			protectedCustomTypes: protectedSet,
-		});
-		const survivingMarker = result.messages.find(
-			(m) => m.role === "custom" && m.customType === DROPPED_TYPE,
-		);
-		assert.ok(survivingMarker, "dropped-turn marker must survive a subsequent tier-3 drop when protected");
-		assert.ok(result.droppedTurns >= 1, "the trimmable turn must still be dropped (the drop is unchanged)");
-		// The marker's tokens are subtracted from the budget, so the
-		// drop fires with the same threshold as without the marker.
-	});
-});
-
-// ─── DROPPED_CUSTOM_TYPE export (AC-2) ────────────────────────────────
-
-describe("DROPPED_CUSTOM_TYPE export (AC-2 surface)", () => {
-	it("is exported from policy.ts as `context-trimmer-dropped`", async () => {
-		const policyPath = resolve(import.meta.dirname ?? ".", "..", "policy.ts");
-		const policy = await import(policyPath);
-		assert.equal(policy.DROPPED_CUSTOM_TYPE, "context-trimmer-dropped");
+		assert.equal(result.droppedTurns, 0, "the summarize-fallback path does not drop any turns");
+		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-3 summarize-fallback path");
 	});
 });
 

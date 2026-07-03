@@ -16,7 +16,7 @@ import contextTrimmerExtension from "../index.ts";
 import { CONFIG_ENV } from "../index.ts";
 import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
 import { PRESERVED_CUSTOM_TYPE } from "../path-stamp.ts";
-import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS, DROPPED_CUSTOM_TYPE } from "../policy.ts";
+import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.ts";
 
 // ─── Pinned-tier opt-in fixture ────────────────────────────────────────
 //
@@ -316,19 +316,21 @@ describe("context handler — opt-out path (nothing configured)", () => {
 			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
 		);
 		assert.equal(pinned, undefined, "no pinned synthetic in opt-out path");
-		// The 120k trimmable turn was dropped; the dropped-turn marker
-		// is emitted at the start of the dropped turn's slice, so the
-		// output is [first-prompt, dropped-marker]. The marker is a
-		// `role: "custom"` message with customType DROPPED_CUSTOM_TYPE
-		// (see the per-dropped-turn marker emission in policy.ts).
+		// The 120k trimmable turn was dropped. The drop path emits one
+		// aggregate plain-English reminder at the start of the prune
+		// pass (the AC-1 reminder) — not a per-dropped-turn marker.
+		// The reminder is a plain `role: "user"` message prepended
+		// to the returned array; with no pinned synthetic in the
+		// opt-out path, the output is [reminder, first-prompt].
 		assert.equal(result.messages.length, 2);
 		assert.equal(result.messages[0].role, "user");
-		assert.equal(result.messages[0].content, "first prompt");
-		assert.equal(result.messages[1].role, "custom");
-		assert.equal(
-			(result.messages[1] as { customType?: string }).customType,
-			DROPPED_CUSTOM_TYPE,
+		const reminderText = String(result.messages[0].content);
+		assert.ok(
+			reminderText.includes("Context Trimmer extension"),
+			"the dropped-turn reminder must be at the start of the output and name the extension",
 		);
+		assert.equal(result.messages[1].role, "user");
+		assert.equal(result.messages[1].content, "first prompt");
 	});
 });
 
@@ -386,6 +388,8 @@ describe("default summa subprocess", () => {
 		// summarizer on failure).
 		assert.equal(typeof policy.lastSummarizerFailed, "boolean");
 	});
+});
+
 // ─── Preserved-paths channel (AC-5 + AC-6) ────────────────────────────
 //
 // End-to-end coverage of the new preserved-paths channel. The wiring
@@ -563,16 +567,15 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		// on the carved-out messages but does NOT change their `role`
 		// (the role stays `toolResult`); the filter below checks the
 		// customType, not the role, to identify preserved messages.
-		// The filter also excludes the DROPPED_CUSTOM_TYPE marker
-		// emitted on the tier-3 drop path — the marker is a NEW
-		// `role: "custom"` message that lands at the start of the
-		// dropped turn's slice, but it is a marker, not the
-		// trimmable content that was dropped.
+		// The filter also excludes the AC-1 aggregate plain-English
+		// prune reminder emitted on the tier-3 drop path — the
+		// reminder is a `role: "user"` message (per the new shape in
+		// policy.ts), so the `role === "user"` filter below already
+		// excludes it. No DROPPED_CUSTOM_TYPE filter is needed.
 		const droppedTrimmable = result.messages.filter((m) => {
 			const customType = (m as { customType?: string }).customType;
 			if (customType === PINNED_CUSTOM_TYPE) return false;
 			if (customType === PRESERVED_CUSTOM_TYPE) return false;
-			if (customType === DROPPED_CUSTOM_TYPE) return false;
 			if (m.role === "user") return false;
 			return true;
 		});
@@ -617,20 +620,28 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 	// trimmable turn rather than sit inside it).
 });
 
-// ─── AC-3 — Reported-signal done-bar (two-session transcript) ─────────────────
+// ─── AC-3 — Reported-signal done-bar (two-session transcript) ──────────
 //
 // The originally-reported signal is the LLM's "I thought I had X but
 // it's gone" confusion after a tier-3 hard drop. AC-3's done-bar is
-// relowered to a mock-provable structural done-bar: (a) the marker is
-// in the marker-present session's output stream; (b) the envelope is
-// in the LLM-bound prompt the marker-present session produces; and
-// (c) the two streams differ ONLY by the dropped-turn marker (no
-// other shape drift). The originally-reported signal's behavioral
-// claim ("the LLM stops being confused") is the operator's live
-// `/reload` confirmation, NOT a mock test — a mock that hard-codes a
-// canned acknowledgment is tautological with the assertion.
+// relowered to a mock-provable structural done-bar: (a) exactly one
+// aggregate plain-English prune reminder is in the reminder-present
+// session's output stream (one reminder per drop event, not per
+// dropped turn); (b) the LLM-bound prompt the reminder-present
+// session produces contains the reminder text (the operator's verbatim
+// example is the bound, the test asserts the substring lands in the
+// LLM-bound prompt); and (c) the two streams differ ONLY by the
+// reminder (no other shape drift — the drop heuristic, the budget,
+// and the carve-out are unchanged). The originally-reported signal's
+// behavioral claim ("the LLM stops being confused") is the operator's
+// live `/reload` confirmation, NOT a mock test — a mock that
+// hard-codes a canned acknowledgment is tautological with the
+// assertion. The two reminder states are constructed directly (the
+// no-reminder baseline mirrors the pre-fix drop output), NOT via a
+// shipped env-var/config toggle (the closed env-var surface stays
+// closed per AGENTS.md rule 8).
 
-describe("AC-3 — reported-signal done-bar (two-session transcript)", () => {
+describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)", () => {
 	/** The trimmable input that exceeds the 100k drop threshold. The
 	 *  tool-result tail carries a known artifact ("needle") that the
 	 *  originally-reported signal references. */
@@ -646,24 +657,11 @@ describe("AC-3 — reported-signal done-bar (two-session transcript)", () => {
 		];
 	}
 
-	it("marker-present session includes the dropped-turn marker in the outbound prompt", async () => {
-		// The marker-present session invokes the wiring's `context`
-		// handler with the same trimmable input. The wiring produces
-		// the new-shape stream: [pinned, dispatch, dropped-marker].
-		// The dropped turn's content is gone (the drop fires), and
-		// the marker envelope is in the prompt the LLM sees.
-		const pi = await loadExtension();
-		const event = { messages: buildOver100kSession() };
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// The marker must be present in the output stream.
-		const marker = result.messages.find(
-			(m) => m.role === "custom" && (m as { customType?: string }).customType === DROPPED_CUSTOM_TYPE,
-		);
-		assert.ok(marker, "marker-present session must include the dropped-turn marker in the output stream");
-		// Flatten the LLM-bound stream into a single text blob and
-		// confirm the envelope is in the prompt the LLM will see.
+	/** Flatten an LLM-bound message stream into a single text blob so
+	 *  we can assert substring presence in the prompt the LLM will see. */
+	function flattenPrompt(messages: ReadonlyArray<Record<string, unknown>>): string {
 		const parts: string[] = [];
-		for (const m of result.messages) {
+		for (const m of messages) {
 			const c = m.content;
 			if (typeof c === "string") {
 				parts.push(c);
@@ -677,26 +675,53 @@ describe("AC-3 — reported-signal done-bar (two-session transcript)", () => {
 				parts.push(JSON.stringify(c));
 			}
 		}
-		const prompt = parts.join("\n");
-		assert.ok(prompt.includes("[dropped:"), "marker-present session prompt must contain the dropped envelope");
-	});
+		return parts.join("\n");
+	}
 
-	it("the two streams differ ONLY by the dropped-turn marker (no other shape drift)", async () => {
-		// Structural check: the marker-present session's output
-		// matches the no-marker baseline's output element-for-element
-		// EXCEPT for the dropped-turn marker. This proves the marker
-		// is the only difference between the two streams — the
-		// solution does not change the drop heuristic, raise the
-		// budget, or remove the drop. The done-bar is at the
-		// marker-only level.
+	it("reminder-present session emits exactly one aggregate reminder in the output stream", async () => {
+		// The reminder-present session invokes the wiring's `context`
+		// handler with the same trimmable input. The wiring produces
+		// the new-shape stream: [pinned, reminder, dispatch]. The
+		// dropped turn's content is gone (the drop fires), and
+		// exactly ONE aggregate reminder is in the stream (one per
+		// drop event, not one per dropped turn).
 		const pi = await loadExtension();
 		const event = { messages: buildOver100kSession() };
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// The marker-present output includes the pinned synthetic
-		// (prepended by the wiring) and the dispatch and the
-		// dropped-turn marker. Strip the marker for shape comparison.
+		// Count reminders: a `role: "user"` message whose content names
+		// the extension. The count must be exactly 1.
+		const reminders = result.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension"),
+		);
+		assert.equal(reminders.length, 1, "exactly one aggregate reminder in the output stream");
+		// Flatten the LLM-bound stream into a single text blob and
+		// confirm the reminder text is in the prompt the LLM will see.
+		const prompt = flattenPrompt(result.messages);
+		assert.ok(prompt.includes("Context Trimmer extension"), "reminder text must land in the LLM-bound prompt");
+		assert.ok(/prun/i.test(prompt), "reminder must reference the prune action in the LLM-bound prompt");
+		assert.ok(/if you need/i.test(prompt), "reminder must include the conditional 'if you need' clause in the LLM-bound prompt");
+		assert.ok(/get it fresh/i.test(prompt), "reminder must include the 'get it fresh' clause in the LLM-bound prompt");
+	});
+
+	it("the two streams differ ONLY by the reminder (no other shape drift)", async () => {
+		// Structural check: the reminder-present session's output
+		// matches the no-reminder baseline's output element-for-element
+		// EXCEPT for the aggregate reminder. This proves the reminder
+		// is the only difference between the two streams — the
+		// solution does not change the drop heuristic, raise the
+		// budget, or remove the drop. The done-bar is at the
+		// reminder-only level. The no-reminder baseline is the
+		// pre-fix drop output (a message array mirroring the
+		// pre-fix shape — there is no shipped env-var/config toggle
+		// to force the marker-off state).
+		const pi = await loadExtension();
+		const event = { messages: buildOver100kSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The reminder-present output includes the pinned synthetic
+		// (prepended by the wiring), the aggregate reminder, and the
+		// dispatch. Strip the reminder for shape comparison.
 		const stripped = result.messages.filter(
-			(m) => !(m.role === "custom" && (m as { customType?: string }).customType === DROPPED_CUSTOM_TYPE),
+			(m) => !(m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension")),
 		);
 		// The remaining messages: pinned synthetic + dispatch. The
 		// drop fired; the trimmable tail is gone. The wiring's
@@ -710,7 +735,8 @@ describe("AC-3 — reported-signal done-bar (two-session transcript)", () => {
 		assert.equal(stripped[1].content, "dispatch task — do X");
 		// The dropped turn's assistant and toolResult are gone.
 		const droppedTurnContent = stripped.filter((m) => m.content && typeof m.content === "string" && (m.content as string).includes("needle"));
-		assert.equal(droppedTurnContent.length, 0, "the dropped turn's tool-result content must NOT be in the marker-present stream");
+		assert.equal(droppedTurnContent.length, 0, "the dropped turn's tool-result content must NOT be in the reminder-present stream");
 	});
 });
-});
+
+
