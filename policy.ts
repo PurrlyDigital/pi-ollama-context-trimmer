@@ -48,8 +48,7 @@ export const SUMMA_WORDS = 60;
  * `role: "custom"` shape the pinned-tier / preserved-paths channels
  * use. The marker rides out through the wiring layer (which does not
  * filter `role: "custom"` messages) so the LLM sees a per-dropped-turn
- * envelope at the position the dropped turn used to occupy, and the
- * session jsonl captures the envelope for after-the-fact review.
+ * envelope at the position the dropped turn used to occupy.
  *
  * The constant lives in `policy.ts` because the marker is a pure-
  * policy concern (the envelope string-formatting is a pure function of
