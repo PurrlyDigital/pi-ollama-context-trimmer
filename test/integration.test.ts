@@ -739,4 +739,87 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 	});
 });
 
+// ─── summaWords float-coercion at the wiring layer ────────────────────
+//
+// The T-2757 tier-threshold work introduced `isPositiveNumber` validation
+// for `summaWords`, which accepts floats (e.g. `60.5`). The downstream
+// Python `summa` subprocess parses its `words` argv via
+// `int(sys.argv[2])`, which raises `ValueError` on a float — the
+// graceful fail-soft path returns the source text and trips
+// `lastSummarizerFailed = true`. The wiring layer (index.ts) now
+// coerces `cfg.summaWords` to an integer via `Math.trunc` before
+// threading it into `applyThreeTierTrim`, so a `60.5` config value
+// hits the subprocess as `60` and the trim path succeeds.
+
+describe("summaWords float-coercion at the wiring layer", () => {
+	let sSummaWords: string | undefined;
+	beforeEach(() => {
+		sSummaWords = process.env[CONFIG_ENV.summaWords];
+	});
+	afterEach(() => {
+		if (sSummaWords === undefined) delete process.env[CONFIG_ENV.summaWords];
+		else process.env[CONFIG_ENV.summaWords] = sSummaWords;
+	});
+
+	it("Math.trunc coerces a float summaWords to an integer at the wiring layer; the tier-2 trim succeeds", async () => {
+		// Set summaWords to a float that `isPositiveNumber` accepts
+		// (the resolver passes it through) but the Python subprocess
+		// would reject (`int('60.5')` → ValueError). The wiring
+		// coerces to 60 before handing to the subprocess.
+		process.env[CONFIG_ENV.summaWords] = "60.5";
+		// Build a session that lands in tier 2 (between 50k and 100k
+		// trimmable tokens) so the summarizer is invoked. The
+		// trimmable mass must be natural-language text long enough
+		// for summa to produce a substantially shorter summary
+		// (>200 chars per the `defaultSummaSummarizer` floor) AND
+		// sized to land in tier 2. Each sentence repeat is ~360
+		// chars ≈ 90 tokens. The body is `longSentence.repeat(400)`
+		// = ~115k chars ≈ 29k tokens; two messages = ~58k tokens,
+		// solidly in tier 2 (above 50k verbatim, below 100k drop).
+		const pi = await loadExtension();
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "assistant", content: trimmableBody },
+				{ role: "toolResult", content: trimmableBody },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The summary path must have succeeded. The wiring-coerced
+		// integer (60) reaches the subprocess; summa is installed
+		// (the test infra) and produces a real summary. The
+		// summarized message is a tier-2 marker: content carries
+		// the `[summa:` tag, and the body inside the envelope is
+		// SHORTER than the original input. The fallback path
+		// (subprocess failure) would leave the body unchanged (the
+		// policy's catch branch returns the source text), so the
+		// length check is the structural proof that the integer
+		// argv was accepted by the Python subprocess. The
+		// summarized content is an array of `{type:"text",
+		// text:string}` blocks; extract the body to compare.
+		const summarizedBlock = result.messages
+			.flatMap((m) => {
+				const c = m.content;
+				if (Array.isArray(c)) {
+					return c
+						.filter((b: unknown) => b && typeof b === "object" && "text" in b && typeof (b as { text: unknown }).text === "string")
+						.map((b: { text: string }) => b.text);
+				}
+				return [];
+			})
+			.find((t) => t.startsWith("[summa:"));
+		assert.ok(summarizedBlock, "tier-2 trim must have produced a [summa:...] summary envelope (proves the wiring coerced a float summaWords and reached the summary path)");
+		// The envelope is `[summa: ...]\n<body>`. The body must be
+		// substantially shorter than the original ~140k-char
+		// assistant message — if the subprocess had failed (the
+		// pre-fix `int('60.5') → ValueError` path), the body would
+		// equal the input and the length check would fail.
+		const body = summarizedBlock.split("\n").slice(1).join("\n");
+		assert.ok(body.length < trimmableBody.length, "the summa body must be shorter than the original input (proves the integer argv was accepted and summa summarized, not the fail-soft source-text fallback)");
+		assert.ok(body.length > 0, "the summa body must be non-empty");
+	});
+});
+
 
