@@ -41,6 +41,15 @@ export interface ContextTrimmerConfig {
 	 *  (leading `/` or `~/`, with home expansion at the wiring
 	 *  layer). Empty / unset means no paths are preserved. */
 	readonly preservedPaths?: readonly string[];
+	/** Optional verbatim-tier cap (tokens). Overrides the policy
+	 *  default when set. */
+	readonly tier1MaxTokens?: number;
+	/** Optional summarize-tier cap (tokens). Overrides the policy
+	 *  default when set. */
+	readonly tier2MaxTokens?: number;
+	/** Optional per-summary word cap passed to summa. Overrides the
+	 *  policy default when set. */
+	readonly summaWords?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -53,6 +62,9 @@ export const ENV = {
 	trackerPath: "PI_CONTEXT_TRIMMER_TRACKER_PATH",
 	protectDispatch: "PI_CONTEXT_TRIMMER_PROTECT_DISPATCH",
 	preservedPaths: "PI_CONTEXT_TRIMMER_PRESERVED_PATHS",
+	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
+	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
+	summaWords: "PI_CONTEXT_TRIMMER_SUMMA_WORDS",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -66,6 +78,9 @@ export interface ParsedConfigFile {
 	trackerPath?: string;
 	protectDispatch?: ProtectDispatchMode;
 	preservedPaths?: readonly string[];
+	tier1MaxTokens?: number;
+	tier2MaxTokens?: number;
+	summaWords?: number;
 }
 
 /**
@@ -90,6 +105,15 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (Array.isArray(o.preservedPaths) && o.preservedPaths.every(isNonEmptyString)) {
 		out.preservedPaths = o.preservedPaths as readonly string[];
+	}
+	if (isPositiveNumber(o.tier1MaxTokens)) {
+		out.tier1MaxTokens = o.tier1MaxTokens;
+	}
+	if (isPositiveNumber(o.tier2MaxTokens)) {
+		out.tier2MaxTokens = o.tier2MaxTokens;
+	}
+	if (isPositiveNumber(o.summaWords)) {
+		out.summaWords = o.summaWords;
 	}
 	return out;
 }
@@ -119,6 +143,13 @@ export function resolveConfig(opts: {
 	const preservedPaths =
 		parseListEnv(env[ENV.preservedPaths]) ?? file.preservedPaths;
 
+	const tier1MaxTokens =
+		parseNumberEnv(env[ENV.tier1MaxTokens]) ?? file.tier1MaxTokens;
+	const tier2MaxTokens =
+		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
+	const summaWords =
+		parseNumberEnv(env[ENV.summaWords]) ?? file.summaWords;
+
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
 	if (envPd === "1") {
@@ -136,6 +167,9 @@ export function resolveConfig(opts: {
 		trackerPath,
 		protectDispatch,
 		preservedPaths,
+		tier1MaxTokens,
+		tier2MaxTokens,
+		summaWords,
 	};
 }
 
@@ -151,6 +185,14 @@ function isNonEmptyString(v: unknown): v is string {
 	return typeof v === "string" && v.length > 0;
 }
 
+/** Type guard: a value is a positive finite number. Used to validate
+ *  the numeric threshold fields; non-numeric, zero, negative, `NaN`,
+ *  and `Infinity` are all treated as absent so the resolver falls
+ *  through to the next precedence layer. */
+function isPositiveNumber(v: unknown): v is number {
+	return typeof v === "number" && Number.isFinite(v) && v > 0;
+}
+
 /** Parse a comma-separated env value into a trimmed, non-empty list.
  *  The empty string (and all-whitespace) returns `undefined` so the
  *  caller can fall through to the next precedence layer. */
@@ -159,4 +201,15 @@ function parseListEnv(s: string | undefined): readonly string[] | undefined {
 	if (trimmed === undefined) return undefined;
 	const parts = trimmed.split(",").map((p) => p.trim()).filter((p) => p.length > 0);
 	return parts.length > 0 ? parts : undefined;
+}
+
+/** Parse an env-var value as a positive finite number. The empty
+ *  string (and all-whitespace) returns `undefined` so the caller can
+ *  fall through to the next precedence layer; non-numeric, zero,
+ *  negative, `NaN`, and `Infinity` likewise return `undefined`. */
+function parseNumberEnv(s: string | undefined): number | undefined {
+	const trimmed = nonEmpty(s);
+	if (trimmed === undefined) return undefined;
+	const n = Number(trimmed);
+	return isPositiveNumber(n) ? n : undefined;
 }
