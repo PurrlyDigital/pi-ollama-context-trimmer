@@ -55,7 +55,7 @@ The extension is global — once installed, every Pi session (parent and subagen
 
 ## Config
 
-The extension's trim policy exposes three constants in `policy.ts`:
+The trim policy's three tier caps live as compile-time constants in `policy.ts` and are also exposed as operator-configurable knobs through the two config channels described below. The compile-time values are the defaults when neither channel sets a value:
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
@@ -81,14 +81,17 @@ Create `~/.pi/agent/context-trimmer.json`:
 
 ```json
 {
-  "personalityPath": "/absolute/path/to/personality.md",
-  "trackerPath": "/absolute/path/to/tracker.py",
-  "protectDispatch": "auto",
-  "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"]
+  "personalityPath": "/absolute/path/to/personality.md",            // falls back to no personality section
+  "trackerPath": "/absolute/path/to/tracker.py",                    // falls back to no tracker section
+  "protectDispatch": "auto",                                        // "auto" (default) | true | false
+  "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"],             // falls back to no paths preserved
+  "tier1MaxTokens": 50000,                                          // falls back to VERBATIM_TIER_MAX_TOKENS
+  "tier2MaxTokens": 100000,                                         // falls back to SUMMARIZE_TIER_MAX_TOKENS
+  "summaWords": 60                                                  // falls back to SUMMA_WORDS
 }
 ```
 
-All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent (the resolver falls back to the other channel / defaults).
+All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. The three tier-threshold fields (`tier1MaxTokens`, `tier2MaxTokens`, `summaWords`) follow the same env-over-file-over-default precedence the other fields already document, with the compile-time constants in `policy.ts` as the final default. Each threshold value must be a positive finite number — non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent (the resolver falls back to the other channel / defaults), matching the existing "badly-typed values are treated as absent" rule. The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent.
 
 `preservedPaths` is an optional list of patterns whose matching tool-result messages are protected from summary and drop and whose tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match — it matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match; the `~/` form is expanded to your home directory (e.g. `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`). When `preservedPaths` is unset, no paths are preserved; when set, the patterns above are protected from the trim budget.
 
@@ -100,11 +103,12 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_TRACKER_PATH` | Absolute path to a tracker CLI whose last-N ticket digest is pinned. Unset/empty → falls back to the file, then no tracker section. |
 | `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` | `1` forces dispatch protection ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"`. |
 | `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` | Comma-separated list of path patterns whose matching tool-result messages are protected from summary and drop. Bare filenames are fuzzy matches (e.g. `AGENTS.md` matches any AGENTS.md); patterns beginning with `/` or `~/` are absolute matches (e.g. `~/secrets/keys.md` matches that one file). Unset/empty → falls back to the file, then no paths preserved. |
+| `PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS` | Positive finite number; the verbatim-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `VERBATIM_TIER_MAX_TOKENS` (`50_000`). |
+| `PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS` | Positive finite number; the summarize-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMARIZE_TIER_MAX_TOKENS` (`100_000`). |
+| `PI_CONTEXT_TRIMMER_SUMMA_WORDS` | Positive finite number; the per-summary word cap passed to summa. Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMA_WORDS` (`60`). |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
-When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The trim-policy thresholds below remain compile-time constants.
-
-**The trim-policy thresholds are compile-time, not environment variables.** To change a threshold, edit the constant in the source file and reinstall.
+When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
 
 The summarize callback can be overridden per-call by passing a `summarizer` option to `applyThreeTierTrim` (this is the test seam — production wires `defaultSummaSummarizer`, which is a Python `summa` subprocess). The `defaultSummaSummarizer` exports a diagnostic flag `lastSummarizerFailed` (let-binding) that flips to `true` if the subprocess errors; consumers can read it after a trim call to surface a warning to the user.
 
@@ -116,7 +120,7 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (104 tests, ~1s on a modern laptop):
+Run the test suite (156 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
