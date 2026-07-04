@@ -225,3 +225,281 @@ describe("preservedPaths", () => {
 		assert.equal(ENV.preservedPaths, "PI_CONTEXT_TRIMMER_PRESERVED_PATHS");
 	});
 });
+
+describe("tier1MaxTokens", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: well-typed positive number is extracted", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 75000 }).tier1MaxTokens, 75000);
+	});
+
+	it("file parse: non-numeric value (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: "75000" }).tier1MaxTokens, undefined);
+	});
+
+	it("file parse: zero is treated as absent (not a valid token budget)", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 0 }).tier1MaxTokens, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: -100 }).tier1MaxTokens, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: Number.NaN }).tier1MaxTokens, undefined);
+	});
+
+	it("file parse: Infinity is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: Number.POSITIVE_INFINITY }).tier1MaxTokens, undefined);
+		assert.equal(parseConfigFile({ tier1MaxTokens: Number.NEGATIVE_INFINITY }).tier1MaxTokens, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).tier1MaxTokens, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { tier1MaxTokens: 50_000 },
+			env: { [ENV.tier1MaxTokens]: "75000" } as EnvRecord,
+		});
+		assert.equal(cfg.tier1MaxTokens, 75000);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { tier1MaxTokens: 50_000 },
+			env: { [ENV.tier1MaxTokens]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.tier1MaxTokens, 50_000);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { tier1MaxTokens: 50_000 },
+			env: { [ENV.tier1MaxTokens]: "not-a-number" } as EnvRecord,
+		});
+		assert.equal(cfg.tier1MaxTokens, 50_000);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { tier1MaxTokens: 75_000 } });
+		assert.equal(cfg.tier1MaxTokens, 75_000);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.tier1MaxTokens, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.tier1MaxTokens]: "125000" } as EnvRecord,
+		});
+		assert.equal(cfg.tier1MaxTokens, 125000);
+		assert.equal(typeof cfg.tier1MaxTokens, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.tier1MaxTokens is the documented namespace", () => {
+		assert.equal(ENV.tier1MaxTokens, "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS");
+	});
+});
+
+describe("tier2MaxTokens", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: well-typed positive number is extracted", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: 150000 }).tier2MaxTokens, 150000);
+	});
+
+	it("file parse: non-numeric value (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: "150000" }).tier2MaxTokens, undefined);
+	});
+
+	it("file parse: zero is treated as absent (not a valid token budget)", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: 0 }).tier2MaxTokens, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: -200 }).tier2MaxTokens, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: Number.NaN }).tier2MaxTokens, undefined);
+	});
+
+	it("file parse: Infinity is treated as absent", () => {
+		assert.equal(parseConfigFile({ tier2MaxTokens: Number.POSITIVE_INFINITY }).tier2MaxTokens, undefined);
+		assert.equal(parseConfigFile({ tier2MaxTokens: Number.NEGATIVE_INFINITY }).tier2MaxTokens, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).tier2MaxTokens, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { tier2MaxTokens: 100_000 },
+			env: { [ENV.tier2MaxTokens]: "150000" } as EnvRecord,
+		});
+		assert.equal(cfg.tier2MaxTokens, 150000);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { tier2MaxTokens: 100_000 },
+			env: { [ENV.tier2MaxTokens]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.tier2MaxTokens, 100_000);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { tier2MaxTokens: 100_000 },
+			env: { [ENV.tier2MaxTokens]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfg.tier2MaxTokens, 100_000);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { tier2MaxTokens: 150_000 } });
+		assert.equal(cfg.tier2MaxTokens, 150_000);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.tier2MaxTokens, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.tier2MaxTokens]: "200000" } as EnvRecord,
+		});
+		assert.equal(cfg.tier2MaxTokens, 200000);
+		assert.equal(typeof cfg.tier2MaxTokens, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.tier2MaxTokens is the documented namespace", () => {
+		assert.equal(ENV.tier2MaxTokens, "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS");
+	});
+});
+
+describe("summaWords", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: well-typed positive number is extracted", () => {
+		assert.equal(parseConfigFile({ summaWords: 100 }).summaWords, 100);
+	});
+
+	it("file parse: non-numeric value (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ summaWords: "100" }).summaWords, undefined);
+	});
+
+	it("file parse: zero is treated as absent (not a valid word cap)", () => {
+		assert.equal(parseConfigFile({ summaWords: 0 }).summaWords, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ summaWords: -50 }).summaWords, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ summaWords: Number.NaN }).summaWords, undefined);
+	});
+
+	it("file parse: Infinity is treated as absent", () => {
+		assert.equal(parseConfigFile({ summaWords: Number.POSITIVE_INFINITY }).summaWords, undefined);
+		assert.equal(parseConfigFile({ summaWords: Number.NEGATIVE_INFINITY }).summaWords, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).summaWords, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { summaWords: 60 },
+			env: { [ENV.summaWords]: "100" } as EnvRecord,
+		});
+		assert.equal(cfg.summaWords, 100);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { summaWords: 60 },
+			env: { [ENV.summaWords]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.summaWords, 60);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { summaWords: 60 },
+			env: { [ENV.summaWords]: "lots" } as EnvRecord,
+		});
+		assert.equal(cfg.summaWords, 60);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { summaWords: 80 } });
+		assert.equal(cfg.summaWords, 80);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.summaWords, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.summaWords]: "120" } as EnvRecord,
+		});
+		assert.equal(cfg.summaWords, 120);
+		assert.equal(typeof cfg.summaWords, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.summaWords is the documented namespace", () => {
+		assert.equal(ENV.summaWords, "PI_CONTEXT_TRIMMER_SUMMA_WORDS");
+	});
+});
+
+describe("tier-threshold fields — per-field independence", () => {
+	it("file parse: one field malformed does not poison the others", () => {
+		const f = parseConfigFile({
+			tier1MaxTokens: 75_000,
+			tier2MaxTokens: "not-a-number",
+			summaWords: 80,
+		});
+		assert.equal(f.tier1MaxTokens, 75_000);
+		assert.equal(f.tier2MaxTokens, undefined);
+		assert.equal(f.summaWords, 80);
+	});
+
+	it("resolveConfig: env sets one field, file sets another, third is undefined", () => {
+		const cfg = resolveConfig({
+			file: { tier2MaxTokens: 200_000 },
+			env: { [ENV.tier1MaxTokens]: "75000" } as EnvRecord,
+		});
+		assert.equal(cfg.tier1MaxTokens, 75000);
+		assert.equal(cfg.tier2MaxTokens, 200_000);
+		assert.equal(cfg.summaWords, undefined);
+	});
+});
