@@ -317,11 +317,28 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// with `~/` expanded at the wiring layer to the operator's
 		// home directory (the pure predicate receives the expanded
 		// pattern; it never reads `os.homedir()` itself).
+		// Coerce `summaWords` to an integer at the wiring layer. The
+		// downstream Python `summa` subprocess parses its `words` argv
+		// via `int(sys.argv[2])`, which raises ValueError on a float
+		// (e.g. `60.5` from a config-file value with a trailing
+		// `.0` or a deliberately fractional cap). `isPositiveNumber`
+		// accepts floats (it's a Number.isFinite check), so the
+		// resolver can hand a float through the env>JSON>default
+		// precedence — the policy guards the integer contract, not
+		// the resolver. `Math.trunc` is the integer-coercion
+		// primitive: it preserves a deliberate `60.0` as `60` (the
+		// rejected Option A — silently dropping the value via a
+		// stricter `isPositiveInteger` predicate — would have lost
+		// the operator's setting), strips a deliberate `60.5` to
+		// `60`, and returns `NaN` for non-finite inputs. When
+		// `cfg.summaWords` is `undefined` (the default path), the
+		// `?? DEFAULT` fallback in `applyThreeTierTrim` still wins.
+		const summaWordsInt = cfg.summaWords !== undefined ? Math.trunc(cfg.summaWords) : undefined;
 		const result = applyThreeTierTrim(withPinned, {
 			summarizer: defaultSummaSummarizer,
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
-			summaWords: cfg.summaWords,
+			summaWords: summaWordsInt,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
