@@ -58,8 +58,6 @@ import {
 	applyThreeTierTrim,
 	defaultSummaSummarizer,
 	isPathPreserved,
-	VERBATIM_TIER_MAX_TOKENS,
-	SUMMARIZE_TIER_MAX_TOKENS,
 	type TrimmableMessage,
 } from "./policy.ts";
 import { createPinnedTier, PINNED_CUSTOM_TYPE } from "./pinned-tier.ts";
@@ -321,8 +319,9 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// pattern; it never reads `os.homedir()` itself).
 		const result = applyThreeTierTrim(withPinned, {
 			summarizer: defaultSummaSummarizer,
-			verbatimMaxTokens: VERBATIM_TIER_MAX_TOKENS,
-			summarizeMaxTokens: SUMMARIZE_TIER_MAX_TOKENS,
+			verbatimMaxTokens: cfg.tier1MaxTokens,
+			summarizeMaxTokens: cfg.tier2MaxTokens,
+			summaWords: cfg.summaWords,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
