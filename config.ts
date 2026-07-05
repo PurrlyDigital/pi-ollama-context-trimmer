@@ -24,6 +24,12 @@
  *  pi-subagents detection; `true`/`false` force it on/off. */
 export type ProtectDispatchMode = "auto" | boolean;
 
+/** The loop-guard enable mode. `"auto"` defers to the wiring layer's
+ *  detection policy; `true`/`false` force loop-guard on/off. Mirrors
+ *  `ProtectDispatchMode` so the two opt-in/out knobs carry the same
+ *  semantics. */
+export type LoopGuardMode = "auto" | boolean;
+
 /** The resolved trimmer config. Every field is optional — when nothing
  *  is configured the trimmer runs with no pinned surfaces and no
  *  dispatch protection (the opt-out default). */
@@ -56,10 +62,31 @@ export interface ContextTrimmerConfig {
 	/** Optional recency-floor token count. Overrides the policy
 	 *  default when set. */
 	readonly recencyFloor?: number;
+	/** Loop-guard enable mode. `true`/`false` force on/off;
+	 *  `"auto"` defers to the wiring layer. Overrides the policy
+	 *  default when set. */
+	readonly loopGuard?: LoopGuardMode;
+	/** Loop-guard nudge threshold (consecutive identical assistant
+	 *  tool-call turns before the wiring layer injects a nudge).
+	 *  Positive integer; the wiring layer coerces with `Math.trunc`
+	 *  (summaWords precedent). Overrides the policy default when
+	 *  set. */
+	readonly loopGuardThreshold?: number;
+	/** Loop-guard hard-block threshold (consecutive identical
+	 *  assistant tool-call turns before the wiring layer hard-blocks
+	 *  the next one). `undefined` means hard-block is off. Positive
+	 *  integer; the wiring layer coerces with `Math.trunc` (summaWords
+	 *  precedent). Overrides the policy default when set. */
+	readonly loopGuardHardBlock?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
 export const DEFAULT_PROTECT_DISPATCH: ProtectDispatchMode = "auto";
+
+/** Default loop-guard mode: defer to the wiring layer's detection
+ *  policy. Mirrors `DEFAULT_PROTECT_DISPATCH` so both opt-in/out
+ *  knobs default to the auto-detect posture. */
+export const DEFAULT_LOOP_GUARD: LoopGuardMode = "auto";
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
  *  the wiring layer and tests reference a single source of truth. */
@@ -73,6 +100,9 @@ export const ENV = {
 	summaWords: "PI_CONTEXT_TRIMMER_SUMMA_WORDS",
 	dropFloorPercent: "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT",
 	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
+	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
+	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
+	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -91,6 +121,9 @@ export interface ParsedConfigFile {
 	summaWords?: number;
 	dropFloorPercent?: number;
 	recencyFloor?: number;
+	loopGuard?: LoopGuardMode;
+	loopGuardThreshold?: number;
+	loopGuardHardBlock?: number;
 }
 
 /**
@@ -131,6 +164,16 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (isPositiveNumber(o.recencyFloor)) {
 		out.recencyFloor = o.recencyFloor;
 	}
+	const lg = o.loopGuard;
+	if (lg === "auto" || lg === true || lg === false) {
+		out.loopGuard = lg;
+	}
+	if (isPositiveNumber(o.loopGuardThreshold)) {
+		out.loopGuardThreshold = o.loopGuardThreshold;
+	}
+	if (isPositiveNumber(o.loopGuardHardBlock)) {
+		out.loopGuardHardBlock = o.loopGuardHardBlock;
+	}
 	return out;
 }
 
@@ -170,6 +213,23 @@ export function resolveConfig(opts: {
 	const recencyFloor =
 		parseNumberEnv(env[ENV.recencyFloor]) ?? file.recencyFloor;
 
+	let loopGuard: LoopGuardMode;
+	const envLg = env[ENV.loopGuard];
+	if (envLg === "1") {
+		loopGuard = true;
+	} else if (envLg === "0") {
+		loopGuard = false;
+	} else if (file.loopGuard === true || file.loopGuard === false || file.loopGuard === "auto") {
+		loopGuard = file.loopGuard;
+	} else {
+		loopGuard = DEFAULT_LOOP_GUARD;
+	}
+
+	const loopGuardThreshold =
+		parseNumberEnv(env[ENV.loopGuardThreshold]) ?? file.loopGuardThreshold;
+	const loopGuardHardBlock =
+		parseNumberEnv(env[ENV.loopGuardHardBlock]) ?? file.loopGuardHardBlock;
+
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
 	if (envPd === "1") {
@@ -192,6 +252,9 @@ export function resolveConfig(opts: {
 		summaWords,
 		dropFloorPercent,
 		recencyFloor,
+		loopGuard,
+		loopGuardThreshold,
+		loopGuardHardBlock,
 	};
 }
 

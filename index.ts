@@ -56,9 +56,14 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import {
 	applyThreeTierTrim,
+	computeFlatInputTokenSignal,
 	defaultSummaSummarizer,
+	detectConsecutiveIdenticalToolCalls,
 	isPathPreserved,
+	LOOP_GUARD_BLOCK_TEXT,
+	LOOP_GUARD_NUDGE_TEXT,
 	SUMMARIZE_TIER_MAX_TOKENS,
+	shouldHardBlock,
 	type TrimmableMessage,
 } from "./policy.ts";
 import { createPinnedTier, PINNED_CUSTOM_TYPE } from "./pinned-tier.ts";
@@ -67,6 +72,7 @@ import {
 	parseConfigFile,
 	ENV,
 	type ContextTrimmerConfig,
+	type LoopGuardMode,
 	type ProtectDispatchMode,
 } from "./config.ts";
 import {
@@ -221,6 +227,47 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		return protectDispatchResolved;
 	}
 
+	// Loop-guard resolution. Resolved lazily on the first `context`
+	// call and cached for the session. An explicit true/false
+	// short-circuits detection; `"auto"` defers to the same
+	// pi-subagents tool probe that `resolveProtectDispatch` uses
+	// (the subagent tool is the wiring-layer signal that the
+	// extension is running in a subagent context — the same
+	// posture where behavioral-loop detection matters most).
+	let loopGuardResolved: boolean | undefined;
+	function resolveLoopGuard(): boolean {
+		if (loopGuardResolved !== undefined) return loopGuardResolved;
+		const mode: LoopGuardMode = cfg.loopGuard ?? "auto";
+		if (mode === true) {
+			loopGuardResolved = true;
+		} else if (mode === false) {
+			loopGuardResolved = false;
+		} else {
+			// Reuse the same `safeGetAllTools(pi)` probe as
+			// `resolveProtectDispatch` — the subagent tool's
+			// presence is the wiring-layer signal that we're in a
+			// subagent context, the same posture where
+			// behavioral-loop detection matters most.
+			const tools = safeGetAllTools(pi);
+			loopGuardResolved = tools.some((t) => t?.name === "subagent");
+		}
+		return loopGuardResolved;
+	}
+
+	// Loop-guard thresholds. `Math.trunc` integer coercion matches
+	// the `summaWords` precedent in this file. Default nudge
+	// threshold is 3; hard-block defaults to off. The
+	// `hardBlockThreshold >= loopGuardThreshold` invariant is
+	// enforced at the wiring layer (the predicate in `policy.ts`
+	// does not check it): clamp `loopGuardHardBlock` up to
+	// `loopGuardThreshold` when the operator sets a value below
+	// the nudge threshold, so the hard-block never fires before
+	// the soft-nudge.
+	const loopGuardThreshold = cfg.loopGuardThreshold !== undefined ? Math.trunc(cfg.loopGuardThreshold) : 3;
+	const rawHardBlock = cfg.loopGuardHardBlock !== undefined ? Math.trunc(cfg.loopGuardHardBlock) : undefined;
+	const loopGuardHardBlock =
+		rawHardBlock !== undefined && rawHardBlock < loopGuardThreshold ? loopGuardThreshold : rawHardBlock;
+
 	pi.on("session_start", async () => {
 		pinnedTier.refresh();
 	});
@@ -363,6 +410,14 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
 		});
+		// Loop-guard integration. Runs AFTER the trim (operates on
+		// the trimmed view the LLM is about to see) and BEFORE the
+		// handler returns. Re-injection on every qualifying turn is
+		// the simpler safe default; the hard-block naturally dedupes
+		// because stripping the tool call breaks the fingerprint
+		// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
+		// signature → the run resets on the next invocation).
+		const out: TrimmableMessage[] = applyLoopGuard(result.messages);
 		// Cast back to the session message shape and return. The
 		// pinned message rides out at the top (when injected); the rest
 		// are the trimmed trimmable messages. The double-cast mirrors the
@@ -370,9 +425,61 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// `AgentMessage` share a structural core (role, content, etc.)
 		// but the session type carries provider-specific fields the
 		// policy does not inspect.
-		const out = result.messages.map((m) => m as unknown as Record<string, unknown>);
-		return { messages: out as unknown as typeof event.messages };
+		const outCasted = out.map((m) => m as unknown as Record<string, unknown>);
+		return { messages: outCasted as unknown as typeof event.messages };
 	});
+
+	/**
+	 * Loop-guard injection over the trimmed message stream. When the
+	 * guard is OFF, returns the input unchanged (the existing path).
+	 * When ON, computes the run-length and the flat-input-token
+	 * co-signal; on a qualifying run, prepends a `role: "user"`
+	 * synthetic with the nudge or block text. The hard-block path
+	 * additionally strips the last assistant turn's `toolCall`
+	 * blocks (preserving any textual / thinking content) so the
+	 * model must proceed via text. Hard-block is a strict superset
+	 * of soft-nudge — when both fire, emit ONLY the block text.
+	 */
+	function applyLoopGuard(trimmed: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
+		if (!resolveLoopGuard()) return trimmed.slice();
+		const { runLength } = detectConsecutiveIdenticalToolCalls(trimmed, loopGuardThreshold);
+		if (runLength < loopGuardThreshold) return trimmed.slice();
+		const { flat: flatInputTokens } = computeFlatInputTokenSignal(trimmed);
+		const hardBlock = shouldHardBlock(runLength, loopGuardHardBlock);
+		const out = trimmed.slice();
+		if (hardBlock) {
+			// Strip the last assistant turn's `toolCall` blocks,
+			// preserving any textual / thinking content of the same
+			// turn. The strip is per-block: any non-`toolCall` block
+			// (e.g. `type: "text"`, `type: "thinking"`) survives.
+			for (let i = out.length - 1; i >= 0; i--) {
+				const m = out[i];
+				if (m.role !== "assistant") continue;
+				if (Array.isArray(m.content)) {
+					const filtered = (m.content as ReadonlyArray<{ type: string; [k: string]: unknown }>).filter(
+						(block) => !(block && typeof block === "object" && (block as { type: string }).type === "toolCall"),
+					);
+					out[i] = { ...m, content: filtered };
+				} else {
+					// Non-array content (string or toolResult shape)
+					// has no tool-call blocks to strip; the model
+					// must have already been proceeding via text.
+				}
+				break;
+			}
+			out.unshift({ role: "user", content: LOOP_GUARD_BLOCK_TEXT });
+		} else {
+			// Soft-nudge. Append the flat-input-token clause when
+			// the co-signal is flat — informational, non-directive;
+			// the model treats it as a status note. The clause is
+			// a single sentence appended to the nudge body.
+			const text = flatInputTokens
+				? LOOP_GUARD_NUDGE_TEXT + " The input token count has been flat across these calls."
+				: LOOP_GUARD_NUDGE_TEXT;
+			out.unshift({ role: "user", content: text });
+		}
+		return out;
+	}
 }
 
 /**

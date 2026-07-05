@@ -53,6 +53,28 @@ The extension is global — once installed, every Pi session (parent and subagen
 - The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from summary and drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
 - A session that contains ONLY the dispatch + the pinned synthetic + a single short trimmable message (e.g. a freshly dispatched subagent) never enters the trim path: the trimmable mass is under 50k, so the messages are returned verbatim.
 
+## Loop guard
+
+Defense-in-depth alongside the trim. The trim bounds **context size** (drop / summarize over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
+
+### How it detects
+
+Each assistant turn's `toolCall` content blocks are fingerprinted as `(toolName, deterministically-sorted-keys args)`. Object key order in the arguments is normalized away (it is an artifact of model serialization, not of the call's identity); array element order is preserved (it is part of the call's identity). A turn's fingerprint is the sorted conjunction of every `toolCall` block's individual fingerprint; a multi-tool-call turn matches the run signature iff every one of its calls matches.
+
+A run is the trailing sequence of consecutive assistant turns whose fingerprints are identical. A **no-tool-call** (reasoning-only) assistant turn yields a distinct fingerprint (a `__no_tool_calls__` signature) so the run resets naturally — the model thinking without re-calling a tool is not a behavioral loop. The guard is therefore scoped to **behavioral** loops, not **reasoning-only** loops.
+
+A **flat input-token co-signal** is computed over the last few assistant turns' input-token counts: when every sample is within a small tolerance of the smallest sample, the signal is "flat." Flat input tokens indicate the model is not progressing on new material; the co-signal is informational and is used to strengthen the nudge text when present (the model receives a single additional sentence noting the flat count).
+
+### How it intervenes
+
+When the run length crosses the configured threshold (default 3), the wiring layer prepends a `role: "user"` synthetic to the LLM-bound view, naming the repetition and pointing the model at the results already in context. The injection rides the same channel as the pinned-tier synthetic and the tier-3 prune reminder. The nudge is non-directive — it is a status note, not a command.
+
+When a **hard-block** threshold is configured (default: off) AND the run length meets or exceeds it, the wiring layer additionally strips the last assistant turn's `toolCall` blocks from the message stream (preserving any textual / thinking content of the same turn) and prepends a `role: "user"` block-notice synthetic. The hard-block path is a strict superset of the soft-nudge path — when both fire, only the block text is emitted, and the model must proceed via text (the tool calls are gone). Re-injection is idempotent: stripping the tool calls breaks the fingerprint on the next turn, so the run resets and the guard goes quiet until the model re-establishes it.
+
+### Scope boundary
+
+The guard detects **behavioral** loops via tool-call signatures. **Reasoning-only** loops (the model re-reasoning without a tool call) are out of scope — a no-tool-call turn yields a distinct fingerprint and resets the run naturally, no special case required.
+
 ## Config
 
 The trim policy's three tier caps live as compile-time constants in `policy.ts` and are also exposed as operator-configurable knobs through the two config channels described below. The compile-time values are the defaults when neither channel sets a value:
@@ -87,7 +109,10 @@ Create `~/.pi/agent/context-trimmer.json`:
   "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"],             // falls back to no paths preserved
   "tier1MaxTokens": 50000,                                          // falls back to VERBATIM_TIER_MAX_TOKENS
   "tier2MaxTokens": 100000,                                         // falls back to SUMMARIZE_TIER_MAX_TOKENS
-  "summaWords": 60                                                  // falls back to SUMMA_WORDS
+  "summaWords": 60,                                                 // falls back to SUMMA_WORDS
+  "loopGuard": "auto",                                              // "auto" (default) | true | false
+  "loopGuardThreshold": 3,                                          // falls back to 3 (consecutive identical tool-call turns)
+  "loopGuardHardBlock": 10                                          // falls back to off; positive int enables hard-block
 }
 ```
 
@@ -106,6 +131,9 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS` | Positive finite number; the verbatim-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `VERBATIM_TIER_MAX_TOKENS` (`50_000`). |
 | `PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS` | Positive finite number; the summarize-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMARIZE_TIER_MAX_TOKENS` (`100_000`). |
 | `PI_CONTEXT_TRIMMER_SUMMA_WORDS` | Positive finite number; the per-summary word cap passed to summa. Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMA_WORDS` (`60`). |
+| `PI_CONTEXT_TRIMMER_LOOP_GUARD` | `1` forces the loop guard ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"` (ON when `pi-subagents` is installed, mirroring `protectDispatch`). |
+| `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD` | Positive integer; the soft-nudge threshold (consecutive identical tool-call turns before the wiring layer injects a nudge). Unset/empty/non-numeric/zero/negative → falls back to the file, then `3`. |
+| `PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK` | Positive integer; the hard-block threshold (consecutive identical tool-call turns before the wiring layer strips the tool calls and forces a text-only continuation). Unset → falls back to the file, then off. Values below the soft-nudge threshold are clamped up to the soft-nudge threshold so the hard-block cannot fire before the soft-nudge. |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
 When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
@@ -120,7 +148,7 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (156 tests, ~1s on a modern laptop):
+Run the test suite (267 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
