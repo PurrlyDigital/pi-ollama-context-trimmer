@@ -886,3 +886,191 @@ function findOldestSummarizable(
 	}
 	return -1;
 }
+
+// ─── Loop guard (defense-in-depth for model-caused loops) ──────────
+//
+// Detects repeated identical tool-call sequences in the assistant
+// turn stream. The detection layer is pure (no `process.*`, no
+// `node:fs`); the wiring layer (Unit 3) is what actually decides
+// whether to nudge, hard-block, or fall through. The constants
+// below are the model-facing strings injected on nudge / hard-block;
+// the predicates are the decision rules.
+//
+// Scope: behavioral loops (identical tool-call sequences with
+// deterministic key order). Reasoning-only loops are out of scope —
+// a no-tool-call assistant turn yields a distinct fingerprint, so
+// the run resets naturally without a special case.
+
+/**
+ * Tolerance for the flat-input-token co-signal (AC-4). The last-N
+ * assistant-turn input-token counts are considered "flat" iff the
+ * spread between the largest and smallest sample is within this
+ * fraction of the smallest. A pure default constant; the wiring
+ * layer may override per-call.
+ */
+export const FLAT_INPUT_TOKEN_TOLERANCE = 0.05;
+
+/**
+ * Plain-English nudge the wiring layer injects as a `role: "user"`
+ * synthetic when the model has issued the same tool call several
+ * times in a row. The nudge names (a) the repetition, (b) the fact
+ * the prior results are already in context, and (c) the option to
+ * proceed to the next step. The phrasing is non-directive — no
+ * "you must" — so the model treats it as a status note, not a
+ * command.
+ */
+export const LOOP_GUARD_NUDGE_TEXT =
+	"You've called the same tool with the same arguments several times in a row, and the results of the earlier calls are already in the conversation above. " +
+	"If those results answer the question, use them; otherwise, try a different approach.";
+
+/**
+ * Plain-English hard-block notice the wiring layer injects as a
+ * `role: "user"` synthetic when the model has crossed the
+ * hard-block threshold. The notice states the repeated tool call
+ * was blocked and that the model must proceed via text (the
+ * hard-block case). Model-facing; non-directive tone.
+ */
+export const LOOP_GUARD_BLOCK_TEXT =
+	"The repeated tool call has been blocked because the same call has fired too many times in a row with the same arguments. " +
+	"Proceed by reasoning in text — use the results already in context or take a different approach.";
+
+/**
+ * Sort an object's keys deterministically for fingerprinting.
+ * Pure: no I/O, no mutation of the input. Non-object inputs are
+ * returned as-is. Arrays preserve order (the position of each
+ * element is part of the call's identity for a tool call); only
+ * object keys are sorted, since key order is an artifact of the
+ * model's serialization, not the call's semantics.
+ */
+function sortObjectKeysDeep(value: unknown): unknown {
+	if (value === null || typeof value !== "object") return value;
+	if (Array.isArray(value)) {
+		return value.map((v) => sortObjectKeysDeep(v));
+	}
+	const obj = value as Record<string, unknown>;
+	const out: Record<string, unknown> = {};
+	for (const key of Object.keys(obj).sort()) {
+		out[key] = sortObjectKeysDeep(obj[key]);
+	}
+	return out;
+}
+
+/**
+ * Fingerprint a single tool call. Two calls fingerprint identically
+ * iff they have the same `name` and equivalent `arguments` under
+ * deterministic key ordering. Argument value identity matters;
+ * argument key order does not.
+ */
+export function fingerprintToolCall(toolCall: { name: string; arguments: unknown }): string {
+	const normalizedArgs = sortObjectKeysDeep(toolCall.arguments);
+	return toolCall.name + "|" + JSON.stringify(normalizedArgs);
+}
+
+/**
+ * Fingerprint a single assistant turn's tool-call blocks. A turn
+ * with no `toolCall` blocks returns a distinct signature so the
+ * run resets naturally (reasoning-only turns break a behavioral
+ * loop). The fingerprint is the sorted conjunction of every
+ * toolCall block's individual fingerprint.
+ *
+ * Scope boundary (AC-9): only behavioral loops (identical tool-call
+ * sequences) are detected. Reasoning-only loops are out of scope.
+ */
+export function fingerprintAssistantTurn(content: ReadonlyArray<{ type: string; [k: string]: unknown }>): string {
+	const toolCalls: string[] = [];
+	for (const block of content) {
+		if (block && typeof block === "object" && block.type === "toolCall") {
+			const blockObj = block as { type: string; name?: unknown; arguments?: unknown };
+			const name = typeof blockObj.name === "string" ? blockObj.name : "";
+			const args = "arguments" in block ? blockObj.arguments : undefined;
+			toolCalls.push(fingerprintToolCall({ name, arguments: args }));
+		}
+	}
+	if (toolCalls.length === 0) {
+		// Distinct signature: reasoning-only turns reset the run.
+		return "\0__no_tool_calls__";
+	}
+	toolCalls.sort();
+	return toolCalls.join("\n");
+}
+
+/**
+ * Detect a run of consecutive identical assistant turns ending at
+ * the last assistant turn in `messages`. The run joins when the
+ * per-turn fingerprint matches the run's signature; a multi-tool-
+ * call turn matches iff the conjunction of all its tool calls
+ * matches the run signature. Read-only and idempotent over the
+ * stream.
+ *
+ * Returns the run length and the matched signature, or `null` if
+ * no run was detected.
+ */
+export function detectConsecutiveIdenticalToolCalls(
+	messages: ReadonlyArray<TrimmableMessage>,
+	threshold: number,
+): { runLength: number; lastSignature: string | null } {
+	if (threshold <= 0) return { runLength: 0, lastSignature: null };
+	let runSignature: string | null = null;
+	let runLength = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg.role !== "assistant") continue;
+		const content = Array.isArray(msg.content) ? (msg.content as ReadonlyArray<{ type: string; [k: string]: unknown }>) : [];
+		const fingerprint = fingerprintAssistantTurn(content);
+		if (runSignature === null) {
+			runSignature = fingerprint;
+			runLength = 1;
+			continue;
+		}
+		if (fingerprint === runSignature) {
+			runLength += 1;
+			continue;
+		}
+		break;
+	}
+	if (runSignature === "\0__no_tool_calls__") {
+		// Reasoning-only tail — not a behavioral loop.
+		return { runLength: 0, lastSignature: null };
+	}
+	return { runLength, lastSignature: runSignature };
+}
+
+/**
+ * Compute the flat-input-token co-signal over the last
+ * `window` assistant-turn input-token counts. The signal is
+ * "flat" when every sample is within `FLAT_INPUT_TOKEN_TOLERANCE`
+ * of the smallest sample. Informational only — the wiring layer
+ * decides whether and how to use it. Pure.
+ */
+export function computeFlatInputTokenSignal(
+	messages: ReadonlyArray<TrimmableMessage>,
+	window: number = 5,
+): { flat: boolean; sampleTokens: number[] } {
+	const sampleTokens: number[] = [];
+	for (let i = messages.length - 1; i >= 0 && sampleTokens.length < window; i--) {
+		if (messages[i].role === "assistant") {
+			sampleTokens.push(approximateMessageTokens(messages[i]));
+		}
+	}
+	sampleTokens.reverse();
+	if (sampleTokens.length < 2) return { flat: false, sampleTokens };
+	const min = Math.min(...sampleTokens);
+	if (min === 0) {
+		const allZero = sampleTokens.every((n) => n === 0);
+		return { flat: allZero, sampleTokens };
+	}
+	const max = Math.max(...sampleTokens);
+	const flat = (max - min) / min <= FLAT_INPUT_TOKEN_TOLERANCE;
+	return { flat, sampleTokens };
+}
+
+/**
+ * Pure hard-block predicate. Returns true iff a hard-block threshold
+ * is configured AND the run length meets or exceeds it. The wiring
+ * layer is responsible for the `hardBlockThreshold >= loopGuardThreshold`
+ * invariant; the predicate does not check it.
+ */
+export function shouldHardBlock(runLength: number, hardBlockThreshold: number | undefined): boolean {
+	if (hardBlockThreshold === undefined) return false;
+	return runLength >= hardBlockThreshold;
+}
