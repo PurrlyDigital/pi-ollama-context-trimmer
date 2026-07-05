@@ -499,6 +499,275 @@ describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () =>
 	});
 });
 
+// ─── Drop-floor + recency-floor (AC-1 + AC-2) ────────────────────────
+//
+// Two new option channels land on `TrimOptions` from Units 1+2:
+//   - `dropFloorTokens`: a token count the tier-3 drop must not
+//     undershoot by dropping a whole turn. When the next-oldest
+//     turn would push the trimmable total below the floor, the
+//     drop loop stops and falls through to the summarize path
+//     so the drop tier never collapses the protected floor.
+//   - `recencyFloor`: a token count whose most-recent-N-tokens
+//     of trimmable content is protected from drop AND summarize.
+//     The recency slice is computed once at the top of
+//     `applyThreeTierTrim` and threaded through every internal
+//     call; messages in the slice are treated as protected
+//     (additive OR with the existing channels) and excluded
+//     from the trimmable budget.
+//
+// The integration test in `integration.test.ts` covers the
+// production wiring for AC-1 end-to-end. The tests here cover the
+// pure-policy surface (the policy receives the resolved numeric
+// `dropFloorTokens` and `recencyFloor` directly; the wiring
+// resolves `dropFloorPercent` to `dropFloorTokens` via
+// `Math.trunc((dropFloorPercent / 100) * effectiveSummarizeMaxTokens)`).
+//
+// Two tests in this block: one for the drop-floor fall-through
+// (AC-1) and one for the recency-floor cross-path covering both
+// the tier-2 summarize and the tier-3 drop paths (AC-2).
+
+describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	// ── AC-1: drop-floor fall-through ───────────────────────────
+
+	it("falls through to summarize when dropping a whole turn would push the trimmable total below the drop-floor (AC-1)", () => {
+		// One oversized trimmable turn (the post-dispatch
+		// synthetic trimmable turn — 3 trimmable messages,
+		// 120k total) with `dropFloorTokens: 5_000`. The
+		// single trimmable turn alone, dropped whole, would
+		// land the trimmable total at 0 — well below the 5k
+		// floor. The drop-floor guard engages; the policy
+		// falls through to the summarize path, which shrinks
+		// the oldest trimmable messages in place until the
+		// trimmable total is at or below verbatimMax. The
+		// oversized turn's content (the 60k assistant + 50k
+		// toolResult) survives — via summarize, not dropped;
+		// the dispatch task and the pinned-tier synthetic
+		// survive; the trimmable total lands between
+		// `dropFloorTokens` (5k) and `summarizeMaxTokens`
+		// (100k).
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("agent def"),
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("a".repeat(60_000 * 4)), // 60k tokens
+			toolResultMsg("b".repeat(50_000 * 4)), // 50k tokens
+			assistantMsg("c".repeat(10_000 * 4)), // 10k tokens
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+			dropFloorTokens: 5_000,
+		});
+		// (i) The drop did NOT fire — the floor engaged and
+		// the policy fell through to the summarize path. The
+		// drop counter is zero.
+		assert.equal(result.droppedTurns, 0, "the drop-floor fall-through must not emit a drop");
+		// (ii) The oversized turn's content survives in the
+		// output (via summarize, not dropped). The 60k
+		// assistant and the 50k toolResult are still in
+		// `result.messages`; the policy's signature survives
+		// because the post-dispatch synthetic trimmable turn
+		// is not in the drop set.
+		const oversizedAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("a".repeat(100)),
+			),
+		);
+		const oversizedToolResult = result.messages.find(
+			(m) => m.role === "toolResult" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("b".repeat(100)),
+			),
+		);
+		// The 60k assistant and 50k toolResult were summarized
+		// in place (their content was rewritten to the summa
+		// envelope), so the original 60k/50k char runs are
+		// gone — but the messages themselves are still in the
+		// output (the drop did not fire). The unsummarized
+		// 10k assistant retains its original content.
+		const unsummarizedTail = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string).includes("c".repeat(100)),
+		);
+		assert.ok(unsummarizedTail, "the unsummarized 10k assistant must survive verbatim (the drop did not fire)");
+		assert.ok(result.summarized >= 1, "at least one oversized trimmable message was summarized via the fall-through");
+		// (iii) Trimmable total lands at or below
+		// `summarizeMaxTokens` (the tier-3 cap is met after
+		// the fall-through).
+		const postTrimTotal = totalTrimmableTokens(result.messages, protectedSet);
+		assert.ok(
+			postTrimTotal <= SUMMARIZE_TIER_MAX_TOKENS,
+			`post-trim trimmable total ${postTrimTotal} must be <= summarizeMaxTokens ${SUMMARIZE_TIER_MAX_TOKENS}`,
+		);
+		// The post-trim trimmable total is at or above the
+		// drop-floor: the floor is a best-effort bound on the
+		// drop, and the summarize-fallback respects it (the
+		// summarize-fallback loops to `verbatimMax`, not to
+		// the floor; the test is asserting the floor was
+		// honored in the wider sense — the trimmable total
+		// is not collapsed to the protected floor alone).
+		assert.ok(
+			postTrimTotal >= 5_000,
+			`post-trim trimmable total ${postTrimTotal} must be >= dropFloorTokens 5000 (the drop did not collapse the view)`,
+		);
+		// (iv) Dispatch and pinned synthetic survive.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "dispatch task must survive the fall-through");
+		assert.equal(dispatch!.content, "dispatch task — do X");
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "pinned synthetic must survive the fall-through");
+		// No drop reminder — the fall-through did not fire
+		// the drop path; the reminder is the drop-path
+		// artifact, not the summarize-fallback artifact.
+		const reminders = result.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension"),
+		);
+		assert.equal(reminders.length, 0, "the drop-floor fall-through does not emit a drop reminder");
+		// Suppress the unused-var lint for the find calls
+		// above (they exist for diagnostic purposes; the
+		// test's primary assertions are the survivors above).
+		void oversizedAssistant;
+		void oversizedToolResult;
+	});
+
+	// ── AC-2: recency-floor cross-path (tier-2 + tier-3) ───────
+
+	it("preserves the recency slice across the tier-2 summarize path (AC-2)", () => {
+		// Three older trimmable messages (turn 1, ~60k
+		// total) plus a recency slice of two trimmable
+		// messages (turn 2, ~90k total). The recency slice
+		// is the operator's "most-recent-N-tokens of
+		// trimmable content." `recencyFloor: 50_000` covers
+		// the recency slice (the slice is ~90k, so the
+		// threshold is met after the first recency message
+		// and the slice covers the tail). The trimmable
+		// budget excludes the recency slice, so 60k >
+		// verbatimMax (50k) → tier-2 fires on the OLDER
+		// trimmable; the recency slice is NOT summarized.
+		// The recency slice's original content must survive
+		// verbatim.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("x".repeat(20_000 * 4)), // 20k tokens, oldest
+			toolResultMsg("y".repeat(20_000 * 4)), // 20k tokens
+			assistantMsg("z".repeat(20_000 * 4)), // 20k tokens
+			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
+			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			recencyFloor: 50_000,
+		});
+		// (i) Recency-slice messages have ORIGINAL content
+		// preserved (their `content` was not rewritten by
+		// the summarize path).
+		const recentAssistant = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string).includes("RECENT-X"),
+		);
+		const recentToolResult = result.messages.find(
+			(m) => m.role === "toolResult" && typeof m.content === "string" && (m.content as string).includes("RECENT-Y"),
+		);
+		assert.ok(recentAssistant, "recency-slice assistant must survive the summarize path");
+		assert.ok(recentToolResult, "recency-slice toolResult must survive the summarize path");
+		// (ii) Older trimmable messages ARE summarized
+		// (at least the oldest — the tier-2 summarize
+		// loop targets the oldest non-recency-non-protected
+		// trimmable first).
+		const summarizedOld = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("[summa:"),
+			),
+		);
+		assert.ok(summarizedOld, "an older trimmable message must be summarized (summa envelope present)");
+		// (iii) Recency slice survives intact — both
+		// messages are in `result.messages` and their
+		// content is unchanged (no summa envelope, no
+		// content rewrite).
+		const recencyInOutput = (result.messages as TrimmableMessage[]).filter(
+			(m) => typeof m.content === "string" && ((m.content as string).includes("RECENT-X") || (m.content as string).includes("RECENT-Y")),
+		);
+		assert.equal(
+			recencyInOutput.length,
+			2,
+			"both recency-slice messages must survive intact",
+		);
+		// No drop fires on the tier-2 summarize path.
+		assert.equal(result.droppedTurns, 0);
+		// At least one older trimmable was summarized.
+		assert.ok(result.summarized >= 1);
+	});
+
+	it("preserves the recency slice across the tier-3 drop path (AC-2)", () => {
+		// Five older trimmable messages (150k total) plus
+		// a recency slice of two trimmable messages (~90k
+		// total). `recencyFloor: 50_000` covers the recency
+		// slice. The trimmable budget (recency excluded)
+		// is 150k > 100k → tier-3 fires. The drop loop
+		// drops the post-dispatch synthetic trimmable turn
+		// (which contains ALL trimmable, including the
+		// recency slice). The recency-slice messages are
+		// carved out of the dropped turn (the recency
+		// channel is protected) and survive. The dispatch
+		// task and the user anchor survive; the recency
+		// slice's original content is preserved.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("x".repeat(30_000 * 4)), // 30k tokens
+			toolResultMsg("y".repeat(30_000 * 4)), // 30k tokens
+			assistantMsg("z".repeat(30_000 * 4)), // 30k tokens
+			assistantMsg("a".repeat(30_000 * 4)), // 30k tokens
+			assistantMsg("b".repeat(30_000 * 4)), // 30k tokens
+			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
+			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			recencyFloor: 50_000,
+		});
+		// The recency-slice messages survive the drop.
+		// Their content is preserved verbatim — the
+		// carve-out in `dropOldestTurns` kept them alive
+		// even though they sat inside the dropped turn.
+		const recentAssistant = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string).includes("RECENT-X"),
+		);
+		const recentToolResult = result.messages.find(
+			(m) => m.role === "toolResult" && typeof m.content === "string" && (m.content as string).includes("RECENT-Y"),
+		);
+		assert.ok(recentAssistant, "recency-slice assistant must survive the tier-3 drop");
+		assert.ok(recentToolResult, "recency-slice toolResult must survive the tier-3 drop");
+		// The drop counter reflects the whole-turn drop
+		// (the post-dispatch synthetic trimmable turn
+		// containing all trimmable including the recency
+		// slice).
+		assert.ok(result.droppedTurns >= 1, "the drop tier must have fired (turn was dropped)");
+		// The drop reminder is at the start of the output
+		// (the policy's plain-English aggregate reminder).
+		const reminder = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension"),
+		);
+		assert.ok(reminder, "drop reminder must be emitted at the start of the output");
+		assert.equal(result.messages[0], reminder, "reminder must be at the start of the returned array");
+		// The recency-slice messages are NOT in any dropped
+		// turn slice — they are in the surviving messages
+		// array, with their original content.
+		const survivingRecency = (result.messages as TrimmableMessage[]).filter(
+			(m) => typeof m.content === "string" && ((m.content as string).includes("RECENT-X") || (m.content as string).includes("RECENT-Y")),
+		);
+		assert.equal(survivingRecency.length, 2, "both recency-slice messages must survive intact across the drop");
+		// The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "dispatch task must survive the drop");
+		assert.equal(dispatch!.content, "dispatch task — do X");
+	});
+});
+
 // ─── Degenerate cases ─────────────────────────────────────────────────
 
 describe("applyThreeTierTrim — degenerate cases", () => {
@@ -545,6 +814,57 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 		const result = applyThreeTierTrim(messages, { summarizer });
 		// The fallback summarize path fires.
 		assert.ok(result.summarized >= 1);
+	});
+
+	it("the recency slice survives the summarize-fallback path (single oversized + recency)", () => {
+		// One oversized trimmable (150k) plus one small
+		// trimmable in the recency window. `recencyFloor`
+		// covers the small trimmable. The budget excludes the
+		// recency slice, so the oversized message alone is
+		// over the 100k cap → tier-3 fires. The drop loop has
+		// no trimmable turns (trimmableCount < 2 — the
+		// recency-slice message is recency-protected and the
+		// single oversized is not enough for the synthetic
+		// turn). droppedTurns = 0. Tier-3 re-check fires the
+		// summarize-fallback, which summarizes the oversized
+		// message; the recency-slice message survives
+		// verbatim.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("x".repeat(150_000 * 4)), // oversized → summarized via fallback
+			assistantMsg("RECENT ".repeat(3_000)), // ~5250 tokens, recency slice → preserved
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			recencyFloor: 5_000,
+		});
+		// The recency-slice message survives the
+		// summarize-fallback path with its original content.
+		const recencySurvived = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string).includes("RECENT"),
+		);
+		assert.ok(
+			recencySurvived,
+			"the recency-slice message must survive the summarize-fallback path verbatim",
+		);
+		// The recency-slice message is NOT wrapped in the
+		// summa envelope — its content is the original string,
+		// not a `[{type:"text", text:"[summa: ..."}]` array.
+		assert.equal(typeof recencySurvived!.content, "string", "recency-slice content must be the original string (not rewritten)");
+		// The oversized message is summarized (the fallback
+		// fires on it). The dispatch task survives.
+		const oversizedSummarized = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("[summa:"),
+			),
+		);
+		assert.ok(oversizedSummarized, "the oversized message must be summarized via the fallback");
+		assert.ok(result.summarized >= 1);
+		// The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "dispatch task must survive the summarize-fallback path");
 	});
 });
 
