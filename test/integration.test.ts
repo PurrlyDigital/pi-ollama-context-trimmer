@@ -990,4 +990,248 @@ describe("summaWords float-coercion at the wiring layer", () => {
 	});
 });
 
+// ─── Loop guard — AC-8 end-to-end regression ──────────────────────────
+//
+// The mock pi in this file does NOT register a `subagent` tool, so the
+// `loopGuard: "auto"` default would resolve to OFF (the same tool-probe
+// path that `protectDispatch` uses). The regression test forces the
+// guard ON by setting `PI_CONTEXT_TRIMMER_LOOP_GUARD=1` and
+// `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD=3` in `process.env` BEFORE
+// `loadExtension()` — the wiring reads the env at load time and the
+// per-session `loopGuardResolved` cache is populated on the first
+// `context` call. The env vars are restored after each test to keep
+// the module-level state of the other suites untouched.
+//
+// The two tests below exercise the same loop shape (>= 3 consecutive
+// identical tool-call turns) under two distinct wiring states:
+//   (a) Soft-nudge: threshold 3, hard-block off. The guard fires at
+//       runLength === 3, prepending a `role: "user"` synthetic with
+//       `LOOP_GUARD_NUDGE_TEXT` to the returned message array. The
+//       assistant turn that pushed the run to threshold still has its
+//       `toolCall` blocks intact (the soft-nudge does not strip them).
+//   (b) Hard-block: threshold 3, hard-block 3. The guard fires at
+//       runLength === 3 AND `shouldHardBlock(runLength, hardBlock) ===
+//       true`, prepending the block-text synthetic AND stripping the
+//       last assistant turn's `toolCall` blocks (preserving any
+//       textual / thinking content of the same turn).
+//
+// The session fixture builds 3 consecutive identical assistant turns
+// carrying the same `toolCall` block. The `userTurnAge` stamp is
+// applied by the wiring; the mock messages don't carry it. The trim
+// policy runs first; the loop-guard runs after. With a small
+// trimmable mass the session lands in the verbatim tier (no trim);
+// the loop-guard's only effect is the synthetic prepend (+ the hard-
+// block strip on the last turn in path (b)).
+
+describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
+	let sLoopGuard: string | undefined;
+	let sLoopGuardThreshold: string | undefined;
+	let sLoopGuardHardBlock: string | undefined;
+
+	beforeEach(() => {
+		sLoopGuard = process.env[CONFIG_ENV.loopGuard];
+		sLoopGuardThreshold = process.env[CONFIG_ENV.loopGuardThreshold];
+		sLoopGuardHardBlock = process.env[CONFIG_ENV.loopGuardHardBlock];
+	});
+
+	afterEach(() => {
+		for (const [k, v] of [
+			[CONFIG_ENV.loopGuard, sLoopGuard],
+			[CONFIG_ENV.loopGuardThreshold, sLoopGuardThreshold],
+			[CONFIG_ENV.loopGuardHardBlock, sLoopGuardHardBlock],
+		] as const) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	});
+
+	/** A three-turn behavioral loop: dispatch + three identical
+	 *  assistant turns, each carrying a `toolCall` block with the
+	 *  same name and arguments. Threshold 3 → runLength === 3 →
+	 *  guard fires. The three `text` blocks differ (so the runs
+	 *  are visibly different messages, not byte-for-byte copies),
+	 *  but the `toolCall` blocks are identical (the fingerprint
+	 *  keys on the toolCall blocks only, not the textual
+	 *  reasoning). */
+	function buildLoopSession(): Array<Record<string, unknown>> {
+		const toolCall = {
+			type: "toolCall",
+			name: "search",
+			arguments: { q: "loop-test" },
+		};
+		return [
+			userMsg("dispatch"),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Searching now" },
+					toolCall,
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Searching again" },
+					toolCall,
+				],
+			},
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "Searching once more" },
+					toolCall,
+				],
+			},
+		];
+	}
+
+	it("soft-nudge: injects a `role: \"user\"` synthetic carrying LOOP_GUARD_NUDGE_TEXT when the run hits the threshold (AC-8)", async () => {
+		// Force the guard ON. Threshold 3, hard-block off (default).
+		process.env[CONFIG_ENV.loopGuard] = "1";
+		process.env[CONFIG_ENV.loopGuardThreshold] = "3";
+		const pi = await loadExtension();
+		const event = { messages: buildLoopSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The wiring runs the trim first (small session → verbatim
+		// tier, no trim), then the loop-guard. The guard's runLength
+		// is 3 (three identical tool-call turns in a row); the
+		// threshold is 3, so it fires. The guard prepends a
+		// `role: "user"` synthetic with LOOP_GUARD_NUDGE_TEXT to
+		// the returned message array.
+		const nudge = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("called the same tool"),
+		);
+		assert.ok(nudge, "the loop-guard nudge must be prepended as a `role: \"user\"` synthetic");
+		// The nudge content is LOOP_GUARD_NUDGE_TEXT verbatim (the
+		// wiring does not rewrite it; the optional flat-input-token
+		// co-signal clause is appended only when the co-signal is
+		// flat, which a 3-turn fixture of similar tool-call content
+		// may or may not trip). Assert the LOOP_GUARD_NUDGE_TEXT
+		// substring is present so the test is independent of the
+		// co-signal clause.
+		const nudgeText = String(nudge!.content);
+		assert.ok(
+			nudgeText.includes("called the same tool"),
+			"the nudge text must match LOOP_GUARD_NUDGE_TEXT (substring assertion so the optional co-signal clause does not break the test)",
+		);
+		assert.ok(
+			nudgeText.includes("results of the earlier calls are already in the conversation"),
+			"the nudge text must reference the in-context prior results",
+		);
+		// The dispatch task still survives (the guard does not affect
+		// dispatch or pinned slots; it only prepends the synthetic).
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must survive the loop-guard path");
+		// The three assistant turns still carry their toolCall
+		// blocks (the soft-nudge does not strip them; only the
+		// hard-block path strips).
+		const assistantTurnsWithToolCall = result.messages.filter((m) => {
+			if (m.role !== "assistant") return false;
+			const c = m.content;
+			if (!Array.isArray(c)) return false;
+			return c.some((b: unknown) => b && typeof b === "object" && (b as { type: string }).type === "toolCall");
+		});
+		assert.equal(
+			assistantTurnsWithToolCall.length,
+			3,
+			"all three assistant turns' toolCall blocks must survive the soft-nudge path (the nudge does not strip)",
+		);
+	});
+
+	it("hard-block: prepends LOOP_GUARD_BLOCK_TEXT AND strips the last assistant turn's toolCall blocks (AC-8)", async () => {
+		// Force the guard ON with both threshold 3 and hard-block 3.
+		// The hard-block is a strict superset of the soft-nudge: the
+		// block-text synthetic is prepended AND the last assistant
+		// turn's `type: "toolCall"` content blocks are stripped
+		// (preserving textual / thinking blocks of the same turn).
+		process.env[CONFIG_ENV.loopGuard] = "1";
+		process.env[CONFIG_ENV.loopGuardThreshold] = "3";
+		process.env[CONFIG_ENV.loopGuardHardBlock] = "3";
+		const pi = await loadExtension();
+		const event = { messages: buildLoopSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The block-text synthetic must be prepended.
+		const block = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("blocked"),
+		);
+		assert.ok(block, "the loop-guard block-text synthetic must be prepended on the hard-block path");
+		const blockText = String(block!.content);
+		assert.ok(/blocked/i.test(blockText), "block text must reference the block action");
+		assert.ok(
+			/proceed by text|proceed via text|reasoning in text/i.test(blockText),
+			"block text must route the model to text-only reasoning",
+		);
+		// The block path is a strict superset of the soft-nudge:
+		// when both fire, only the block text is emitted. The
+		// soft-nudge text ("called the same tool") must NOT be
+		// present in the same array.
+		const both = result.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("called the same tool"),
+		);
+		assert.equal(
+			both.length,
+			0,
+			"hard-block path emits only the block text (not both block and nudge)",
+		);
+		// The last assistant turn's `toolCall` blocks are stripped
+		// (the wiring removes the `type: "toolCall"` blocks of the
+		// last assistant turn only; earlier assistant turns'
+		// toolCall blocks are untouched). The buildLoopSession
+		// fixture has the last assistant turn at index 3 (after
+		// dispatch at index 0). After the guard prepends the block
+		// synthetic, the array shifts by one; find the LAST
+		// assistant turn (the one whose toolCall was stripped) and
+		// the assistant turn immediately before it (whose
+		// toolCall is still present).
+		const assistantTurns = result.messages.filter((m) => m.role === "assistant");
+		assert.ok(assistantTurns.length >= 2, "at least two assistant turns must survive");
+		const lastAssistant = assistantTurns[assistantTurns.length - 1];
+		const lastContent = lastAssistant.content;
+		// The last assistant turn's content has NO `type:
+		// "toolCall"` blocks. If content is a non-array (string),
+		// the strip is a no-op (the model must have already been
+		// proceeding via text); the test fixture's content is
+		// always an array.
+		assert.ok(Array.isArray(lastContent), "the last assistant turn's content must remain an array (the strip filters blocks, it does not collapse the array)");
+		const lastToolCallBlocks = (lastContent as Array<{ type: string }>).filter(
+			(b) => b && typeof b === "object" && b.type === "toolCall",
+		);
+		assert.equal(
+			lastToolCallBlocks.length,
+			0,
+			"the last assistant turn's toolCall blocks must be stripped on the hard-block path",
+		);
+		// The last assistant turn's textual / non-toolCall blocks
+		// are preserved (the strip is per-block; only `type:
+		// "toolCall"` is removed).
+		const lastTextBlocks = (lastContent as Array<{ type: string; text?: string }>).filter(
+			(b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string",
+		);
+		assert.ok(
+			lastTextBlocks.length > 0,
+			"the last assistant turn's textual blocks must be preserved by the hard-block strip (per-block filter, not array collapse)",
+		);
+		// The penultimate assistant turn still has its toolCall
+		// block (the strip is on the LAST assistant turn only).
+		const penultimateAssistant = assistantTurns[assistantTurns.length - 2];
+		const penultimateContent = penultimateAssistant.content;
+		assert.ok(Array.isArray(penultimateContent), "penultimate assistant turn's content must remain an array");
+		const penultimateToolCallBlocks = (penultimateContent as Array<{ type: string }>).filter(
+			(b) => b && typeof b === "object" && b.type === "toolCall",
+		);
+		assert.equal(
+			penultimateToolCallBlocks.length,
+			1,
+			"the penultimate assistant turn's toolCall block must survive (the strip targets the LAST assistant turn only)",
+		);
+		// The dispatch task still survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must survive the hard-block path");
+	});
+});
+
 

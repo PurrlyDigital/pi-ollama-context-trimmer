@@ -12,6 +12,7 @@ import {
 	parseConfigFile,
 	ENV,
 	DEFAULT_PROTECT_DISPATCH,
+	DEFAULT_LOOP_GUARD,
 	type EnvRecord,
 } from "../config.ts";
 
@@ -712,5 +713,319 @@ describe("recencyFloor", () => {
 
 	it("ENV.recencyFloor is the documented namespace", () => {
 		assert.equal(ENV.recencyFloor, "PI_CONTEXT_TRIMMER_RECENCY_FLOOR");
+	});
+});
+
+// ─── loopGuard (defense-in-depth for model-caused loops) ───────────────
+//
+// The loop-guard enable mode is opt-in/opt-out via `loopGuard` in the
+// config file or `PI_CONTEXT_TRIMMER_LOOP_GUARD` in env. Mirrors the
+// `protectDispatch` knob so the two opt-in/out surfaces share the same
+// shape: a `"auto"` deferral default, `true`/`false` forces, and a
+// bogus env value falls through to the file channel (and ultimately to
+// the default). The wiring layer in `index.ts` reads `cfg.loopGuard`
+// and uses the same `subagent` tool probe as `protectDispatch` for
+// `auto` resolution.
+
+describe("loopGuard", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: 'auto' is extracted", () => {
+		assert.equal(parseConfigFile({ loopGuard: "auto" }).loopGuard, "auto");
+	});
+
+	it("file parse: boolean true is extracted", () => {
+		assert.equal(parseConfigFile({ loopGuard: true }).loopGuard, true);
+	});
+
+	it("file parse: boolean false is extracted", () => {
+		assert.equal(parseConfigFile({ loopGuard: false }).loopGuard, false);
+	});
+
+	it("file parse: string other than 'auto' is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuard: "on" }).loopGuard, undefined);
+		assert.equal(parseConfigFile({ loopGuard: "yes" }).loopGuard, undefined);
+		assert.equal(parseConfigFile({ loopGuard: "" }).loopGuard, undefined);
+	});
+
+	it("file parse: number is treated as absent (not 'auto', not boolean)", () => {
+		assert.equal(parseConfigFile({ loopGuard: 1 }).loopGuard, undefined);
+		assert.equal(parseConfigFile({ loopGuard: 0 }).loopGuard, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).loopGuard, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env '1' forces loopGuard true over file 'auto'", () => {
+		const cfg = resolveConfig({
+			file: { loopGuard: "auto" },
+			env: { [ENV.loopGuard]: "1" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuard, true);
+	});
+
+	it("resolveConfig: env '0' forces loopGuard false over file true", () => {
+		const cfg = resolveConfig({
+			file: { loopGuard: true },
+			env: { [ENV.loopGuard]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuard, false);
+	});
+
+	it("resolveConfig: env unset falls back to file 'auto'", () => {
+		const cfg = resolveConfig({
+			file: { loopGuard: "auto" },
+			env: {} as EnvRecord,
+		});
+		assert.equal(cfg.loopGuard, "auto");
+	});
+
+	it("resolveConfig: env bogus value falls through to file then default 'auto'", () => {
+		const cfgFromFile = resolveConfig({
+			file: { loopGuard: "auto" },
+			env: { [ENV.loopGuard]: "on" } as EnvRecord,
+		});
+		assert.equal(cfgFromFile.loopGuard, "auto");
+		const cfgFromDefault = resolveConfig({
+			env: { [ENV.loopGuard]: "yes" } as EnvRecord,
+		});
+		assert.equal(cfgFromDefault.loopGuard, DEFAULT_LOOP_GUARD);
+		assert.equal(cfgFromDefault.loopGuard, "auto");
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuard: false },
+			env: { [ENV.loopGuard]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuard, false);
+	});
+
+	it("resolveConfig: file boolean is honored when env is unset", () => {
+		const cfgOn = resolveConfig({ file: { loopGuard: true } });
+		assert.equal(cfgOn.loopGuard, true);
+		const cfgOff = resolveConfig({ file: { loopGuard: false } });
+		assert.equal(cfgOff.loopGuard, false);
+	});
+
+	it("resolveConfig: nothing configured returns the default 'auto'", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.loopGuard, DEFAULT_LOOP_GUARD);
+		assert.equal(cfg.loopGuard, "auto");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.loopGuard is the documented namespace", () => {
+		assert.equal(ENV.loopGuard, "PI_CONTEXT_TRIMMER_LOOP_GUARD");
+	});
+});
+
+// ─── loopGuardThreshold (nudge threshold, positive integer) ────────────
+
+describe("loopGuardThreshold", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: positive integer is extracted", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: 3 }).loopGuardThreshold, 3);
+		assert.equal(parseConfigFile({ loopGuardThreshold: 1 }).loopGuardThreshold, 1);
+		assert.equal(parseConfigFile({ loopGuardThreshold: 100 }).loopGuardThreshold, 100);
+	});
+
+	it("file parse: zero is treated as absent (matches isPositiveNumber's open-lower bound)", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: 0 }).loopGuardThreshold, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: -1 }).loopGuardThreshold, undefined);
+		assert.equal(parseConfigFile({ loopGuardThreshold: -100 }).loopGuardThreshold, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: Number.NaN }).loopGuardThreshold, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: Number.POSITIVE_INFINITY }).loopGuardThreshold, undefined);
+		assert.equal(parseConfigFile({ loopGuardThreshold: Number.NEGATIVE_INFINITY }).loopGuardThreshold, undefined);
+	});
+
+	it("file parse: non-numeric (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardThreshold: "3" }).loopGuardThreshold, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).loopGuardThreshold, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardThreshold: 3 },
+			env: { [ENV.loopGuardThreshold]: "5" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardThreshold, 5);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardThreshold: 3 },
+			env: { [ENV.loopGuardThreshold]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardThreshold, 3);
+	});
+
+	it("resolveConfig: non-positive env (0, negative) falls back to file", () => {
+		const cfgZero = resolveConfig({
+			file: { loopGuardThreshold: 3 },
+			env: { [ENV.loopGuardThreshold]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.loopGuardThreshold, 3);
+		const cfgNeg = resolveConfig({
+			file: { loopGuardThreshold: 3 },
+			env: { [ENV.loopGuardThreshold]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.loopGuardThreshold, 3);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardThreshold: 3 },
+			env: { [ENV.loopGuardThreshold]: "lots" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardThreshold, 3);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { loopGuardThreshold: 7 } });
+		assert.equal(cfg.loopGuardThreshold, 7);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.loopGuardThreshold, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.loopGuardThreshold]: "10" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardThreshold, 10);
+		assert.equal(typeof cfg.loopGuardThreshold, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.loopGuardThreshold is the documented namespace", () => {
+		assert.equal(ENV.loopGuardThreshold, "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD");
+	});
+});
+
+// ─── loopGuardHardBlock (hard-block threshold, positive integer) ──────
+
+describe("loopGuardHardBlock", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: positive integer is extracted", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: 3 }).loopGuardHardBlock, 3);
+		assert.equal(parseConfigFile({ loopGuardHardBlock: 1 }).loopGuardHardBlock, 1);
+		assert.equal(parseConfigFile({ loopGuardHardBlock: 100 }).loopGuardHardBlock, 100);
+	});
+
+	it("file parse: zero is treated as absent (matches isPositiveNumber's open-lower bound)", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: 0 }).loopGuardHardBlock, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: -1 }).loopGuardHardBlock, undefined);
+		assert.equal(parseConfigFile({ loopGuardHardBlock: -100 }).loopGuardHardBlock, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: Number.NaN }).loopGuardHardBlock, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: Number.POSITIVE_INFINITY }).loopGuardHardBlock, undefined);
+		assert.equal(parseConfigFile({ loopGuardHardBlock: Number.NEGATIVE_INFINITY }).loopGuardHardBlock, undefined);
+	});
+
+	it("file parse: non-numeric (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ loopGuardHardBlock: "3" }).loopGuardHardBlock, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).loopGuardHardBlock, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardHardBlock: 3 },
+			env: { [ENV.loopGuardHardBlock]: "7" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardHardBlock, 7);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardHardBlock: 3 },
+			env: { [ENV.loopGuardHardBlock]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardHardBlock, 3);
+	});
+
+	it("resolveConfig: non-positive env (0, negative) falls back to file", () => {
+		const cfgZero = resolveConfig({
+			file: { loopGuardHardBlock: 3 },
+			env: { [ENV.loopGuardHardBlock]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.loopGuardHardBlock, 3);
+		const cfgNeg = resolveConfig({
+			file: { loopGuardHardBlock: 3 },
+			env: { [ENV.loopGuardHardBlock]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.loopGuardHardBlock, 3);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { loopGuardHardBlock: 3 },
+			env: { [ENV.loopGuardHardBlock]: "many" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardHardBlock, 3);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { loopGuardHardBlock: 5 } });
+		assert.equal(cfg.loopGuardHardBlock, 5);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined (hard-block off by default)", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.loopGuardHardBlock, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.loopGuardHardBlock]: "8" } as EnvRecord,
+		});
+		assert.equal(cfg.loopGuardHardBlock, 8);
+		assert.equal(typeof cfg.loopGuardHardBlock, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.loopGuardHardBlock is the documented namespace", () => {
+		assert.equal(ENV.loopGuardHardBlock, "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK");
 	});
 });

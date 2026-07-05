@@ -13,6 +13,14 @@ import {
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	extractText,
+	fingerprintToolCall,
+	fingerprintAssistantTurn,
+	detectConsecutiveIdenticalToolCalls,
+	computeFlatInputTokenSignal,
+	shouldHardBlock,
+	FLAT_INPUT_TOKEN_TOLERANCE,
+	LOOP_GUARD_NUDGE_TEXT,
+	LOOP_GUARD_BLOCK_TEXT,
 	isPathPreserved,
 	isProtectedSlot,
 	totalTrimmableTokens,
@@ -52,6 +60,22 @@ function pinnedMsg(text: string): TrimmableMessage {
 /** Build a tool-result fixture carrying a stamped source path. */
 function toolResultWithPath(text: string, sourcePath: string): TrimmableMessage {
 	return { role: "toolResult", content: text, details: { sourcePath } };
+}
+
+/** Build an assistant-turn fixture carrying a single toolCall content block. */
+function assistantWithToolCall(name: string, args: unknown): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", name, arguments: args }],
+	};
+}
+
+/** Build an assistant-turn fixture carrying multiple toolCall content blocks. */
+function assistantWithToolCalls(toolCalls: Array<{ name: string; arguments: unknown }>): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: toolCalls.map((tc) => ({ type: "toolCall", name: tc.name, arguments: tc.arguments })),
+	};
 }
 
 /** Build a trimmable mass of roughly N tokens (chars = N * 4). */
@@ -1247,5 +1271,323 @@ describe("exported constants", () => {
 	});
 	it("SUMMA_WORDS is positive", () => {
 		assert.ok(SUMMA_WORDS > 0);
+	});
+});
+
+// ─── Loop-guard detection (AC-1, AC-4) ────────────────────────────────
+//
+// Pure-function coverage of the loop-guard layer added in Unit 1:
+//   - `fingerprintToolCall`: deterministic per-tool-call signature
+//     with sorted-key argument normalization.
+//   - `fingerprintAssistantTurn`: per-turn signature; reasoning-only
+//     turns (no toolCall blocks) yield a distinct signature so the
+//     run resets naturally (AC-9).
+//   - `detectConsecutiveIdenticalToolCalls`: walk the assistant turn
+//     stream from the end, count the trailing run of identical
+//     signatures.
+//   - `computeFlatInputTokenSignal`: co-signal over the last-N
+//     assistant-turn input token counts.
+//   - `shouldHardBlock`: pure predicate — true iff a hard-block
+//     threshold is configured AND the run length meets or exceeds it.
+// The wiring (index.ts) is what actually decides whether to nudge,
+// hard-block, or fall through; the tests here cover the pure decision
+// rules the wiring calls into.
+
+describe("loop-guard detection (AC-1, AC-4)", () => {
+	// ── fingerprintToolCall ─────────────────────────────────────
+
+	it("fingerprintToolCall: deterministic signature (same input → same output)", () => {
+		const a = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3 } });
+		const b = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3 } });
+		assert.equal(a, b);
+	});
+
+	it("fingerprintToolCall: sorted-keys normalization (reordered keys fingerprint identically)", () => {
+		const a = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3, extra: "y" } });
+		const b = fingerprintToolCall({ name: "search", arguments: { extra: "y", n: 3, q: "x" } });
+		assert.equal(a, b, "argument key order must not change the fingerprint");
+	});
+
+	it("fingerprintToolCall: distinct toolName → distinct fingerprint", () => {
+		const a = fingerprintToolCall({ name: "search", arguments: { q: "x" } });
+		const b = fingerprintToolCall({ name: "lookup", arguments: { q: "x" } });
+		assert.notEqual(a, b, "different tool names must fingerprint differently");
+	});
+
+	it("fingerprintToolCall: distinct argument values → distinct fingerprint", () => {
+		const a = fingerprintToolCall({ name: "search", arguments: { q: "x" } });
+		const b = fingerprintToolCall({ name: "search", arguments: { q: "y" } });
+		assert.notEqual(a, b);
+	});
+
+	it("fingerprintToolCall: nested objects are sorted recursively", () => {
+		const a = fingerprintToolCall({
+			name: "search",
+			arguments: { q: "x", filter: { kind: "and", values: [1, 2, 3] } },
+		});
+		const b = fingerprintToolCall({
+			name: "search",
+			arguments: { filter: { values: [1, 2, 3], kind: "and" }, q: "x" },
+		});
+		assert.equal(a, b, "nested object key order must not change the fingerprint");
+	});
+
+	it("fingerprintToolCall: array order is preserved (it is part of the call's identity)", () => {
+		const a = fingerprintToolCall({ name: "search", arguments: { items: [1, 2, 3] } });
+		const b = fingerprintToolCall({ name: "search", arguments: { items: [3, 2, 1] } });
+		assert.notEqual(a, b, "array order is part of the call's identity (the position of each element is semantically meaningful)");
+	});
+
+	// ── fingerprintAssistantTurn ───────────────────────────────
+
+	it("fingerprintAssistantTurn: a turn with no toolCall blocks returns a distinct signature (AC-9 — reasoning-only resets the run)", () => {
+		const textOnly = fingerprintAssistantTurn([{ type: "text", text: "hello" }]);
+		assert.equal(
+			textOnly,
+			"\0__no_tool_calls__",
+			"a no-tool-call turn must yield the dedicated reasoning-only signature",
+		);
+	});
+
+	it("fingerprintAssistantTurn: a turn with a single toolCall returns the call's fingerprint", () => {
+		const turn = fingerprintAssistantTurn([
+			{ type: "text", text: "I'll search" },
+			{ type: "toolCall", name: "search", arguments: { q: "x" } },
+		]);
+		const expected = fingerprintToolCall({ name: "search", arguments: { q: "x" } });
+		assert.equal(turn, expected);
+	});
+
+	it("fingerprintAssistantTurn: a multi-tool-call turn's fingerprint is the sorted conjunction of all calls", () => {
+		// fingerprintAssistantTurn sorts the per-call fingerprints
+		// before joining, so the per-turn signature is order-
+		// independent (a turn with [search, lookup] and a turn with
+		// [lookup, search] yield the same per-turn signature).
+		const turn = fingerprintAssistantTurn([
+			{ type: "toolCall", name: "lookup", arguments: { id: 1 } },
+			{ type: "toolCall", name: "search", arguments: { q: "x" } },
+		]);
+		const expected =
+			fingerprintToolCall({ name: "lookup", arguments: { id: 1 } }) + "\n" +
+			fingerprintToolCall({ name: "search", arguments: { q: "x" } });
+		assert.equal(turn, expected);
+	});
+
+	it("fingerprintAssistantTurn: two turns with identical tool-call sets match", () => {
+		const a = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
+		const b = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
+		assert.equal(a, b);
+	});
+
+	it("fingerprintAssistantTurn: different argument values → different fingerprints", () => {
+		const a = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
+		const b = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "y" } }]);
+		assert.notEqual(a, b);
+	});
+
+	// ── detectConsecutiveIdenticalToolCalls ───────────────────
+
+	it("detectConsecutiveIdenticalToolCalls: a run of N identical assistant turns yields runLength === N and matching signature", () => {
+		const N = 4;
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCall("search", { q: "loop-test" }),
+			assistantWithToolCall("search", { q: "loop-test" }),
+			assistantWithToolCall("search", { q: "loop-test" }),
+			assistantWithToolCall("search", { q: "loop-test" }),
+		];
+		const { runLength, lastSignature } = detectConsecutiveIdenticalToolCalls(messages, 3);
+		assert.equal(runLength, N);
+		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "loop-test" } }));
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: a different assistant turn in the middle resets the run", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCall("search", { q: "same" }),
+			assistantWithToolCall("search", { q: "same" }),
+			assistantWithToolCall("search", { q: "DIFFERENT" }),
+			assistantWithToolCall("search", { q: "same" }),
+		];
+		const { runLength, lastSignature } = detectConsecutiveIdenticalToolCalls(messages, 3);
+		assert.equal(runLength, 1, "a different turn in the middle breaks the run; only the trailing one matches the last turn");
+		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "same" } }));
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: non-assistant messages do not break the run and do not extend it", () => {
+		// The walk is over assistant turns only. A user or toolResult
+		// message inside the candidate run is skipped: it neither
+		// contributes to the run count nor resets it (a toolResult
+		// for a prior tool call sits between the model issuing the
+		// call and the model re-issuing it; the run of identical
+		// tool calls is what we're measuring).
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCall("search", { q: "x" }),
+			toolResultMsg("result 1"),
+			assistantWithToolCall("search", { q: "x" }),
+			toolResultMsg("result 2"),
+			assistantWithToolCall("search", { q: "x" }),
+		];
+		const { runLength, lastSignature } = detectConsecutiveIdenticalToolCalls(messages, 3);
+		assert.equal(runLength, 3, "three identical toolCall turns with toolResult interleaved — run is 3");
+		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "x" } }));
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: reasoning-only trailing turn yields runLength 0 (AC-9)", () => {
+		// A no-toolCall assistant turn at the end resets the run
+		// (the predicate returns the dedicated no-tool-calls
+		// signature, which never matches a real tool-call signature,
+		// AND the predicate short-circuits when the last signature
+		// is the no-tool-calls sentinel).
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCall("search", { q: "x" }),
+			assistantWithToolCall("search", { q: "x" }),
+			assistantMsg("I'm done searching — moving on"),
+		];
+		const { runLength, lastSignature } = detectConsecutiveIdenticalToolCalls(messages, 3);
+		assert.equal(runLength, 0, "reasoning-only trailing turn must reset the run (AC-9)");
+		assert.equal(lastSignature, null, "no run detected when the last assistant turn is reasoning-only");
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: threshold <= 0 disables detection (no run counted)", () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCall("search", { q: "x" }),
+			assistantWithToolCall("search", { q: "x" }),
+			assistantWithToolCall("search", { q: "x" }),
+		];
+		assert.deepEqual(
+			detectConsecutiveIdenticalToolCalls(messages, 0),
+			{ runLength: 0, lastSignature: null },
+		);
+		assert.deepEqual(
+			detectConsecutiveIdenticalToolCalls(messages, -1),
+			{ runLength: 0, lastSignature: null },
+		);
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: multi-tool-call turn matches iff the conjunction matches", () => {
+		// Two identical multi-tool-call turns → run is 2.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithToolCalls([
+				{ name: "search", arguments: { q: "x" } },
+				{ name: "lookup", arguments: { id: 1 } },
+			]),
+			assistantWithToolCalls([
+				{ name: "search", arguments: { q: "x" } },
+				{ name: "lookup", arguments: { id: 1 } },
+			]),
+		];
+		const { runLength, lastSignature } = detectConsecutiveIdenticalToolCalls(messages, 2);
+		assert.equal(runLength, 2);
+		assert.ok(lastSignature && lastSignature.length > 0);
+	});
+
+	it("detectConsecutiveIdenticalToolCalls: reordered tools in the same turn do NOT match (order is part of the conjunction)", () => {
+		// The two turns call the same tools in different orders. The
+		// conjunction sorts the per-call fingerprints before joining
+		// (fingerprintAssistantTurn sorts), so reordering still
+		// matches. Verify: a turn with [search, lookup] in slot 1 and
+		// [lookup, search] in slot 2 fingerprint identically (because
+		// the per-turn signature is the sorted conjunction).
+		const t1 = fingerprintAssistantTurn([
+			{ type: "toolCall", name: "search", arguments: { q: "x" } },
+			{ type: "toolCall", name: "lookup", arguments: { id: 1 } },
+		]);
+		const t2 = fingerprintAssistantTurn([
+			{ type: "toolCall", name: "lookup", arguments: { id: 1 } },
+			{ type: "toolCall", name: "search", arguments: { q: "x" } },
+		]);
+		assert.equal(t1, t2, "a turn's signature is the sorted conjunction; order within a turn does not change it");
+	});
+
+	// ── computeFlatInputTokenSignal ───────────────────────────
+
+	it("computeFlatInputTokenSignal: flat last-N token counts → flat: true", () => {
+		// All five last assistant turns are the same string → same
+		// approximateMessageTokens → flat.
+		const sameTurn = assistantMsg("the same content repeated");
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			sameTurn,
+			sameTurn,
+			sameTurn,
+			sameTurn,
+			sameTurn,
+		];
+		const { flat, sampleTokens } = computeFlatInputTokenSignal(messages);
+		assert.equal(flat, true);
+		// All five samples are the same (no variance).
+		assert.equal(sampleTokens.length, 5);
+		for (const t of sampleTokens) {
+			assert.equal(t, sampleTokens[0]);
+		}
+	});
+
+	it("computeFlatInputTokenSignal: token counts varying > 5% → flat: false", () => {
+		// Build five assistant turns of increasing size so the
+		// spread between the largest and smallest is more than 5%.
+		const tokens = [100, 100, 100, 200, 1000];
+		const messages: TrimmableMessage[] = tokens.map((n) => assistantMsg("x".repeat(n * 4)));
+		// Prepend a user anchor (the window only counts assistant turns).
+		messages.unshift(userMsg("dispatch", 0));
+		const { flat, sampleTokens } = computeFlatInputTokenSignal(messages);
+		assert.equal(flat, false, "varying token counts > 5% spread → flat: false");
+		assert.equal(sampleTokens.length, 5);
+	});
+
+	it("computeFlatInputTokenSignal: small variation within tolerance → flat: true", () => {
+		// Five turns sized 1000, 1000, 1000, 1000, 1010 tokens. The
+		// spread is 10/1000 = 1%, well within the 5% tolerance.
+		const tokens = [1000, 1000, 1000, 1000, 1010];
+		const messages: TrimmableMessage[] = tokens.map((n) => assistantMsg("x".repeat(n * 4)));
+		messages.unshift(userMsg("dispatch", 0));
+		const { flat } = computeFlatInputTokenSignal(messages);
+		assert.equal(flat, true, "1% spread is within the 5% tolerance");
+	});
+
+	it("computeFlatInputTokenSignal: fewer than 2 assistant turns → flat: false (no signal)", () => {
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), assistantMsg("hi")];
+		const { flat } = computeFlatInputTokenSignal(messages);
+		assert.equal(flat, false, "single sample yields no signal");
+	});
+
+	it("FLAT_INPUT_TOKEN_TOLERANCE is the documented 0.05", () => {
+		assert.equal(FLAT_INPUT_TOKEN_TOLERANCE, 0.05);
+	});
+
+	// ── shouldHardBlock ───────────────────────────────────────
+
+	it("shouldHardBlock: undefined threshold → false (hard-block off by default)", () => {
+		assert.equal(shouldHardBlock(5, undefined), false);
+		assert.equal(shouldHardBlock(100, undefined), false);
+	});
+
+	it("shouldHardBlock: runLength >= threshold → true", () => {
+		assert.equal(shouldHardBlock(3, 3), true, "exact-equal run length meets the threshold");
+		assert.equal(shouldHardBlock(10, 3), true, "run length above the threshold");
+	});
+
+	it("shouldHardBlock: runLength < threshold → false", () => {
+		assert.equal(shouldHardBlock(2, 3), false);
+		assert.equal(shouldHardBlock(0, 3), false);
+	});
+
+	// ── Nudge / block text shape ──────────────────────────────
+
+	it("LOOP_GUARD_NUDGE_TEXT is non-empty, names the repetition, and uses non-directive phrasing", () => {
+		assert.ok(LOOP_GUARD_NUDGE_TEXT.length > 0);
+		assert.ok(/called the same tool/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must reference the repeated tool call");
+		assert.ok(/same arguments/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must reference the same arguments");
+		assert.ok(!/you must/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must not use directive 'you must' language");
+	});
+
+	it("LOOP_GUARD_BLOCK_TEXT is non-empty, names the block, and routes the model to text", () => {
+		assert.ok(LOOP_GUARD_BLOCK_TEXT.length > 0);
+		assert.ok(/blocked/i.test(LOOP_GUARD_BLOCK_TEXT), "block must name the block action");
+		assert.ok(/reasoning in text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed by text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed via text/i.test(LOOP_GUARD_BLOCK_TEXT), "block must route the model to text-only reasoning");
 	});
 });
