@@ -24,11 +24,14 @@
  *  pi-subagents detection; `true`/`false` force it on/off. */
 export type ProtectDispatchMode = "auto" | boolean;
 
-/** The loop-guard enable mode. `"auto"` defers to the wiring layer's
- *  detection policy; `true`/`false` force loop-guard on/off. Mirrors
- *  `ProtectDispatchMode` so the two opt-in/out knobs carry the same
- *  semantics. */
-export type LoopGuardMode = "auto" | boolean;
+/** The loop-guard enable mode. `true` (default) turns the guard
+ *  ON for every session; `false` turns it off. The guard is
+ *  universal — it is not coupled to a subagent-only detection probe
+ *  (the wiring layer does not probe `pi-subagents` for the loop
+ *  guard; behavioral-loop detection is the same concern in every
+ *  session posture). Mirrors the `protectDispatch` opt-in/out
+ *  shape semantically; the two surfaces are now independent. */
+export type LoopGuardMode = boolean;
 
 /** The resolved trimmer config. Every field is optional — when nothing
  *  is configured the trimmer runs with no pinned surfaces and no
@@ -62,8 +65,8 @@ export interface ContextTrimmerConfig {
 	/** Optional recency-floor token count. Overrides the policy
 	 *  default when set. */
 	readonly recencyFloor?: number;
-	/** Loop-guard enable mode. `true`/`false` force on/off;
-	 *  `"auto"` defers to the wiring layer. Overrides the policy
+	/** Loop-guard enable mode. `true` (default) turns the guard ON
+	 *  for every session; `false` turns it off. Overrides the policy
 	 *  default when set. */
 	readonly loopGuard?: LoopGuardMode;
 	/** Loop-guard nudge threshold (consecutive identical assistant
@@ -83,10 +86,11 @@ export interface ContextTrimmerConfig {
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
 export const DEFAULT_PROTECT_DISPATCH: ProtectDispatchMode = "auto";
 
-/** Default loop-guard mode: defer to the wiring layer's detection
- *  policy. Mirrors `DEFAULT_PROTECT_DISPATCH` so both opt-in/out
- *  knobs default to the auto-detect posture. */
-export const DEFAULT_LOOP_GUARD: LoopGuardMode = "auto";
+/** Default loop-guard mode: ON for every session. The guard is
+ *  universal across session postures; the subagent-only coupling was
+ *  dropped because behavioral-loop detection is the same concern
+ *  whether the model is in a parent or a subagent session. */
+export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
  *  the wiring layer and tests reference a single source of truth. */
@@ -165,7 +169,7 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 		out.recencyFloor = o.recencyFloor;
 	}
 	const lg = o.loopGuard;
-	if (lg === "auto" || lg === true || lg === false) {
+	if (lg === true || lg === false) {
 		out.loopGuard = lg;
 	}
 	if (isPositiveNumber(o.loopGuardThreshold)) {
@@ -219,7 +223,7 @@ export function resolveConfig(opts: {
 		loopGuard = true;
 	} else if (envLg === "0") {
 		loopGuard = false;
-	} else if (file.loopGuard === true || file.loopGuard === false || file.loopGuard === "auto") {
+	} else if (file.loopGuard === true || file.loopGuard === false) {
 		loopGuard = file.loopGuard;
 	} else {
 		loopGuard = DEFAULT_LOOP_GUARD;

@@ -992,15 +992,18 @@ describe("summaWords float-coercion at the wiring layer", () => {
 
 // ─── Loop guard — AC-8 end-to-end regression ──────────────────────────
 //
-// The mock pi in this file does NOT register a `subagent` tool, so the
-// `loopGuard: "auto"` default would resolve to OFF (the same tool-probe
-// path that `protectDispatch` uses). The regression test forces the
-// guard ON by setting `PI_CONTEXT_TRIMMER_LOOP_GUARD=1` and
+// The loop-guard default is now `true` (ON for every session). The
+// mock pi in this file does NOT register a `subagent` tool — the
+// subagent-tool probe was removed from the wiring layer for the
+// loop-guard resolution path (the guard is universal across session
+// postures). The regression test forces the guard ON by setting
+// `PI_CONTEXT_TRIMMER_LOOP_GUARD=1` and
 // `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD=3` in `process.env` BEFORE
-// `loadExtension()` — the wiring reads the env at load time and the
-// per-session `loopGuardResolved` cache is populated on the first
-// `context` call. The env vars are restored after each test to keep
-// the module-level state of the other suites untouched.
+// `loadExtension()` — the env force is now redundant with the default
+// (the suite could rely on the default `true`) but is kept as a
+// stable, explicit contract on the wiring's read path. The env vars
+// are restored after each test to keep the module-level state of the
+// other suites untouched.
 //
 // The two tests below exercise the same loop shape (>= 3 consecutive
 // identical tool-call turns) under two distinct wiring states:
@@ -1022,6 +1025,12 @@ describe("summaWords float-coercion at the wiring layer", () => {
 // trimmable mass the session lands in the verbatim tier (no trim);
 // the loop-guard's only effect is the synthetic prepend (+ the hard-
 // block strip on the last turn in path (b)).
+//
+// The "default-ON" regression test below asserts the guard is ON
+// when neither env nor config sets `loopGuard` — a session with no
+// `subagent` tool and no `PI_CONTEXT_TRIMMER_LOOP_GUARD` env override
+// still gets the nudge. This is the regression for the gap this
+// issue closes (the previous default was OFF in plain parent sessions).
 
 describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 	let sLoopGuard: string | undefined;
@@ -1231,6 +1240,62 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 			(m) => m.role === "user" && m.content === "dispatch",
 		);
 		assert.ok(dispatch, "dispatch task must survive the hard-block path");
+	});
+
+	// ─── Default-ON regression (gap this issue closes) ────────────
+	//
+	// Previously `loopGuard: "auto"` resolved OFF in a plain parent
+	// session (the mock pi in this file does not register a
+	// `subagent` tool, so the probe returned OFF). With the new
+	// default `true`, the guard must fire in a session with NO
+	// `subagent` tool AND no `PI_CONTEXT_TRIMMER_LOOP_GUARD` env
+	// override. This is the regression for the gap this issue
+	// closes: the guard is ON for every session by default.
+	//
+	// The test uses the same `buildLoopSession` fixture as the
+	// forced-ON cases above. The env-forcing is intentionally
+	// absent — we delete the env override in a local hook so the
+	// test cannot rely on the surrounding suite's leaked state.
+	let dLoopGuard: string | undefined;
+	let dLoopGuardThreshold: string | undefined;
+	before(() => {
+		dLoopGuard = process.env[CONFIG_ENV.loopGuard];
+		dLoopGuardThreshold = process.env[CONFIG_ENV.loopGuardThreshold];
+		// Unset the env so the resolver falls through to the file,
+		// then the default `true`. The file channel is pointed at a
+		// non-existent path (the module-level `before` hook), so
+		// neither channel sets `loopGuard` and the default wins.
+		delete process.env[CONFIG_ENV.loopGuard];
+		delete process.env[CONFIG_ENV.loopGuardThreshold];
+	});
+	after(() => {
+		if (dLoopGuard === undefined) delete process.env[CONFIG_ENV.loopGuard];
+		else process.env[CONFIG_ENV.loopGuard] = dLoopGuard;
+		if (dLoopGuardThreshold === undefined) delete process.env[CONFIG_ENV.loopGuardThreshold];
+		else process.env[CONFIG_ENV.loopGuardThreshold] = dLoopGuardThreshold;
+	});
+
+	it("default ON: injects the nudge in a session with no subagent tool and no env override", async () => {
+		// No env override, no file override. The resolver returns
+		// `loopGuard: true` (the new default). The wiring's
+		// `resolveLoopGuard` no longer probes `safeGetAllTools(pi)`
+		// (the subagent-tool probe was dropped). The mock pi here
+		// does not register a `subagent` tool — that is irrelevant
+		// to the resolution, but it exercises the gap the issue
+		// closes: previously this exact setup resolved OFF and the
+		// guard never fired.
+		const pi = await loadExtension();
+		const event = { messages: buildLoopSession() };
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The guard fires at runLength === 3 (default threshold 3)
+		// and prepends the nudge.
+		const nudge = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("called the same tool"),
+		);
+		assert.ok(
+			nudge,
+			"the loop-guard nudge must fire by default (no env, no file, no subagent tool) — the regression for the issue this closes",
+		);
 	});
 });
 
