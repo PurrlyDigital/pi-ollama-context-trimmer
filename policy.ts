@@ -141,6 +141,28 @@ export type TrimOptions = {
 	 * shape is uniform across all internal call sites.
 	 */
 	preservedPatterns?: ReadonlyArray<string>;
+	/**
+	 * The lower bound the tier-3 drop must not undershoot by dropping a
+	 * whole turn. When set, `dropOldestTurns` stops one step before the
+	 * remaining trimmable mass would dip below this floor; the
+	 * fall-through hands the surviving trimmable content off to the
+	 * summarize path so the drop tier never collapses the protected
+	 * floor. `undefined` or non-positive values disable the floor
+	 * (legacy behavior: drop until the trimmable total ≤
+	 * `summarizeMaxTokens`).
+	 */
+	dropFloorTokens?: number;
+	/**
+	 * A token count; the most-recent-N-tokens of trimmable content
+	 * protected from drop AND summarize. The recency slice is computed
+	 * once at the top of `applyThreeTierTrim` and threaded through
+	 * every internal call; messages in the slice are treated as
+	 * protected (additive OR with the existing channels) and excluded
+	 * from the trimmable budget. `undefined` or non-positive values
+	 * disable recency protection (legacy behavior: every trimmable
+	 * message is a candidate for summarize or drop).
+	 */
+	recencyFloor?: number;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -289,6 +311,52 @@ function extractSourcePath(msg: TrimmableMessage): string | undefined {
 	return typeof sourcePath === "string" ? sourcePath : undefined;
 }
 
+// ─── Recency-floor helper (recency channel) ─────────────────────
+
+/**
+ * Walk backward from the end of the messages array, SKIPPING
+ * already-protected messages (dispatch via `userTurnAge === 0`,
+ * pinned `customType` in `protectedCustomTypes`, or preserved-path
+ * matches), accumulating trimmable tokens until the
+ * `recencyFloorTokens` threshold is reached. Returns the set of
+ * TRIMMABLE-message indices in `[stopIndex, end)`.
+ *
+ * The recency slice is the "most-recent-N-tokens of trimmable
+ * content" the operator asked to protect. The slice is computed
+ * once at the top of `applyThreeTierTrim` and threaded through
+ * every internal call as an additive OR with the existing
+ * protected-slot checks. Already-protected messages are
+ * **excluded** from the recency slice — they are already
+ * subtracted from the budget by their own channels, so including
+ * them here would double-subtract.
+ *
+ * `recencyFloorTokens <= 0` or `undefined` → empty set (no recency
+ * protection, legacy behavior).
+ *
+ * Pure: no `process.*`, no `node:fs`. Operates on the messages
+ * array and the predicate arguments; all input data is the
+ * caller's responsibility to thread through.
+ */
+export function computeRecencyProtectedIndices(
+	messages: ReadonlyArray<TrimmableMessage>,
+	recencyFloorTokens: number | undefined,
+	protectedCustomTypes: ReadonlySet<string> = new Set(),
+	protectDispatch = true,
+	preservedPatterns: ReadonlyArray<string> = [],
+): ReadonlySet<number> {
+	const out = new Set<number>();
+	if (recencyFloorTokens === undefined || recencyFloorTokens <= 0) return out;
+	let acc = 0;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		const tokens = approximateMessageTokens(messages[i]);
+		out.add(i);
+		acc += tokens;
+		if (acc >= recencyFloorTokens) break;
+	}
+	return out;
+}
+
 // ─── Protected-slot predicate ──────────────────────────────────────────
 
 export function isProtectedSlot(
@@ -298,6 +366,7 @@ export function isProtectedSlot(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 ): boolean {
 	// Agent-def / pinned-tier synthetic.
 	if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
@@ -308,6 +377,13 @@ export function isProtectedSlot(
 	// channels above — the OR is additive, the existing checks stay
 	// first so their semantics are unchanged.
 	if (isPathPreserved(extractSourcePath(msg), preservedPatterns)) {
+		return true;
+	}
+	// Recency-floor slot: a trimmable message in the most-recent
+	// recency window whose drop or summarize would violate the
+	// operator's recency floor. Independent of the three channels
+	// above; the OR is additive.
+	if (recencyProtectedIndices.has(index)) {
 		return true;
 	}
 	// Dispatch task: the first user message. Only applies when dispatch
@@ -339,10 +415,11 @@ export function totalTrimmableTokens(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
 		total += approximateMessageTokens(messages[i]);
 	}
 	return total;
@@ -433,9 +510,27 @@ export function applyThreeTierTrim(
 	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
 	const protectDispatch = options.protectDispatch ?? true;
 	const preservedPatterns = options.preservedPatterns ?? [];
+	const dropFloorTokens = options.dropFloorTokens;
+	const recencyFloor = options.recencyFloor;
+
+	// Compute the recency-protected slice once and thread it through
+	// every internal call. The slice is the operator's
+	// "most-recent-N-tokens of trimmable content" carve-out;
+	// messages in the slice are treated as protected (additive OR
+	// with the dispatch / pinned / preserved-paths channels). The
+	// slice is computed against the other protected-slot channels
+	// so already-protected messages are excluded — they are
+	// already subtracted from the budget by their own channels.
+	const recencyProtectedIndices = computeRecencyProtectedIndices(
+		messages,
+		recencyFloor,
+		protectedCustomTypes,
+		protectDispatch,
+		preservedPatterns,
+	);
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns);
+	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
 	// The "turn" is bounded by user messages: a turn is everything from
@@ -443,20 +538,59 @@ export function applyThreeTierTrim(
 	// including) the next user message. We carve whole turns from the
 	// oldest end.
 	if (total > summarizeMax) {
-		const { messages: dropped, droppedTurns } = dropOldestTurns(messages, summarizeMax, protectedCustomTypes, protectDispatch, preservedPatterns);
+		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
+			messages,
+			summarizeMax,
+			protectedCustomTypes,
+			protectDispatch,
+			preservedPatterns,
+			dropFloorTokens,
+			recencyProtectedIndices,
+		);
+		// Drop-floor fall-through: when the next-oldest turn would
+		// push the trimmable total below `dropFloorTokens`, stop
+		// dropping and hand the surviving trimmable content off to
+		// the summarize path. The summarize path then trims the
+		// older half (trimmable messages OUTSIDE the recency
+		// window) down to verbatimMax — the recency slice stays
+		// intact and the drop tier never collapses the floor.
+		if (shouldFallThrough) {
+			const result = summarizeOldestUntilUnder(
+				dropped,
+				verbatimMax,
+				summarizer,
+				summaWords,
+				protectedCustomTypes,
+				protectDispatch,
+				preservedPatterns,
+				recencyProtectedIndices,
+			);
+			return {
+				messages: result.messages,
+				summarized: result.summarized,
+				droppedTurns,
+				totalTokens: totalTrimmableTokens(
+					result.messages,
+					protectedCustomTypes,
+					protectDispatch,
+					preservedPatterns,
+					recencyProtectedIndices,
+				),
+			};
+		}
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns);
+		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 		// If still over summarizeMax (a single trimmable turn is larger
 		// than the tier ceiling), summarize that turn's oldest messages
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns);
+			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns),
+				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 			};
 		}
 		return {
@@ -470,12 +604,12 @@ export function applyThreeTierTrim(
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns);
+		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns),
+			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 		};
 	}
 
@@ -508,7 +642,9 @@ function dropOldestTurns(
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string>,
-): { messages: TrimmableMessage[]; droppedTurns: number } {
+	dropFloorTokens: number | undefined = undefined,
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
+): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean } {
 	// First pass: identify the trimmable turns and their token mass.
 	// A trimmable turn starts immediately after a non-dispatch user
 	// message and runs to either the next non-dispatch user message
@@ -532,20 +668,20 @@ function dropOldestTurns(
 		if (isTurnAnchor) {
 			// Close any open trimmable turn at the previous boundary.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
 			}
 			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
 				turnStart = -1;
 			}
 		}
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
@@ -574,19 +710,30 @@ function dropOldestTurns(
 		// Count trimmable messages in the post-dispatch tail.
 		let trimmableCount = 0;
 		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) trimmableCount++;
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
 	const totalMass = turns.reduce((s, t) => s + t.tokens, 0);
 	// Drop oldest turns until the remaining mass is ≤ cap.
+	// Drop-floor guard: when `dropFloorTokens` is set, stop one
+	// step before the next-oldest turn would push the remaining
+	// trimmable mass below the floor. The caller (applyThreeTierTrim)
+	// then hands the surviving trimmable content off to the
+	// summarize path so the drop tier never collapses the protected
+	// floor.
 	let remaining = totalMass;
 	const dropSet = new Set<number>();
+	let shouldFallThrough = false;
 	for (const t of turns) {
 		if (remaining <= cap) break;
+		if (dropFloorTokens !== undefined && remaining - t.tokens < dropFloorTokens) {
+			shouldFallThrough = true;
+			break;
+		}
 		dropSet.add(t.start); // Marker: this turn's start index is dropped.
 		remaining -= t.tokens;
 	}
@@ -629,10 +776,10 @@ function dropOldestTurns(
 				break;
 			}
 		}
-		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
 		out.push(msg);
 	}
-	return { messages: out, droppedTurns: dropSet.size };
+	return { messages: out, droppedTurns: dropSet.size, shouldFallThrough };
 }
 
 /**
@@ -646,10 +793,11 @@ function makeTurn(
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string>,
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
 		tokens += approximateMessageTokens(messages[i]);
 	}
 	return { start, end, tokens };
@@ -675,6 +823,7 @@ function summarizeOldestUntilUnder(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 ): { messages: TrimmableMessage[]; summarized: number } {
 	const out = messages.map((m) => m);
 	let summarized = 0;
@@ -684,10 +833,10 @@ function summarizeOldestUntilUnder(
 	// infinite-loop: the replacement content is small, but the
 	// message remains the "oldest" candidate and gets re-picked).
 	let cursor = 0;
-	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns) > cap) {
+	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices) > cap) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor.
-		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor);
+		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices);
 		if (target === -1) break; // Nothing left to summarize (degenerate: a single message is over cap).
 		const msg = out[target];
 		const original = extractText(msg.content);
@@ -729,9 +878,10 @@ function findOldestSummarizable(
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string> = [],
 	startFrom = 0,
+	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
 		return i;
 	}
 	return -1;

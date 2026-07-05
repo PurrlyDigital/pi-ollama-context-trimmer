@@ -50,6 +50,12 @@ export interface ContextTrimmerConfig {
 	/** Optional per-summary word cap passed to summa. Overrides the
 	 *  policy default when set. */
 	readonly summaWords?: number;
+	/** Optional drop-tier floor as a percentage (0, 100] of the
+	 *  trimmable budget. Overrides the policy default when set. */
+	readonly dropFloorPercent?: number;
+	/** Optional recency-floor token count. Overrides the policy
+	 *  default when set. */
+	readonly recencyFloor?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -65,6 +71,8 @@ export const ENV = {
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
 	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
 	summaWords: "PI_CONTEXT_TRIMMER_SUMMA_WORDS",
+	dropFloorPercent: "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT",
+	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -81,6 +89,8 @@ export interface ParsedConfigFile {
 	tier1MaxTokens?: number;
 	tier2MaxTokens?: number;
 	summaWords?: number;
+	dropFloorPercent?: number;
+	recencyFloor?: number;
 }
 
 /**
@@ -114,6 +124,12 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.summaWords)) {
 		out.summaWords = o.summaWords;
+	}
+	if (isDropFloorPercent(o.dropFloorPercent)) {
+		out.dropFloorPercent = o.dropFloorPercent;
+	}
+	if (isPositiveNumber(o.recencyFloor)) {
+		out.recencyFloor = o.recencyFloor;
 	}
 	return out;
 }
@@ -149,6 +165,10 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
 	const summaWords =
 		parseNumberEnv(env[ENV.summaWords]) ?? file.summaWords;
+	const dropFloorPercent =
+		parsePercentEnv(env[ENV.dropFloorPercent]) ?? file.dropFloorPercent;
+	const recencyFloor =
+		parseNumberEnv(env[ENV.recencyFloor]) ?? file.recencyFloor;
 
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
@@ -170,6 +190,8 @@ export function resolveConfig(opts: {
 		tier1MaxTokens,
 		tier2MaxTokens,
 		summaWords,
+		dropFloorPercent,
+		recencyFloor,
 	};
 }
 
@@ -193,6 +215,15 @@ function isPositiveNumber(v: unknown): v is number {
 	return typeof v === "number" && Number.isFinite(v) && v > 0;
 }
 
+/** Type guard: a value is a finite number in the open-closed interval
+ *  (0, 100]. Used to validate the drop-floor percent field; non-numeric,
+ *  zero, negative, greater than 100, `NaN`, and `Infinity` are all
+ *  treated as absent so the resolver falls through to the next
+ *  precedence layer. */
+function isDropFloorPercent(v: unknown): v is number {
+	return typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 100;
+}
+
 /** Parse a comma-separated env value into a trimmed, non-empty list.
  *  The empty string (and all-whitespace) returns `undefined` so the
  *  caller can fall through to the next precedence layer. */
@@ -212,4 +243,16 @@ function parseNumberEnv(s: string | undefined): number | undefined {
 	if (trimmed === undefined) return undefined;
 	const n = Number(trimmed);
 	return isPositiveNumber(n) ? n : undefined;
+}
+
+/** Parse an env-var value as a finite number in (0, 100]. The empty
+ *  string (and all-whitespace) returns `undefined` so the caller can
+ *  fall through to the next precedence layer; non-numeric, zero,
+ *  negative, greater than 100, `NaN`, and `Infinity` likewise return
+ *  `undefined`. */
+function parsePercentEnv(s: string | undefined): number | undefined {
+	const trimmed = nonEmpty(s);
+	if (trimmed === undefined) return undefined;
+	const n = Number(trimmed);
+	return isDropFloorPercent(n) ? n : undefined;
 }

@@ -503,3 +503,214 @@ describe("tier-threshold fields — per-field independence", () => {
 		assert.equal(cfg.summaWords, undefined);
 	});
 });
+
+describe("dropFloorPercent", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: a value in (0, 100] is extracted (50, 1, 100 all valid)", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: 50 }).dropFloorPercent, 50);
+		assert.equal(parseConfigFile({ dropFloorPercent: 1 }).dropFloorPercent, 1);
+		// 100 is the upper bound — accepted (drop effectively
+		// disabled: 100% of the cap means the floor equals the
+		// cap, which the drop never undershoots).
+		assert.equal(parseConfigFile({ dropFloorPercent: 100 }).dropFloorPercent, 100);
+	});
+
+	it("file parse: 0 is treated as absent (open-lower bound excludes 0)", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: 0 }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: 101 is treated as absent (open-upper bound excludes >100)", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: 101 }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: negative is treated as absent", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: -50 }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: Number.NaN }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: Number.POSITIVE_INFINITY }).dropFloorPercent, undefined);
+		assert.equal(parseConfigFile({ dropFloorPercent: Number.NEGATIVE_INFINITY }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: non-numeric (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ dropFloorPercent: "50" }).dropFloorPercent, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 50_000 }).dropFloorPercent, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "75" } as EnvRecord,
+		});
+		assert.equal(cfg.dropFloorPercent, 75);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.dropFloorPercent, 50);
+	});
+
+	it("resolveConfig: out-of-range env (0, 101, negative) falls back to file", () => {
+		const cfgZero = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.dropFloorPercent, 50);
+		const cfg101 = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "101" } as EnvRecord,
+		});
+		assert.equal(cfg101.dropFloorPercent, 50);
+		const cfgNeg = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "-10" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.dropFloorPercent, 50);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { dropFloorPercent: 50 },
+			env: { [ENV.dropFloorPercent]: "half" } as EnvRecord,
+		});
+		assert.equal(cfg.dropFloorPercent, 50);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { dropFloorPercent: 75 } });
+		assert.equal(cfg.dropFloorPercent, 75);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.dropFloorPercent, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string in (0, 100] is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.dropFloorPercent]: "60" } as EnvRecord,
+		});
+		assert.equal(cfg.dropFloorPercent, 60);
+		assert.equal(typeof cfg.dropFloorPercent, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.dropFloorPercent is the documented namespace", () => {
+		assert.equal(ENV.dropFloorPercent, "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT");
+	});
+});
+
+describe("recencyFloor", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: a positive number is extracted", () => {
+		assert.equal(parseConfigFile({ recencyFloor: 5000 }).recencyFloor, 5000);
+		assert.equal(parseConfigFile({ recencyFloor: 1 }).recencyFloor, 1);
+	});
+
+	it("file parse: 0 is treated as absent (matches isPositiveNumber's open-lower bound)", () => {
+		assert.equal(parseConfigFile({ recencyFloor: 0 }).recencyFloor, undefined);
+	});
+
+	it("file parse: negative is treated as absent", () => {
+		assert.equal(parseConfigFile({ recencyFloor: -100 }).recencyFloor, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ recencyFloor: Number.NaN }).recencyFloor, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ recencyFloor: Number.POSITIVE_INFINITY }).recencyFloor, undefined);
+		assert.equal(parseConfigFile({ recencyFloor: Number.NEGATIVE_INFINITY }).recencyFloor, undefined);
+	});
+
+	it("file parse: non-numeric (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ recencyFloor: "5000" }).recencyFloor, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 50_000 }).recencyFloor, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { recencyFloor: 5000 },
+			env: { [ENV.recencyFloor]: "10000" } as EnvRecord,
+		});
+		assert.equal(cfg.recencyFloor, 10000);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { recencyFloor: 5000 },
+			env: { [ENV.recencyFloor]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.recencyFloor, 5000);
+	});
+
+	it("resolveConfig: non-positive env (0, negative) falls back to file", () => {
+		const cfgZero = resolveConfig({
+			file: { recencyFloor: 5000 },
+			env: { [ENV.recencyFloor]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.recencyFloor, 5000);
+		const cfgNeg = resolveConfig({
+			file: { recencyFloor: 5000 },
+			env: { [ENV.recencyFloor]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.recencyFloor, 5000);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { recencyFloor: 5000 },
+			env: { [ENV.recencyFloor]: "lots" } as EnvRecord,
+		});
+		assert.equal(cfg.recencyFloor, 5000);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { recencyFloor: 7500 } });
+		assert.equal(cfg.recencyFloor, 7500);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.recencyFloor, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.recencyFloor]: "20000" } as EnvRecord,
+		});
+		assert.equal(cfg.recencyFloor, 20000);
+		assert.equal(typeof cfg.recencyFloor, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.recencyFloor is the documented namespace", () => {
+		assert.equal(ENV.recencyFloor, "PI_CONTEXT_TRIMMER_RECENCY_FLOOR");
+	});
+});

@@ -58,6 +58,7 @@ import {
 	applyThreeTierTrim,
 	defaultSummaSummarizer,
 	isPathPreserved,
+	SUMMARIZE_TIER_MAX_TOKENS,
 	type TrimmableMessage,
 } from "./policy.ts";
 import { createPinnedTier, PINNED_CUSTOM_TYPE } from "./pinned-tier.ts";
@@ -334,11 +335,30 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// `cfg.summaWords` is `undefined` (the default path), the
 		// `?? DEFAULT` fallback in `applyThreeTierTrim` still wins.
 		const summaWordsInt = cfg.summaWords !== undefined ? Math.trunc(cfg.summaWords) : undefined;
+		// Drop-floor: a percentage of the effective summarize cap,
+		// resolved to a token count at the wiring layer (the policy
+		// receives the resolved numeric `dropFloorTokens`, not the
+		// operator-configurable percentage). Per AC-3 the compile-time
+		// default is 50% — the no-acknowledge operator still gets a
+		// bound that engages when a whole-turn drop would collapse
+		// the trimmable total below half the summarize cap.
+		const effectiveSummarizeMaxTokens = cfg.tier2MaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
+		const dropFloorPercent = cfg.dropFloorPercent ?? 50;
+		const dropFloorTokens = Math.trunc((dropFloorPercent / 100) * effectiveSummarizeMaxTokens);
+		// Recency-floor: integer-coerced token count passed through
+		// to the policy unchanged in shape. Per AC-3 the compile-time
+		// default is `undefined` (off; recency protection is operator
+		// opt-in), so the policy's `recencyFloor <= 0 || undefined`
+		// guard treats the default as a no-op. `Math.trunc` matches
+		// the existing `summaWords` integer-coercion primitive.
+		const recencyFloorTokens = cfg.recencyFloor !== undefined ? Math.trunc(cfg.recencyFloor) : undefined;
 		const result = applyThreeTierTrim(withPinned, {
 			summarizer: defaultSummaSummarizer,
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
 			summaWords: summaWordsInt,
+			dropFloorTokens,
+			recencyFloor: recencyFloorTokens,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
