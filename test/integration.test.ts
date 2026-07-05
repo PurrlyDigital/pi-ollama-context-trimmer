@@ -223,27 +223,111 @@ describe("context handler — pinned-tier injection", () => {
 // ─── End-to-end: drop tier with protected slots ────────────────────────
 
 describe("context handler — drop tier with protected slots", () => {
-	it("drops the oldest trimmable turn when over 100k, preserving pinned and dispatch", async () => {
+	it("drops the oldest trimmable turn when over 100k without engaging the drop-floor, preserving pinned and dispatch", async () => {
+		// Two trimmable turns of 60k each = 120k total, cap 100k. Drop
+		// the oldest 60k turn → 60k remaining, which is > the 50k
+		// drop-floor (50% of 100k summarize cap), so the drop fires.
+		// The 50% drop-floor is the post-fix default; this fixture
+		// sits ABOVE the floor so the legitimate drop path is
+		// exercised end-to-end. (The single-oversized-turn case that
+		// engages the floor is covered separately below.)
+		//
+		// With dispatch protection ON (the module-level before hook),
+		// the dispatch (userTurnAge === 0) is NOT a turn anchor; only
+		// follow-up user messages (userTurnAge > 0) anchor turns. So
+		// two follow-up user messages are required to delimit two
+		// trimmable turns. (One follow-up would only produce a single
+		// open turn spanning to end-of-stream, and the policy's
+		// post-dispatch-tail synthesis only fires when ZERO turns
+		// are identified — not when one is.)
 		const pi = await loadExtension();
 		const event = {
 			messages: [
 				userMsg("dispatch"),
-				assistantMsg(pad("a", 60_000)), // 60k trimmable turn 1
-				toolResultMsg(pad("b", 60_000)),
+				// Trimmable turn 1: 60k total (between follow-up 1 and follow-up 2).
+				userMsg("follow-up 1"),
+				assistantMsg(pad("a", 30_000)),
+				toolResultMsg(pad("b", 30_000)),
+				// Trimmable turn 2: 60k total (after follow-up 2).
+				userMsg("follow-up 2"),
+				assistantMsg(pad("c", 30_000)),
+				toolResultMsg(pad("d", 30_000)),
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// Pinned + dispatch + ... the drop should have removed the
-		// assistant/toolResult turn. The output should have at most
-		// the pinned synthetic + the dispatch.
+		// Pinned + dispatch + 2 follow-ups + the surviving turn 2's
+		// assistant+toolResult. Turn 1 was dropped; turn 2 survives.
 		const trimmableMass = result.messages.filter((m) => {
 			if (m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE) return false;
-			if (m.role === "user") return false; // dispatch
+			if (m.role === "user") return false; // dispatch + 2 follow-ups
 			return true;
 		});
-		// After drop, the trimmable mass is 0 (or near 0). Definitely
-		// not 120k.
-		assert.ok(trimmableMass.length <= 1, "trimmable turn must be dropped");
+		// After drop, only turn 2's assistant+toolResult survive
+		// (60k trimmable, ≤ cap). The drop removed exactly the 2
+		// messages of turn 1.
+		assert.equal(trimmableMass.length, 2, "trimmable turn 1 must be dropped; trimmable turn 2 survives");
+		// Dispatch + both follow-up user anchors survive.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must be preserved");
+		const followUp1 = result.messages.find(
+			(m) => m.role === "user" && m.content === "follow-up 1",
+		);
+		assert.ok(followUp1, "follow-up 1 user anchor must survive (it bounds turn 1)");
+		const followUp2 = result.messages.find(
+			(m) => m.role === "user" && m.content === "follow-up 2",
+		);
+		assert.ok(followUp2, "follow-up 2 user anchor must survive (it bounds turn 2)");
+	});
+
+	it("falls through to summarize when a single oversized turn would collapse the trimmable total below the drop-floor — AC-1 regression", async () => {
+		// A single trimmable turn of 120k (above the 100k cap) is
+		// the operator's reported overshoot shape: dropping the turn
+		// whole would land the trimmable total at 0, far below the
+		// 50% drop-floor (50k). The policy must NOT drop the turn;
+		// it must fall through to the summarize-fallback path so the
+		// post-trim trimmable total stays >= the floor and the
+		// dispatch + pinned survive. The oversized turn's content
+		// is summarized in place; the dispatch task and pinned
+		// synthetic are untouched.
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a", 60_000)), // 60k trimmable
+				toolResultMsg(pad("b", 60_000)), // 60k trimmable (total 120k → drop-floor fall-through)
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// Dispatch must survive.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "dispatch task must survive the fall-through");
+		// Pinned synthetic must survive.
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.ok(pinned, "pinned synthetic must survive the fall-through");
+		// The trimmable turn survived via summarize-fallback: the
+		// assistant and toolResult are still in the output, and
+		// at least one of them carries the summa envelope marker
+		// (the summarize path rewrites content to "[summa: ...]").
+		const trimmable = result.messages.filter((m) => {
+			if (m.role === "custom") return false;
+			if (m.role === "user") return false;
+			return true;
+		});
+		assert.equal(trimmable.length, 2, "oversized trimmable turn survives via summarize-fallback (both messages retained)");
+		const flat = trimmable.map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n");
+		assert.ok(flat.includes("[summa:"), "the oversized turn's content must be summarized in place (summa envelope present)");
+		// No drop reminder emitted (dropSet was empty — the floor
+		// engaged and the drop path did not fire).
+		const reminders = result.messages.filter(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension"),
+		);
+		assert.equal(reminders.length, 0, "the drop-floor fall-through does not emit a drop reminder (no drop fired)");
 	});
 });
 
@@ -298,16 +382,28 @@ describe("context handler — opt-out path (nothing configured)", () => {
 
 	it("does not treat the first user message as a protected dispatch slot", async () => {
 		// With dispatch protection OFF, the first user message is an
-		// ordinary turn anchor (not exempted). A session that lands in
-		// the drop tier drops the post-anchor turn; the first user
-		// message survives as an anchor (it is not "protected," it is
-		// simply not inside a trimmable turn slice).
+		// ordinary turn anchor (not exempted). A multi-turn session
+		// whose trimmable total sits above 100k AND whose oldest
+		// trimmable turn can be dropped without engaging the 50k
+		// drop-floor exercises the drop path end-to-end: the
+		// post-anchor turn is dropped, the first user message
+		// survives as an anchor (it is not "protected," it is simply
+		// not inside a trimmable turn slice), and the AC-1 drop
+		// reminder is emitted at the start of the output.
 		const pi = await loadExtension();
 		const event = {
 			messages: [
 				userMsg("first prompt"),
-				assistantMsg(pad("a", 60_000)), // 60k trimmable
-				toolResultMsg(pad("b", 60_000)), // 60k (total 120k → drop)
+				// Trimmable turn 1: 60k total.
+				assistantMsg(pad("a", 30_000)),
+				toolResultMsg(pad("b", 30_000)),
+				// Trimmable turn 2 (anchored by a follow-up user
+				// message): 60k total. Together with turn 1 = 120k,
+				// forcing tier 3. Dropping turn 1 leaves 60k > the
+				// 50k floor, so the drop fires.
+				userMsg("follow-up"),
+				assistantMsg(pad("c", 30_000)),
+				toolResultMsg(pad("d", 30_000)),
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
@@ -316,13 +412,15 @@ describe("context handler — opt-out path (nothing configured)", () => {
 			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
 		);
 		assert.equal(pinned, undefined, "no pinned synthetic in opt-out path");
-		// The 120k trimmable turn was dropped. The drop path emits one
-		// aggregate plain-English reminder at the start of the prune
-		// pass (the AC-1 reminder) — not a per-dropped-turn marker.
-		// The reminder is a plain `role: "user"` message prepended
-		// to the returned array; with no pinned synthetic in the
-		// opt-out path, the output is [reminder, first-prompt].
-		assert.equal(result.messages.length, 2);
+		// Turn 1 was dropped (60k trimmable), turn 2 survives (60k
+		// trimmable, ≤ cap). The drop path emits one aggregate
+		// plain-English reminder at the start of the prune pass (the
+		// AC-1 reminder) — not a per-dropped-turn marker. The
+		// reminder is a plain `role: "user"` message prepended to
+		// the returned array; with no pinned synthetic in the
+		// opt-out path, the output is [reminder, first-prompt,
+		// follow-up, assistant, toolResult].
+		assert.equal(result.messages.length, 5);
 		assert.equal(result.messages[0].role, "user");
 		const reminderText = String(result.messages[0].content);
 		assert.ok(
@@ -331,6 +429,8 @@ describe("context handler — opt-out path (nothing configured)", () => {
 		);
 		assert.equal(result.messages[1].role, "user");
 		assert.equal(result.messages[1].content, "first prompt");
+		assert.equal(result.messages[2].role, "user");
+		assert.equal(result.messages[2].content, "follow-up");
 	});
 });
 
@@ -499,34 +599,56 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 	});
 
 	it("preserves a tool result through the drop tier (tier-3) — AC-6 (b)", async () => {
-		// Build a session that lands in tier 3 (>100k trimmable). The
-		// preserved-path message sits inside the dropped trimmable
+		// Build a multi-turn session that lands in tier 3 (>100k
+		// trimmable) WITHOUT engaging the 50% drop-floor. The
+		// preserved-path messages sit inside the dropped trimmable
 		// turn slice; with the policy's carve-out in place
 		// (dropOldestTurns carves protected messages out of the
-		// dropped slice), the preserved message survives. The
+		// dropped slice), the preserved messages survive. The
 		// test exercises BOTH distinct tool-dispatch shapes
 		// (read_file + shell cat) per the AC-6 floor.
+		//
+		// Trimmable shape: turn 1 (between follow-up 1 and
+		// follow-up 2, contains the two preserved messages) = 60k
+		// trimmable (assistant + toolResult). Turn 2 (after
+		// follow-up 2) = 60k trimmable. Total = 120k → tier 3.
+		// Drop turn 1 → 60k remaining > 50k floor, so the drop
+		// fires. The preserved messages in turn 1 are carved out
+		// of the dropped slice and survive.
+		//
+		// With dispatch protection ON (the module-level before
+		// hook), the dispatch is NOT a turn anchor; only follow-up
+		// user messages anchor turns. Two follow-up users delimit
+		// the two trimmable turns.
 		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md,CLAUDE.md";
 		const pi = await loadExtension();
 		const event = {
 			messages: [
 				userMsg("dispatch"),
+				// Follow-up 1 anchors turn 1.
+				userMsg("follow-up 1"),
 				// Preserved (fuzzy match on AGENTS.md) — embedded in turn 1.
 				readFileResult(pad("preserved body — AGENTS.md", 60_000), join(fixtureDir, "AGENTS.md")),
-				// Trimmable mass pushing the trimmable total past 100k.
-				assistantMsg(pad("a", 60_000)), // 60k trimmable
+				// Trimmable mass in turn 1.
+				assistantMsg(pad("a", 30_000)), // 30k trimmable
 				// Preserved (fuzzy match on CLAUDE.md) — embedded in turn 1.
 				shellCatResult(pad("preserved body — CLAUDE.md", 60_000), join(fixtureDir, "CLAUDE.md")),
-				// More trimmable mass to ensure tier 3 is reached.
-				toolResultMsg(pad("b", 60_000)), // 60k trimmable
+				// Trimmable mass in turn 1.
+				toolResultMsg(pad("b", 30_000)), // 30k trimmable
+				// Follow-up 2 closes turn 1 and anchors turn 2.
+				userMsg("follow-up 2"),
+				// Trimmable turn 2: 60k trimmable.
+				assistantMsg(pad("c", 30_000)),
+				toolResultMsg(pad("d", 30_000)),
 			],
 		};
-		// Trimmable total: 60k + 60k = 120k (preserved messages are
-		// subtracted from the budget). Tier 3 (drop). Turn 1 spans
-		// indices [1, 5) (everything after the dispatch user anchor
-		// through end-of-stream). The wiring stamps PRESERVED_CUSTOM_TYPE
-		// on the two preserved messages; both must be carved out of
-		// the dropped turn slice and survive.
+		// Trimmable total: 30k + 30k + 30k + 30k = 120k (preserved
+		// messages are subtracted from the budget). Tier 3 (drop).
+		// Turn 1 spans [2, 7) (between follow-up 1 and follow-up 2).
+		// Turn 2 spans [8, end). The wiring stamps
+		// PRESERVED_CUSTOM_TYPE on the two preserved messages;
+		// both must be carved out of the dropped turn slice and
+		// survive.
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 
 		// The dispatch must survive.
@@ -559,19 +681,23 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		assert.ok(claudeText.includes("preserved body — CLAUDE.md"), "preserved CLAUDE.md content must be verbatim (no summa tag)");
 		assert.ok(!claudeText.includes("[summa:"), "preserved CLAUDE.md content must not be summarized");
 
-		// The trimmable turn was dropped: the assistant and tool-result
-		// messages are gone. The drop counter reflects the whole-turn
-		// drop (counted as 1 turn dropped — the carve-out does not
+		// Turn 1's trimmable messages (the 30k assistant and 30k
+		// toolResult) were dropped. Turn 2's trimmable messages
+		// (the 30k assistant and 30k toolResult) survive (60k ≤
+		// cap). The drop counter reflects the whole-turn drop
+		// (counted as 1 turn dropped — the carve-out does not
 		// change the turn count, only which messages survive the
-		// slice). Note: the wiring stamps `customType: PRESERVED_CUSTOM_TYPE`
-		// on the carved-out messages but does NOT change their `role`
-		// (the role stays `toolResult`); the filter below checks the
-		// customType, not the role, to identify preserved messages.
-		// The filter also excludes the AC-1 aggregate plain-English
-		// prune reminder emitted on the tier-3 drop path — the
-		// reminder is a `role: "user"` message (per the new shape in
-		// policy.ts), so the `role === "user"` filter below already
-		// excludes it. No DROPPED_CUSTOM_TYPE filter is needed.
+		// slice). Note: the wiring stamps
+		// `customType: PRESERVED_CUSTOM_TYPE` on the carved-out
+		// messages but does NOT change their `role` (the role
+		// stays `toolResult`); the filter below checks the
+		// customType, not the role, to identify preserved
+		// messages. The filter also excludes the AC-1 aggregate
+		// plain-English prune reminder emitted on the tier-3 drop
+		// path — the reminder is a `role: "user"` message, so the
+		// `role === "user"` filter below already excludes it. The
+		// follow-up user anchor is also a `role: "user"` message;
+		// it survives the drop and is excluded by the same filter.
 		const droppedTrimmable = result.messages.filter((m) => {
 			const customType = (m as { customType?: string }).customType;
 			if (customType === PINNED_CUSTOM_TYPE) return false;
@@ -579,7 +705,9 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 			if (m.role === "user") return false;
 			return true;
 		});
-		assert.equal(droppedTrimmable.length, 0, "all non-protected trimmable messages in the dropped turn must be gone");
+		// Turn 2's 2 trimmable messages survive; turn 1's 2
+		// trimmable messages were dropped.
+		assert.equal(droppedTrimmable.length, 2, "turn 1's trimmable messages must be dropped; turn 2's survive");
 	});
 
 	it("expands `~/` at the wiring layer — an absolute `~/...` pattern matches the operator's home", async () => {
@@ -642,18 +770,46 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 // closed per AGENTS.md rule 8).
 
 describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)", () => {
-	/** The trimmable input that exceeds the 100k drop threshold. The
-	 *  tool-result tail carries a known artifact ("needle") that the
-	 *  originally-reported signal references. */
+	/** The trimmable input that exceeds the 100k drop threshold
+	 *  WITHOUT engaging the 50% drop-floor. The shape is a
+	 *  multi-turn session whose trimmable total is 120k and
+	 *  whose oldest trimmable turn is 60k — dropping it leaves
+	 *  60k remaining, which is > the 50k floor, so the drop
+	 *  fires and the AC-1 reminder is emitted. The surviving
+	 *  turn 2 carries the "needle" artifact that the
+	 *  originally-reported signal references.
+	 *
+	 *  The dropped turn uses a unique signature string
+	 *  ("DO_NOT_KEEP_42") so the "the dropped turn's content must
+	 *  NOT be in the reminder-present stream" assertion has a
+	 *  deterministic non-overlapping check. (A naive "a" prefix
+	 *  would false-positive on the surviving turn's content.)
+	 *
+	 *  With dispatch protection ON (the module-level before
+	 *  hook), the dispatch is NOT a turn anchor; only follow-up
+	 *  user messages (userTurnAge > 0) anchor turns. Two
+	 *  follow-up users are required to delimit two trimmable
+	 *  turns — otherwise the open turn spans to end-of-stream
+	 *  and the policy identifies only a single 120k turn (which
+	 *  would engage the drop-floor and fall through to summarize,
+	 *  emitting no drop reminder). */
 	function buildOver100kSession(): Array<Record<string, unknown>> {
 		return [
 			userMsg("dispatch task — do X"),
-			// The dropped turn: assistant + toolResult. The toolResult
-			// carries the "needle" artifact that the originally-reported
-			// signal references ("I'll consult the tool result from
-			// the earlier turn ... 'needle' ...").
-			assistantMsg(pad("a", 60_000)),
-			toolResultMsg(pad("needle ", 60_000)),
+			// Follow-up 1 anchors turn 1.
+			userMsg("follow-up 1"),
+			// Trimmable turn 1 (will be dropped): 60k trimmable.
+			// Use a unique signature so the "must not be in
+			// output" assertion has a deterministic check.
+			assistantMsg(pad("DO_NOT_KEEP_42_", 30_000)),
+			toolResultMsg(pad("DO_NOT_KEEP_42_", 30_000)),
+			// Follow-up 2 closes turn 1 and anchors turn 2.
+			userMsg("follow-up 2"),
+			// Trimmable turn 2 (survives the drop): 60k
+			// trimmable. Carries the "needle" artifact that the
+			// originally-reported signal references.
+			assistantMsg(pad("c", 30_000)),
+			toolResultMsg(pad("needle ", 30_000)),
 		];
 	}
 
@@ -681,10 +837,10 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 	it("reminder-present session emits exactly one aggregate reminder in the output stream", async () => {
 		// The reminder-present session invokes the wiring's `context`
 		// handler with the same trimmable input. The wiring produces
-		// the new-shape stream: [pinned, reminder, dispatch]. The
-		// dropped turn's content is gone (the drop fires), and
-		// exactly ONE aggregate reminder is in the stream (one per
-		// drop event, not one per dropped turn).
+		// the new-shape stream: [pinned, reminder, dispatch, follow-up,
+		// assistant, toolResult]. Turn 1 was dropped (drop fired,
+		// dropSet.size > 0), and exactly ONE aggregate reminder is in
+		// the stream (one per drop event, not per dropped turn).
 		const pi = await loadExtension();
 		const event = { messages: buildOver100kSession() };
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
@@ -718,24 +874,36 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 		const event = { messages: buildOver100kSession() };
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// The reminder-present output includes the pinned synthetic
-		// (prepended by the wiring), the aggregate reminder, and the
-		// dispatch. Strip the reminder for shape comparison.
+		// (prepended by the wiring), the aggregate reminder, the
+		// dispatch, the follow-up user anchor, and the surviving
+		// turn-2 trimmable messages. Strip the reminder for shape
+		// comparison.
 		const stripped = result.messages.filter(
 			(m) => !(m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension")),
 		);
-		// The remaining messages: pinned synthetic + dispatch. The
-		// drop fired; the trimmable tail is gone. The wiring's
-		// pinned-tier synthetic is operator-opted-in (env
-		// `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` is set in the
-		// module-level before hook) and rides at position 0.
-		assert.equal(stripped.length, 2);
+		// The remaining messages: pinned synthetic + dispatch +
+		// follow-up 1 + follow-up 2 + turn-2 assistant + turn-2
+		// toolResult. The drop fired on turn 1; turn 2 survives
+		// under the cap. The wiring's pinned-tier synthetic is
+		// operator-opted-in (env `PI_CONTEXT_TRIMMER_PERSONALITY_PATH`
+		// is set in the module-level before hook) and rides at
+		// position 0.
+		assert.equal(stripped.length, 6);
 		assert.equal(stripped[0].role, "custom");
 		assert.equal((stripped[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
 		assert.equal(stripped[1].role, "user");
 		assert.equal(stripped[1].content, "dispatch task — do X");
+		assert.equal(stripped[2].role, "user");
+		assert.equal(stripped[2].content, "follow-up 1");
+		assert.equal(stripped[3].role, "user");
+		assert.equal(stripped[3].content, "follow-up 2");
 		// The dropped turn's assistant and toolResult are gone.
-		const droppedTurnContent = stripped.filter((m) => m.content && typeof m.content === "string" && (m.content as string).includes("needle"));
-		assert.equal(droppedTurnContent.length, 0, "the dropped turn's tool-result content must NOT be in the reminder-present stream");
+		// The "DO_NOT_KEEP_42" signature is unique to the dropped
+		// turn's content (the surviving turn 2 uses "c" and
+		// "needle" pads that do not contain it). Confirm the
+		// dropped-turn content is absent from the stream.
+		const droppedTurnContent = stripped.filter((m) => m.content && typeof m.content === "string" && (m.content as string).includes("DO_NOT_KEEP_42"));
+		assert.equal(droppedTurnContent.length, 0, "the dropped turn's content (DO_NOT_KEEP_42 signature) must NOT be in the reminder-present stream");
 	});
 });
 
