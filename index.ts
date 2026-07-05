@@ -228,29 +228,19 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	}
 
 	// Loop-guard resolution. Resolved lazily on the first `context`
-	// call and cached for the session. An explicit true/false
-	// short-circuits detection; `"auto"` defers to the same
-	// pi-subagents tool probe that `resolveProtectDispatch` uses
-	// (the subagent tool is the wiring-layer signal that the
-	// extension is running in a subagent context — the same
-	// posture where behavioral-loop detection matters most).
+	// call and cached for the session. The guard is universal across
+	// session postures — the previous `"auto"` posture probed
+	// `pi-subagents` to detect subagent sessions, but behavioral-loop
+	// detection is the same concern in every session type, so the
+	// auto/subagent-tool coupling was dropped. `true` (default)
+	// turns the guard ON for every session; `false` turns it off.
+	// Operators opt out with `false` (env `PI_CONTEXT_TRIMMER_LOOP_GUARD=0`
+	// or `"loopGuard": false` in the config file).
 	let loopGuardResolved: boolean | undefined;
 	function resolveLoopGuard(): boolean {
 		if (loopGuardResolved !== undefined) return loopGuardResolved;
-		const mode: LoopGuardMode = cfg.loopGuard ?? "auto";
-		if (mode === true) {
-			loopGuardResolved = true;
-		} else if (mode === false) {
-			loopGuardResolved = false;
-		} else {
-			// Reuse the same `safeGetAllTools(pi)` probe as
-			// `resolveProtectDispatch` — the subagent tool's
-			// presence is the wiring-layer signal that we're in a
-			// subagent context, the same posture where
-			// behavioral-loop detection matters most.
-			const tools = safeGetAllTools(pi);
-			loopGuardResolved = tools.some((t) => t?.name === "subagent");
-		}
+		const mode: LoopGuardMode = cfg.loopGuard ?? true;
+		loopGuardResolved = mode === true;
 		return loopGuardResolved;
 	}
 

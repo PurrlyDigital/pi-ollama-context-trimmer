@@ -718,21 +718,19 @@ describe("recencyFloor", () => {
 
 // ─── loopGuard (defense-in-depth for model-caused loops) ───────────────
 //
-// The loop-guard enable mode is opt-in/opt-out via `loopGuard` in the
-// config file or `PI_CONTEXT_TRIMMER_LOOP_GUARD` in env. Mirrors the
-// `protectDispatch` knob so the two opt-in/out surfaces share the same
-// shape: a `"auto"` deferral default, `true`/`false` forces, and a
-// bogus env value falls through to the file channel (and ultimately to
-// the default). The wiring layer in `index.ts` reads `cfg.loopGuard`
-// and uses the same `subagent` tool probe as `protectDispatch` for
-// `auto` resolution.
+// The loop-guard enable mode is opt-out: `loopGuard` in the config
+// file or `PI_CONTEXT_TRIMMER_LOOP_GUARD` in env. `true` (default)
+// turns the guard ON for every session; `false` turns it off. The
+// guard is universal across session postures — the previous `"auto"`
+// posture coupled the guard to a subagent-tool probe, but
+// behavioral-loop detection is the same concern whether the model is
+// in a parent or a subagent session, so the coupling was dropped.
+// `parseConfigFile` accepts only the boolean shape; any other value
+// (string, number, the previous `"auto"` sentinel) is treated as
+// absent and the resolver falls through to the default `true`.
 
 describe("loopGuard", () => {
 	// --- parseConfigFile (file channel) ---
-
-	it("file parse: 'auto' is extracted", () => {
-		assert.equal(parseConfigFile({ loopGuard: "auto" }).loopGuard, "auto");
-	});
 
 	it("file parse: boolean true is extracted", () => {
 		assert.equal(parseConfigFile({ loopGuard: true }).loopGuard, true);
@@ -742,13 +740,17 @@ describe("loopGuard", () => {
 		assert.equal(parseConfigFile({ loopGuard: false }).loopGuard, false);
 	});
 
-	it("file parse: string other than 'auto' is treated as absent", () => {
+	it("file parse: the previous 'auto' string is treated as absent (sentinel was dropped)", () => {
+		assert.equal(parseConfigFile({ loopGuard: "auto" }).loopGuard, undefined);
+	});
+
+	it("file parse: arbitrary string is treated as absent", () => {
 		assert.equal(parseConfigFile({ loopGuard: "on" }).loopGuard, undefined);
 		assert.equal(parseConfigFile({ loopGuard: "yes" }).loopGuard, undefined);
 		assert.equal(parseConfigFile({ loopGuard: "" }).loopGuard, undefined);
 	});
 
-	it("file parse: number is treated as absent (not 'auto', not boolean)", () => {
+	it("file parse: number is treated as absent (boolean only)", () => {
 		assert.equal(parseConfigFile({ loopGuard: 1 }).loopGuard, undefined);
 		assert.equal(parseConfigFile({ loopGuard: 0 }).loopGuard, undefined);
 	});
@@ -759,9 +761,9 @@ describe("loopGuard", () => {
 
 	// --- resolveConfig (env wins over file) ---
 
-	it("resolveConfig: env '1' forces loopGuard true over file 'auto'", () => {
+	it("resolveConfig: env '1' forces loopGuard true over file false", () => {
 		const cfg = resolveConfig({
-			file: { loopGuard: "auto" },
+			file: { loopGuard: false },
 			env: { [ENV.loopGuard]: "1" } as EnvRecord,
 		});
 		assert.equal(cfg.loopGuard, true);
@@ -775,25 +777,43 @@ describe("loopGuard", () => {
 		assert.equal(cfg.loopGuard, false);
 	});
 
-	it("resolveConfig: env unset falls back to file 'auto'", () => {
-		const cfg = resolveConfig({
-			file: { loopGuard: "auto" },
+	it("resolveConfig: env unset falls back to file value (boolean)", () => {
+		const cfgTrue = resolveConfig({
+			file: { loopGuard: true },
 			env: {} as EnvRecord,
 		});
-		assert.equal(cfg.loopGuard, "auto");
+		assert.equal(cfgTrue.loopGuard, true);
+		const cfgFalse = resolveConfig({
+			file: { loopGuard: false },
+			env: {} as EnvRecord,
+		});
+		assert.equal(cfgFalse.loopGuard, false);
 	});
 
-	it("resolveConfig: env bogus value falls through to file then default 'auto'", () => {
+	it("resolveConfig: env bogus value falls through to file then default true", () => {
 		const cfgFromFile = resolveConfig({
-			file: { loopGuard: "auto" },
+			file: { loopGuard: true },
 			env: { [ENV.loopGuard]: "on" } as EnvRecord,
 		});
-		assert.equal(cfgFromFile.loopGuard, "auto");
+		assert.equal(cfgFromFile.loopGuard, true);
 		const cfgFromDefault = resolveConfig({
 			env: { [ENV.loopGuard]: "yes" } as EnvRecord,
 		});
 		assert.equal(cfgFromDefault.loopGuard, DEFAULT_LOOP_GUARD);
-		assert.equal(cfgFromDefault.loopGuard, "auto");
+		assert.equal(cfgFromDefault.loopGuard, true);
+	});
+
+	it("resolveConfig: env 'auto' falls through to file then default true (sentinel was dropped)", () => {
+		const cfgFromFile = resolveConfig({
+			file: { loopGuard: true },
+			env: { [ENV.loopGuard]: "auto" } as EnvRecord,
+		});
+		assert.equal(cfgFromFile.loopGuard, true);
+		const cfgFromDefault = resolveConfig({
+			env: { [ENV.loopGuard]: "auto" } as EnvRecord,
+		});
+		assert.equal(cfgFromDefault.loopGuard, DEFAULT_LOOP_GUARD);
+		assert.equal(cfgFromDefault.loopGuard, true);
 	});
 
 	it("resolveConfig: empty-string env falls back to file", () => {
@@ -811,10 +831,10 @@ describe("loopGuard", () => {
 		assert.equal(cfgOff.loopGuard, false);
 	});
 
-	it("resolveConfig: nothing configured returns the default 'auto'", () => {
+	it("resolveConfig: nothing configured returns the default true (ON for all sessions)", () => {
 		const cfg = resolveConfig({});
 		assert.equal(cfg.loopGuard, DEFAULT_LOOP_GUARD);
-		assert.equal(cfg.loopGuard, "auto");
+		assert.equal(cfg.loopGuard, true);
 	});
 
 	// --- ENV map ---
