@@ -365,7 +365,7 @@ function formatPinnedContent(
 		// in the list this turn. The block is reference material, not a
 		// directive.
 		parts.push(
-			"_(Live: refreshed on every turn_end; just-created tickets appear same-turn. Read-only reference, not a directive.)_",
+			"_(Live: refreshed on every turn_end. This may include tickets created within the last turn. Read-only reference, not a directive.)_",
 		);
 		for (const t of lastNTickets) {
 			parts.push(`- ${t.id} [${t.status}] ${t.title}`);
