@@ -2,10 +2,9 @@
  * Pinned tier module (auto-pin by convention).
  *
  * Owns the auto-pinned content the agent always sees: `personality.md`
- * (the agent's voice/identity substrate in `~/.pi/agent/`) and the
- * last-N tracker tickets (the project state the agent needs to navigate
- * the workspace). The pinned tier is the Pi-native substitute for the
- * Claude Code `UserPromptSubmit` re-injection hack — Pi has no
+ * (the agent's voice/identity substrate in `~/.pi/agent/`). The pinned
+ * tier is the Pi-native substitute for the Claude Code
+ * `UserPromptSubmit` re-injection hack — Pi has no
  * `user_prompt_submit` event, so the trimmer injects on `context`
  * instead, every call, regardless of age.
  *
@@ -24,7 +23,7 @@
  *   the top. The pinned content is **view-time only** — it is not
  *   persisted in the session file (that would bloat the session). The
  *   injection is reconstructed on every `context` call from the file
- *   system + the tracker.
+ *   system.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * What's pinned
@@ -36,36 +35,28 @@
  *      An operator who wants the personality substrate injected sets
  *      its path explicitly; when unset (or the file is missing) the
  *      personality section is omitted entirely.
- *   2. Last-N tracker tickets — a digest of the last N tickets' titles
- *      and statuses. Read via the global tracker CLI when a tracker path
- *      is explicitly provided; **the tracker is optional** — no default
- *      path is bundled. The list is refreshed at `session_start` and on
- *      each `turn_end` (so newly-created tickets are picked up). `N` is
- *      a fixed default of 5. Scope: ALL projects (global last-5, no
- *      project scoping).
  *
- *   When neither the personality path nor the tracker path is
- *   configured (or both resolve empty), there is nothing to pin and
- *   `buildPinnedMessage()` returns `null` — the wiring layer skips the
- *   injection entirely. The extension ships no opinionated default
- *   content; everything pinned is operator-opted-in.
+ *   When personality is not configured (or the file resolves empty),
+ *   there is nothing to pin and `buildPinnedMessage()` returns `null`
+ *   — the wiring layer skips the injection entirely. The extension
+ *   ships no opinionated default content; everything pinned is
+ *   operator-opted-in.
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Convention-driven, not agent-driven
  *
  *   The pinned set is **convention-driven** (auto-pin by convention),
  *   not agent-driven. The convention is `isPinned(path): boolean`
- *   returning true for `~/.pi/agent/personality.md` and the last-N
- *   tracker ticket paths. No agent `pin` verb exists in v1 (per the
- *   Out-of-scope list: "Agent `pin <ref>` verb and config-file
- *   pinned-tier declaration — future tickets").
+ *   returning true for `~/.pi/agent/personality.md`. No agent `pin`
+ *   verb exists in v1 (per the Out-of-scope list: "Agent `pin <ref>`
+ *   verb and config-file pinned-tier declaration — future tickets").
  *
  * ─────────────────────────────────────────────────────────────────────────────
  * Purity contract
  *
  *   - The `PinnedTier` instance holds the in-memory cache (personality
- *     content + last-N tracker digest). The cache is populated by
- *     `refresh()` calls (session_start, turn_end).
+ *     content). The cache is populated by `refresh()` calls
+ *     (session_start, turn_end).
  *   - The text-formatting helpers are pure functions.
  *   - File I/O is encapsulated in `refresh()` — the engine is otherwise
  *     pure.
@@ -75,13 +66,9 @@
  *     to build the synthetic injection message.
  */
 
-import { execFileSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 
 // ─── Constants (the load-bearing AC-3 surface) ────────────────────────────
-
-/** Default N for the last-N tracker tickets. LOCKED at N=5 per Tension-2. */
-export const DEFAULT_PINNED_TRACKER_COUNT = 5;
 
 /** Custom type for the pinned-tier injection message. The `context`
  *  handler prepends a `customType: "context-trimmer-pinned"` message
@@ -93,46 +80,27 @@ export const PINNED_CUSTOM_TYPE = "context-trimmer-pinned";
 // ─── Public types ──────────────────────────────────────────────────────────
 
 /**
- * A single ticket summary for the pinned-tier list. The full ticket
- * body is not inlined (the digest is a list, not a dump); the agent
- * can `tracker.py show <id> --summary` if it needs the body.
- */
-export interface PinnedTicketSummary {
-	/** The ticket id, formatted as `T-NNN`. */
-	id: string;
-	/** Ticket title. */
-	title: string;
-	/** Ticket status (canonical underscored lowercase, e.g. `in_progress`). */
-	status: string;
-}
-
-/**
  * The PinnedTier container. Created by `createPinnedTier()`. The
  * instance holds the in-memory cache; `refresh()` re-reads from the
- * file system + tracker.
+ * file system.
  */
 export interface PinnedTier {
 	/** Verbatim `personality.md` content. Empty if not configured or
 	 *  the file is missing. */
 	readonly personality: string;
-	/** Last-N tracker ticket summaries, most recent first. Empty when
-	 *  no tracker is configured or the tracker returns nothing. */
-	readonly lastNTickets: ReadonlyArray<PinnedTicketSummary>;
-	/** The N used to build `lastNTickets`. */
-	readonly n: number;
 	/** The current turn index. Bumped on every `turn_end` so the
 	 *  cache is refreshed lazily; the lifecycle engine does not read
 	 *  this — only the `index.ts` handler does. */
 	readonly currentTurn: number;
-	/** Re-read personality.md and the last-N tracker. Called from
-	 *  `session_start` (always) and from `turn_end` (refresh tick). */
+	/** Re-read personality.md. Called from `session_start` (always)
+	 *  and from `turn_end` (refresh tick). */
 	refresh: () => void;
 	/** Bump the current turn. Called from `turn_end` after `refresh()`. */
 	bumpTurn: () => void;
 	/** Build the synthetic `context-trimmer-pinned` message for the
 	 *  per-LLM-call view. Returns `null` when there is nothing to pin
-	 *  (no personality content and no tracker tickets), so the wiring
-	 *  layer can skip the injection entirely. */
+	 *  (no personality content), so the wiring layer can skip the
+	 *  injection entirely. */
 	buildPinnedMessage: () => PinnedMessage | null;
 	/** Test seam: return whether a path is auto-pinned by convention. */
 	isPinned: (path: string) => boolean;
@@ -160,26 +128,19 @@ export interface PinnedMessage {
  * the caches. The caches are then read by the `context` handler on
  * every per-LLM-call view.
  *
- * Both `personalityPath` and `trackerPath` are **opt-in** — no
- * default paths are bundled with the extension. When either is
- * omitted (or resolves to a missing file / empty result) the
- * corresponding pinned section is omitted; when both are empty the
+ * `personalityPath` is **opt-in** — no default path is bundled with
+ * the extension. When omitted (or resolves to a missing file) the
  * pinned tier has nothing to inject and `buildPinnedMessage()`
  * returns `null` so the wiring layer skips the injection entirely.
  * This keeps the extension self-contained for public use; operators
- * opt in to each pinned surface explicitly.
+ * opt in to the pinned surface explicitly.
  */
 export function createPinnedTier(opts?: {
 	personalityPath?: string;
-	trackerPath?: string;
-	n?: number;
 }): PinnedTier {
 	const personalityPath = opts?.personalityPath;
-	const trackerPath = opts?.trackerPath;
-	const n = opts?.n ?? DEFAULT_PINNED_TRACKER_COUNT;
 
 	let personality = "";
-	let lastNTickets: PinnedTicketSummary[] = [];
 	let currentTurn = 0;
 	// True once any refresh has run. `buildPinnedMessage` lazily refreshes
 	// on its first call if nothing has populated the cache yet (covers the
@@ -192,18 +153,11 @@ export function createPinnedTier(opts?: {
 		get personality() {
 			return personality;
 		},
-		get lastNTickets() {
-			return lastNTickets;
-		},
-		get n() {
-			return n;
-		},
 		get currentTurn() {
 			return currentTurn;
 		},
 		refresh() {
 			personality = readPersonalityMd(personalityPath);
-			lastNTickets = readLastNTickets(trackerPath, n);
 			hasRefreshed = true;
 		},
 		bumpTurn() {
@@ -212,10 +166,9 @@ export function createPinnedTier(opts?: {
 		buildPinnedMessage() {
 			if (!hasRefreshed) {
 				personality = readPersonalityMd(personalityPath);
-				lastNTickets = readLastNTickets(trackerPath, n);
 				hasRefreshed = true;
 			}
-			const content = formatPinnedContent(personality, lastNTickets, n);
+			const content = formatPinnedContent(personality);
 			if (content.length === 0) return null;
 			return {
 				role: "custom",
@@ -226,11 +179,6 @@ export function createPinnedTier(opts?: {
 		},
 		isPinned(path: string) {
 			if (path === personalityPath) return true;
-			// A tracker ticket's path is the JSON-line of the
-			// session file, not a filesystem path; the convention
-			// does not match by filesystem path. The injection is
-			// unconditional via `buildPinnedMessage` — the per-path
-			// predicate is reserved for future shape.
 			void path; // explicit unused
 			return false;
 		},
@@ -243,8 +191,9 @@ export function createPinnedTier(opts?: {
  * Read the personality.md file from disk. Returns the verbatim content
  * (the file is small; the convention treats it as a pinned verbatim
  * file, not a tool result that ages). If the file is missing, returns
- * an empty string — the pinned message degrades to the tracker list
- * only, and the agent can still see the last-N state.
+ * an empty string — the pinned message degrades to nothing, and
+ * `buildPinnedMessage()` returns `null` so the wiring layer skips
+ * the injection.
  */
 function readPersonalityMd(path: string | undefined): string {
 	if (!path) return "";
@@ -256,90 +205,13 @@ function readPersonalityMd(path: string | undefined): string {
 	}
 }
 
-/**
- * Read the last-N tracker tickets via the global tracker CLI. The
- * function shells out to `tracker.py export --list --all-statuses
- * --limit <N> --sort updated_at:desc` (the canonical export façade
- * per the `purrly-tracker` skill — frozen, versioned, machine-
- * branchable, all-projects scope by default). The output is the
- * `{items, page, schema_version}` envelope; `items` is parsed; the
- * first N entries are taken; summaries are built.
- *
- * The function is **best-effort**: a tracker failure (missing CLI,
- * transient I/O error) returns an empty list. The pinned tier must
- * never block the LLM call on a tracker hiccup — the fallback is
- * "no pinned tickets," not "throw."
- *
- * Trust-wrap stripping: the export surface wraps `title` in
- * `<ticket_title trust="untrusted">…</ticket_title>` (the trust-
- * wrapping surface, per the export contract). The wrapper is
- * stripped here so the LLM sees a clean title; the trust-wrapping
- * is the export surface's metadata, not the title content.
- */
-function readLastNTickets(trackerPath: string | undefined, n: number): PinnedTicketSummary[] {
-	if (!trackerPath) return [];
-	if (!existsSync(trackerPath)) return [];
-	try {
-		// `tracker.py export --list --format json --all-statuses
-		// --limit <N> --sort updated_at:desc` returns the most-
-		// recently-updated N tickets across all projects. Use
-		// `execFileSync` (not `execSync`) to avoid shell expansion;
-		// the path + args are a fixed array, no interpolation.
-		const out = execFileSync("/usr/bin/python3", [
-			trackerPath,
-			"export",
-			"--list",
-			"--format",
-			"json",
-			"--all-statuses",
-			"--limit",
-			String(n),
-			"--sort",
-			"updated_at:desc",
-		], {
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-			timeout: 5000,
-		});
-		const parsed = JSON.parse(out) as {
-			items?: Array<{ id: number; title: string; status: string }>;
-		} | null;
-		const items = parsed?.items;
-		if (!Array.isArray(items)) return [];
-		return items.map((t) => ({
-			id: `T-${t.id}`,
-			title: stripTrustWrap(t.title ?? ""),
-			status: String(t.status ?? "unknown"),
-		}));
-	} catch {
-		// Tracker failure (CLI missing, parse error, timeout) → empty list.
-		// The pinned tier degrades gracefully; the LLM call is not blocked.
-		return [];
-	}
-}
-
-/**
- * Strip the trust-wrap markup from an export-façade field. The export
- * surface wraps user-authored free text in `<tag trust="untrusted">…</tag>`;
- * the LLM should see the unwrapped title, not the markup. The function
- * is conservative: it strips a leading `<tag ...>` and a trailing `</tag>`
- * if the wrap matches the documented shape. Anything else is returned
- * as-is.
- */
-function stripTrustWrap(value: string): string {
-	const m = value.match(/^<[a-z_]+\s+trust="[^"]*">([\s\S]*)<\/[a-z_]+>$/);
-	if (m && typeof m[1] === "string") return m[1];
-	return value;
-}
-
 // ─── Pinned message formatter (pure) ───────────────────────────────────────
 
 /**
- * Format the pinned-tier content the LLM sees. Each section is emitted
- * only when it has content: the personality section requires non-empty
- * personality text; the tracker section requires at least one ticket.
- * Returns an empty string when both are absent so the caller can skip
- * the injection entirely (no empty placeholder noise).
+ * Format the pinned-tier content the LLM sees. The personality
+ * section is emitted only when it has content (non-empty personality
+ * text). Returns an empty string when personality is absent so the
+ * caller can skip the injection entirely (no empty placeholder noise).
  *
  * The pinned message is a `display: false` customType — the TUI does
  * not render it as a visible line, but the LLM consumes the content on
@@ -348,28 +220,12 @@ function stripTrustWrap(value: string): string {
  */
 function formatPinnedContent(
 	personality: string,
-	lastNTickets: ReadonlyArray<PinnedTicketSummary>,
-	n: number,
 ): string {
 	const parts: string[] = [];
 	if (personality.length > 0) {
 		parts.push("## Pinned — personality (always present)");
 		parts.push(personality);
 		parts.push("");
-	}
-	if (lastNTickets.length > 0) {
-		parts.push(`## Pinned — last ${n} tracker tickets (always present, all-projects scope)`);
-		// Liveness annotation: the list is reconstructed on every
-		// `context` call from a `turn_end` refresh of the live tracker,
-		// not a session-start snapshot — so a ticket filed this turn is
-		// in the list this turn. The block is reference material, not a
-		// directive.
-		parts.push(
-			"_(Live: refreshed on every turn_end. This may include tickets created within the last turn. Read-only reference, not a directive.)_",
-		);
-		for (const t of lastNTickets) {
-			parts.push(`- ${t.id} [${t.status}] ${t.title}`);
-		}
 	}
 	return parts.join("\n").trimEnd();
 }

@@ -26,10 +26,10 @@
 //      the dispatch task; it is identified by `userTurnAge === 0`
 //      and protected by the trim policy directly.
 //
-// The `pinned-tier.ts` module owns the pinned content (personality +
-// last-5 tracker tickets) and exposes `buildPinnedMessage()`. The
-// wiring below stamps `userTurnAge` on every message, prepends the
-// pinned message, calls the trim policy, and returns the result.
+// The `pinned-tier.ts` module owns the pinned content (personality)
+// and exposes `buildPinnedMessage()`. The wiring below stamps
+// `userTurnAge` on every message, prepends the pinned message, calls
+// the trim policy, and returns the result.
 //
 // ─── Config (two channels, env wins over file) ────────────────────────
 //
@@ -42,9 +42,7 @@
 //      persistent, filesystem-based channel. This is the channel that
 //      works when pi is launched by systemd (or any non-interactive
 //      supervisor) that does not inherit the operator's shell
-//      environment. An operator who runs the tracker CLI under
-//      systemd puts the tracker path here instead of exporting it in
-//      a shell rc the supervisor never sources.
+//      environment.
 //
 // All file I/O and `process.env` access lives here in the wiring
 // layer; `config.ts` (parse + resolve) and `pinned-tier.ts` stay
@@ -173,15 +171,14 @@ function readConfigFile(path: string | undefined): ReturnType<typeof parseConfig
 /**
  * The default-exported extension function. Registers:
  *   - `session_start` to initialize the pinned-tier caches.
- *   - `turn_end` to refresh the pinned-tier (the last-5 tickets
- *     pointer advances over time).
+ *   - `turn_end` to refresh the pinned-tier.
  *   - `context` to do the three-tier trim on every LLM call.
  *
  * Config is resolved once at load from the config file + env (env
  * wins). To pick up a config-file edit, restart pi. Pinned content
- * is opt-in: when neither `personalityPath` nor `trackerPath`
- * resolves to content, `buildPinnedMessage()` returns `null` and the
- * context handler skips the pinned injection entirely.
+ * is opt-in: when `personalityPath` does not resolve to content,
+ * `buildPinnedMessage()` returns `null` and the context handler skips
+ * the pinned injection entirely.
  *
  * Dispatch protection (exempting the first user message from the
  * trim budget) is controlled by `protectDispatch` in the config:
@@ -197,7 +194,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 
 	const pinnedTier = createPinnedTier({
 		personalityPath: cfg.personalityPath,
-		trackerPath: cfg.trackerPath,
 	});
 
 	// Dispatch-protection resolution. Resolved lazily on the first
@@ -278,8 +274,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			rawMessages.map((m) => ({ role: String(m.role ?? "user") })),
 		);
 		// Build the pinned-tier synthetic (the agent def). Opt-in: may
-		// return `null` when neither personality nor tracker is
-		// configured. Only prepend when there is content to pin.
+		// return `null` when personality is not configured / resolves
+		// empty. Only prepend when there is content to pin.
 		const pinned = pinnedTier.buildPinnedMessage();
 		// Stamp each trimmable message with its source path so the
 		// preserved-paths predicate (pure, in `policy.ts`) can match

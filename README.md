@@ -19,7 +19,7 @@ Subagent protected inputs are **never** counted in the budget, **never** summari
 1. **The agent def / pinned-tier synthetic** — travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option. This protection applies whenever the pinned synthetic is injected (i.e. when at least one pinned surface is configured).
 2. **The dispatch instructions** — the first user message (identified by `userTurnAge === 0`). The trim policy subtracts its tokens from the cap total so a session whose only over-budget contributor is the dispatch does not trigger a trim. **This protection only applies when the `pi-subagents` extension is installed** — the dispatch concept only exists in a subagent session, so a plain parent session leaves the first user prompt treated as ordinary trimmable content. Detection is automatic (see Config); default is ON when pi-subagents is present.
 
-The extension also injects a **pinned-tier message** on every LLM call: the agent's `personality.md` content (when configured) plus a live digest of the last 5 tracker tickets (when a tracker is configured). The injection is reconstructed on every `context` event from the file system (+ the tracker, if configured); it is not persisted in the session file. **Both pinned surfaces are optional and opt-in** — the extension ships no default paths, and when neither is configured the pinned-tier injection is skipped entirely (no empty placeholder is prepended). See Config below.
+The extension also injects a **pinned-tier message** on every LLM call: the agent's `personality.md` content (when configured). The injection is reconstructed on every `context` event from the file system; it is not persisted in the session file. **The pinned surface is optional and opt-in** — the extension ships no default path, and when personality is not configured the pinned-tier injection is skipped entirely (no empty placeholder is prepended). See Config below.
 
 ## Prerequisites
 
@@ -87,14 +87,13 @@ The trim policy's three tier caps live as compile-time constants in `policy.ts` 
 | `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this fall into the drop tier. |
 | `SUMMA_WORDS` | `60` | Word budget for each summa in-place summary. |
 
-The pinned tier exposes two constants in `pinned-tier.ts`:
+The pinned tier exposes one constant in `pinned-tier.ts`:
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `DEFAULT_PINNED_TRACKER_COUNT` | `5` | Number of most-recently-updated tracker tickets injected (when a tracker is configured). Currently only works with Purrly's internal tracker. |
 | `PINNED_CUSTOM_TYPE` | `"context-trimmer-pinned"` | The customType stamp on the synthetic pinned message. |
 
-Neither pinned surface ships a default path. Both the personality file and the tracker CLI are **opt-in** — machine-specific, carrying no defaults. There are two config channels, with a fixed precedence (highest first):
+The personality file is **opt-in** — machine-specific, carrying no default. There are two config channels, with a fixed precedence (highest first):
 
 1. **Environment variables** (`PI_CONTEXT_TRIMMER_*`) — useful for ad-hoc runs, CI, and tests.
 2. **Global config file** `~/.pi/agent/context-trimmer.json` — the persistent, filesystem-based channel. This is the channel to use when pi is launched by a non-interactive supervisor (systemd, launchd, a container orchestrator) that does not inherit your shell environment: put the paths in the JSON file instead of exporting them in a shell rc the supervisor never sources.
@@ -106,7 +105,6 @@ Create `~/.pi/agent/context-trimmer.json`:
 ```json
 {
   "personalityPath": "/absolute/path/to/personality.md",            // falls back to no personality section
-  "trackerPath": "/absolute/path/to/tracker.py",                    // falls back to no tracker section
   "protectDispatch": "auto",                                        // "auto" (default) | true | false
   "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"],             // falls back to no paths preserved
   "tier1MaxTokens": 50000,                                          // falls back to VERBATIM_TIER_MAX_TOKENS
@@ -127,7 +125,6 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | Env var | Effect |
 |---------|--------|
 | `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` | Absolute path to a personality/voice file pinned verbatim on every LLM call. Unset/empty → falls back to the file, then no personality section. |
-| `PI_CONTEXT_TRIMMER_TRACKER_PATH` | Absolute path to a tracker CLI whose last-N ticket digest is pinned. Unset/empty → falls back to the file, then no tracker section. |
 | `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` | `1` forces dispatch protection ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"`. |
 | `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` | Comma-separated list of path patterns whose matching tool-result messages are protected from summary and drop. Bare filenames are fuzzy matches (e.g. `AGENTS.md` matches any AGENTS.md); patterns beginning with `/` or `~/` are absolute matches (e.g. `~/secrets/keys.md` matches that one file). Unset/empty → falls back to the file, then no paths preserved. |
 | `PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS` | Positive finite number; the verbatim-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `VERBATIM_TIER_MAX_TOKENS` (`50_000`). |
@@ -138,7 +135,7 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK` | Positive integer; the hard-block threshold (consecutive identical tool-call turns before the wiring layer strips the tool calls and forces a text-only continuation). Unset → falls back to the file, then off. Values below the soft-nudge threshold are clamped up to the soft-nudge threshold so the hard-block cannot fire before the soft-nudge. |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
-When neither channel resolves a `personalityPath` or `trackerPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
+When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
 
 The summarize callback can be overridden per-call by passing a `summarizer` option to `applyThreeTierTrim` (this is the test seam — production wires `defaultSummaSummarizer`, which is a Python `summa` subprocess). The `defaultSummaSummarizer` exports a diagnostic flag `lastSummarizerFailed` (let-binding) that flips to `true` if the subprocess errors; consumers can read it after a trim call to surface a warning to the user.
 
@@ -165,7 +162,7 @@ Project structure:
 index.ts              # Extension wiring: registers session_start / turn_end / context handlers
 config.ts             # Pure config resolver (parse file + merge env over file)
 policy.ts             # Three-tier trim policy (the trim algorithm)
-pinned-tier.ts        # Pinned content reader (personality + last-N tracker tickets)
+pinned-tier.ts        # Pinned content reader (personality)
 test/policy.test.ts    # Unit tests for the trim policy
 test/config.test.ts    # Unit tests for config resolution (precedence + parsing)
 test/integration.test.ts # End-to-end tests for the context handler wiring

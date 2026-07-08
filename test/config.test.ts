@@ -20,11 +20,9 @@ describe("parseConfigFile", () => {
 	it("extracts well-typed fields", () => {
 		const f = parseConfigFile({
 			personalityPath: "/a/personality.md",
-			trackerPath: "/b/tracker.py",
 			protectDispatch: "auto",
 		});
 		assert.equal(f.personalityPath, "/a/personality.md");
-		assert.equal(f.trackerPath, "/b/tracker.py");
 		assert.equal(f.protectDispatch, "auto");
 	});
 
@@ -40,9 +38,8 @@ describe("parseConfigFile", () => {
 	});
 
 	it("rejects badly-typed values", () => {
-		const f = parseConfigFile({ personalityPath: 42, trackerPath: "", protectDispatch: "maybe" });
+		const f = parseConfigFile({ personalityPath: 42, protectDispatch: "maybe" });
 		assert.equal(f.personalityPath, undefined);
-		assert.equal(f.trackerPath, undefined);
 		assert.equal(f.protectDispatch, undefined);
 	});
 
@@ -57,32 +54,28 @@ describe("resolveConfig — precedence", () => {
 	it("defaults when nothing is configured", () => {
 		const cfg = resolveConfig({});
 		assert.equal(cfg.personalityPath, undefined);
-		assert.equal(cfg.trackerPath, undefined);
 		assert.equal(cfg.protectDispatch, DEFAULT_PROTECT_DISPATCH);
 		assert.equal(cfg.protectDispatch, "auto");
 	});
 
 	it("uses file values when env is absent", () => {
 		const cfg = resolveConfig({
-			file: { personalityPath: "/file/p", trackerPath: "/file/t", protectDispatch: false },
+			file: { personalityPath: "/file/p", protectDispatch: false },
 		});
 		assert.equal(cfg.personalityPath, "/file/p");
-		assert.equal(cfg.trackerPath, "/file/t");
 		assert.equal(cfg.protectDispatch, false);
 	});
 
 	it("env overrides file", () => {
 		const env: EnvRecord = {
 			[ENV.personalityPath]: "/env/p",
-			[ENV.trackerPath]: "/env/t",
 			[ENV.protectDispatch]: "1",
 		};
 		const cfg = resolveConfig({
-			file: { personalityPath: "/file/p", trackerPath: "/file/t", protectDispatch: false },
+			file: { personalityPath: "/file/p", protectDispatch: false },
 			env,
 		});
 		assert.equal(cfg.personalityPath, "/env/p");
-		assert.equal(cfg.trackerPath, "/env/t");
 		assert.equal(cfg.protectDispatch, true);
 	});
 

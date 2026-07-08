@@ -39,8 +39,6 @@ export type LoopGuardMode = boolean;
 export interface ContextTrimmerConfig {
 	/** Absolute path to a personality/voice file pinned verbatim. */
 	readonly personalityPath?: string;
-	/** Absolute path to a tracker CLI whose last-N digest is pinned. */
-	readonly trackerPath?: string;
 	/** Dispatch-protection mode. */
 	readonly protectDispatch: ProtectDispatchMode;
 	/** Optional list of path patterns whose matching tool-result
@@ -96,7 +94,6 @@ export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
  *  the wiring layer and tests reference a single source of truth. */
 export const ENV = {
 	personalityPath: "PI_CONTEXT_TRIMMER_PERSONALITY_PATH",
-	trackerPath: "PI_CONTEXT_TRIMMER_TRACKER_PATH",
 	protectDispatch: "PI_CONTEXT_TRIMMER_PROTECT_DISPATCH",
 	preservedPaths: "PI_CONTEXT_TRIMMER_PRESERVED_PATHS",
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
@@ -117,7 +114,6 @@ export type EnvRecord = Record<string, string | undefined>;
  *  non-readonly fields of `ContextTrimmerConfig` plus `protectDispatch`. */
 export interface ParsedConfigFile {
 	personalityPath?: string;
-	trackerPath?: string;
 	protectDispatch?: ProtectDispatchMode;
 	preservedPaths?: readonly string[];
 	tier1MaxTokens?: number;
@@ -142,9 +138,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	const out: ParsedConfigFile = {};
 	if (typeof o.personalityPath === "string" && o.personalityPath.length > 0) {
 		out.personalityPath = o.personalityPath;
-	}
-	if (typeof o.trackerPath === "string" && o.trackerPath.length > 0) {
-		out.trackerPath = o.trackerPath;
 	}
 	const pd = o.protectDispatch;
 	if (pd === "auto" || pd === true || pd === false) {
@@ -200,8 +193,6 @@ export function resolveConfig(opts: {
 
 	const personalityPath =
 		nonEmpty(env[ENV.personalityPath]) ?? file.personalityPath;
-	const trackerPath =
-		nonEmpty(env[ENV.trackerPath]) ?? file.trackerPath;
 
 	const preservedPaths =
 		parseListEnv(env[ENV.preservedPaths]) ?? file.preservedPaths;
@@ -248,7 +239,6 @@ export function resolveConfig(opts: {
 
 	return {
 		personalityPath,
-		trackerPath,
 		protectDispatch,
 		preservedPaths,
 		tier1MaxTokens,
