@@ -20,8 +20,8 @@ import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.t
 
 // ─── Pinned-tier opt-in fixture ────────────────────────────────────────
 //
-// The pinned synthetic (personality + tracker) and dispatch protection
-// are operator-opted-in via config (env overrides file). The tests use
+// The pinned synthetic (personality) and dispatch protection are
+// operator-opted-in via config (env overrides file). The tests use
 // the `PI_CONTEXT_TRIMMER_*` env vars to opt in, mirroring how an
 // operator enables the surfaces. Tests that exercise the opt-OUT path
 // (no pinned synthetic, no dispatch protection) restore the unset env
@@ -35,7 +35,6 @@ import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.t
 
 let fixtureDir: string;
 let savedPersonalityEnv: string | undefined;
-let savedTrackerEnv: string | undefined;
 let savedProtectEnv: string | undefined;
 let savedConfigPathEnv: string | undefined;
 
@@ -43,16 +42,12 @@ before(() => {
 	fixtureDir = mkdtempSync(join(tmpdir(), "ctx-trimmer-"));
 	writeFileSync(join(fixtureDir, "personality.md"), "test personality substrate\n");
 	savedPersonalityEnv = process.env[CONFIG_ENV.personalityPath];
-	savedTrackerEnv = process.env[CONFIG_ENV.trackerPath];
 	savedProtectEnv = process.env[CONFIG_ENV.protectDispatch];
 	savedConfigPathEnv = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
 	// Point the config file at a non-existent path so the file channel
 	// is empty for every test (env is the only input).
 	process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 	process.env[CONFIG_ENV.personalityPath] = join(fixtureDir, "personality.md");
-	// No tracker configured — the tracker section is omitted; the
-	// pinned synthetic still carries the personality section.
-	delete process.env[CONFIG_ENV.trackerPath];
 	// Dispatch protection ON (simulates pi-subagents being installed).
 	process.env[CONFIG_ENV.protectDispatch] = "1";
 });
@@ -60,7 +55,6 @@ before(() => {
 after(() => {
 	for (const [k, v] of [
 		[CONFIG_ENV.personalityPath, savedPersonalityEnv],
-		[CONFIG_ENV.trackerPath, savedTrackerEnv],
 		[CONFIG_ENV.protectDispatch, savedProtectEnv],
 		["PI_CONTEXT_TRIMMER_CONFIG_PATH", savedConfigPathEnv],
 	] as const) {
@@ -333,7 +327,7 @@ describe("context handler — drop tier with protected slots", () => {
 
 // ─── Opt-out path (no env configured) ─────────────────────────────────
 //
-// When no personality/tracker env is set and the config file is empty,
+// When no personality env is set and the config file is empty,
 // `buildPinnedMessage` returns `null` and the context handler skips the
 // pinned injection entirely. When `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`
 // is unset and no `subagent` tool is registered (the mock pi registers
@@ -343,21 +337,17 @@ describe("context handler — drop tier with protected slots", () => {
 
 describe("context handler — opt-out path (nothing configured)", () => {
 	let sPersonality: string | undefined;
-	let sTracker: string | undefined;
 	let sProtect: string | undefined;
 
 	beforeEach(() => {
 		sPersonality = process.env[CONFIG_ENV.personalityPath];
-		sTracker = process.env[CONFIG_ENV.trackerPath];
 		sProtect = process.env[CONFIG_ENV.protectDispatch];
 		delete process.env[CONFIG_ENV.personalityPath];
-		delete process.env[CONFIG_ENV.trackerPath];
 		delete process.env[CONFIG_ENV.protectDispatch];
 	});
 	afterEach(() => {
 		for (const [k, v] of [
 			[CONFIG_ENV.personalityPath, sPersonality],
-			[CONFIG_ENV.trackerPath, sTracker],
 			[CONFIG_ENV.protectDispatch, sProtect],
 		] as const) {
 			if (v === undefined) delete process.env[k];
