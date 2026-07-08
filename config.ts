@@ -85,6 +85,13 @@ export interface ContextTrimmerConfig {
 	 *  the next context event. When false, the trim path awaits each
 	 *  summarizer call synchronously (legacy behavior). */
 	readonly asyncMode?: boolean;
+	/** Subagent-context pin override. When `undefined` (the default),
+	 *  the wiring layer skips the pinned-tier injection in child/
+	 *  subagent sessions (`PI_SUBAGENT_CHILD=1`); when `true`, the
+	 *  pin is re-enabled despite the child flag; when `false`, the
+	 *  pin is also skipped (an explicit no-op for clarity, identical
+	 *  to leaving it unset). */
+	readonly pinSubagent?: boolean;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -117,6 +124,7 @@ export const ENV = {
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
 	asyncMode: "PI_CONTEXT_TRIMMER_ASYNC_MODE",
+	pinSubagent: "PI_CONTEXT_TRIMMER_PIN_SUBAGENT",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -138,6 +146,7 @@ export interface ParsedConfigFile {
 	loopGuardThreshold?: number;
 	loopGuardHardBlock?: number;
 	asyncMode?: boolean;
+	pinSubagent?: boolean;
 }
 
 /**
@@ -187,6 +196,10 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (o.asyncMode === true || o.asyncMode === false) {
 		out.asyncMode = o.asyncMode;
+	}
+	const ps = o.pinSubagent;
+	if (ps === true || ps === false) {
+		out.pinSubagent = ps;
 	}
 	return out;
 }
@@ -254,6 +267,18 @@ export function resolveConfig(opts: {
 		asyncMode = DEFAULT_ASYNC_MODE;
 	}
 
+	let pinSubagent: boolean | undefined;
+	const envPs = env[ENV.pinSubagent];
+	if (envPs === "1") {
+		pinSubagent = true;
+	} else if (envPs === "0") {
+		pinSubagent = false;
+	} else if (file.pinSubagent === true || file.pinSubagent === false) {
+		pinSubagent = file.pinSubagent;
+	} else {
+		pinSubagent = undefined;
+	}
+
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
 	if (envPd === "1") {
@@ -279,6 +304,7 @@ export function resolveConfig(opts: {
 		loopGuardThreshold,
 		loopGuardHardBlock,
 		asyncMode,
+		pinSubagent,
 	};
 }
 
