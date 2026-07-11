@@ -110,7 +110,7 @@ function pad(text: string, n: number): string {
 async function invokeContext(pi: ReturnType<typeof createMockPi>, event: unknown) {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
-	return handlers[0](event, {});
+	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
 }
 
 // ─── Hook registration ─────────────────────────────────────────────────
@@ -132,6 +132,178 @@ describe("extension wiring", () => {
 		const pi = await loadExtension();
 		const handlers = pi.getHandlers("turn_end");
 		assert.ok(handlers.length > 0, "expected at least one turn_end handler");
+	});
+});
+
+// ─── Status indicator lifecycle (AC-4) ────────────────────────────────
+//
+// The wiring sets a UI status indicator ("Summarizing…") before
+// invoking the trim policy and clears it (to `undefined`) in a
+// `finally` block — the try/finally guarantees the clear fires even
+// on a trim throw. The `ctx?.hasUI` guard skips the UI calls in
+// non-TUI modes (rpc, json, print) and in test mocks that don't
+// advertise a UI surface. The three tests below cover the lifecycle:
+//
+//   (a) Status set/clear with `hasUI: true` — the production TUI
+//       path. A conversation that lands in tier 2 (50k–100k trimmable)
+//       exercises the summarize branch. The set fires unconditionally
+//       before the trim; the clear fires unconditionally in the
+//       `finally` after the trim returns.
+//   (b) `hasUI: false` guard skips all UI calls — the rpc/json/print
+//       path. The handler still returns the trimmed messages; the UI
+//       spy is never invoked.
+//   (c) Small conversation (Tier-1 verbatim) still sets/clears with
+//       `hasUI: true` — documents the unconditional wrap: the status
+//       flashes on Tier-1 too, per the structural-seam decision (the
+//       wrap is a single try/finally around the trim call, not a
+//       tier-conditional check).
+
+describe("status indicator lifecycle", () => {
+	it("sets and clears the status indicator when hasUI is true (tier-2 summarize)", async () => {
+		const pi = await loadExtension();
+		// Build a conversation that lands in tier 2 (trimmable
+		// total between 50k and 100k). Two trimmable assistant
+		// messages of ~30k tokens each = ~60k trimmable total,
+		// above the 50k verbatim cap and below the 100k drop cap.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+		// Spy on setStatus; record every call.
+		const setStatusCalls: Array<[string, string | undefined]> = [];
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setStatus: (name: string, value: string | undefined) => {
+					setStatusCalls.push([name, value]);
+				},
+			},
+		};
+		const handlers = pi.getHandlers("context");
+		assert.ok(handlers.length > 0, "context handler must be registered");
+		const result = (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
+		// The set call: at least one call with
+		// ("context-trimmer", "Summarizing…") fired before the trim.
+		const setCalls = setStatusCalls.filter(
+			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
+		);
+		assert.ok(
+			setCalls.length >= 1,
+			`setStatus must be called at least once with ("context-trimmer", "Summarizing…") before the trim. Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
+		// The clear call: at least one call with
+		// ("context-trimmer", undefined) fired after the trim.
+		const clearCalls = setStatusCalls.filter(
+			([n, v]) => n === "context-trimmer" && v === undefined,
+		);
+		assert.ok(
+			clearCalls.length >= 1,
+			`setStatus must be called at least once with ("context-trimmer", undefined) after the trim. Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
+		// Order: the set call(s) must precede the clear call(s). The
+		// wiring's try/finally guarantees this: the set fires before
+		// the trim, the clear fires after the trim returns.
+		const firstSetIndex = setStatusCalls.findIndex(
+			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
+		);
+		const firstClearIndex = setStatusCalls.findIndex(
+			([n, v]) => n === "context-trimmer" && v === undefined,
+		);
+		assert.ok(
+			firstSetIndex < firstClearIndex,
+			`the set call must precede the clear call (set index ${firstSetIndex}, clear index ${firstClearIndex}). Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
+		// Sanity: the handler returned a non-empty messages array
+		// (the trim ran; the output is the trimmed view).
+		assert.ok(result.messages.length > 0, "handler must return a non-empty messages array");
+	});
+
+	it("skips all UI calls when hasUI is false (the rpc/json/print guard path)", async () => {
+		const pi = await loadExtension();
+		// Same tier-2 fixture as the (a) test — the conversation
+		// lands in the summarize branch, exercising the full trim
+		// path. The guard is the only difference: `hasUI: false`
+		// means the `ctx?.hasUI` short-circuits both UI calls.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+		const setStatusCalls: Array<[string, string | undefined]> = [];
+		const ctx = {
+			hasUI: false,
+			ui: {
+				setStatus: (name: string, value: string | undefined) => {
+					setStatusCalls.push([name, value]);
+				},
+			},
+		};
+		const handlers = pi.getHandlers("context");
+		assert.ok(handlers.length > 0, "context handler must be registered");
+		const result = (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
+		// The guard short-circuits the `if (ctx?.hasUI)` block, so
+		// setStatus is NEVER called. The spy array must be empty.
+		assert.equal(
+			setStatusCalls.length,
+			0,
+			`setStatus must NEVER be called when hasUI is false (the rpc/json/print guard). Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
+		// The handler still returned a non-empty messages array
+		// (the guard is UI-only; the trim path ran end-to-end).
+		assert.ok(result.messages.length > 0, "handler must return a non-empty messages array even with hasUI false");
+	});
+
+	it("sets and clears the status on a small tier-1 conversation with hasUI true (unconditional wrap)", async () => {
+		// A small conversation lands in tier 1 (verbatim, no trim
+		// work). The wiring's try/finally is unconditional — the
+		// set/clear fires on EVERY context event, not just on the
+		// summarize branch. This test documents that behavior: the
+		// status flashes briefly on tier-1 too, then clears. The
+		// wrap is a structural seam (single try/finally around the
+		// trim call), not a tier-conditional check. A future change
+		// to gate the wrap on tier-2+ would be a follow-up ticket,
+		// not a silent regression in this test.
+		const pi = await loadExtension();
+		const event = {
+			messages: [userMsg("dispatch"), assistantMsg("hi")],
+		};
+		const setStatusCalls: Array<[string, string | undefined]> = [];
+		const ctx = {
+			hasUI: true,
+			ui: {
+				setStatus: (name: string, value: string | undefined) => {
+					setStatusCalls.push([name, value]);
+				},
+			},
+		};
+		const handlers = pi.getHandlers("context");
+		assert.ok(handlers.length > 0, "context handler must be registered");
+		await handlers[0](event, ctx);
+		// The set call fired (unconditional, before the trim).
+		const setCalls = setStatusCalls.filter(
+			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
+		);
+		assert.ok(
+			setCalls.length >= 1,
+			`setStatus must be called at least once with ("context-trimmer", "Summarizing…") on a tier-1 conversation (unconditional wrap). Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
+		// The clear call fired (unconditional, in the finally).
+		const clearCalls = setStatusCalls.filter(
+			([n, v]) => n === "context-trimmer" && v === undefined,
+		);
+		assert.ok(
+			clearCalls.length >= 1,
+			`setStatus must be called at least once with ("context-trimmer", undefined) on a tier-1 conversation (unconditional wrap). Calls: ${JSON.stringify(setStatusCalls)}`,
+		);
 	});
 });
 
@@ -1372,7 +1544,7 @@ async function fireContextWithCtx(
 ): Promise<unknown> {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
-	return handlers[0](event, {});
+	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
 }
 
 describe("persistence seam — appendEntry records summary state (AC-8 a)", () => {
