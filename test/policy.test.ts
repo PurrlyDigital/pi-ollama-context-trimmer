@@ -23,6 +23,8 @@ import {
 	LOOP_GUARD_BLOCK_TEXT,
 	isPathPreserved,
 	isProtectedSlot,
+	isAlreadySummarized,
+	messageFingerprint,
 	totalTrimmableTokens,
 	VERBATIM_TIER_MAX_TOKENS,
 	SUMMARIZE_TIER_MAX_TOKENS,
@@ -1589,6 +1591,386 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.ok(LOOP_GUARD_BLOCK_TEXT.length > 0);
 		assert.ok(/blocked/i.test(LOOP_GUARD_BLOCK_TEXT), "block must name the block action");
 		assert.ok(/reasoning in text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed by text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed via text/i.test(LOOP_GUARD_BLOCK_TEXT), "block must route the model to text-only reasoning");
+	});
+});
+
+// ─── Skip detection, escape clause, and fingerprint tests ──────────────
+//
+// Three pure functions added to `policy.ts`:
+//   - `isAlreadySummarized(msg)` — envelope-detection predicate.
+//   - `messageFingerprint(msg)` — first-200-chars extractor.
+//   - The `alreadySummarizedHashes` option threaded through
+//     `TrimOptions` → `summarizeOldestUntilUnder` → `findOldestSummarizable`.
+//
+// Behavior under test:
+//   - The skip-by-envelope branch lifts an already-summarized message
+//     out of the candidates list when a non-summarized alternative
+//     exists (cases a, c, e).
+//   - The escape clause fires when every trimmable candidate is
+//     already-summarized AND the trimmable total is still over the
+//     verbatim cap — the policy re-summarizes the oldest candidate
+//     rather than blocking progress (case b).
+//   - The fingerprint set is honored even when no envelope is present
+//     on the message (case d), and `summarizedFingerprints` records
+//     the original (pre-replacement) fingerprints.
+//   - The within-pass cursor advances past the most recent
+//     summarization so the loop does not infinite-loop on a message
+//     whose replacement content is still the oldest candidate (case e).
+
+/** Build a `role: "assistant"` message whose content is the summa envelope. */
+function summarizedAssistantMsg(originalTokens: number, summaryTokens: number, summaryText: string): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: [
+			{
+				type: "text",
+				text: `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]\n${summaryText}`,
+			},
+		],
+	};
+}
+
+describe("isAlreadySummarized", () => {
+	it("returns true for an array content whose first text block starts with the summa envelope", () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "[summa: ~100 tokens originally → ~20 tokens summary]\nshort summary" },
+			],
+		};
+		assert.equal(isAlreadySummarized(msg), true);
+	});
+
+	it("returns true even when the envelope tag is followed by a long summary body", () => {
+		const msg: TrimmableMessage = {
+			role: "toolResult",
+			content: [
+				{ type: "text", text: "[summa: ~50000 tokens originally → ~1000 tokens summary]\n" + "x".repeat(4000) },
+			],
+		};
+		assert.equal(isAlreadySummarized(msg), true);
+	});
+
+	it("returns false for an array content whose first text block is plain text", () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "hello, this is a regular assistant turn" }],
+		};
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+
+	it("returns false for an array content whose first text block starts with a different bracket tag", () => {
+		// Other bracket-leading strings (e.g. a hypothetical "[note:" tag) are
+		// not the summa envelope; the predicate must reject them.
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "[note: this is something else entirely]\nbody" }],
+		};
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+
+	it("returns false for a string content (the envelope only lives in array text blocks)", () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: "[summa: ~100 tokens originally → ~20 tokens summary]\nsummary text",
+		};
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+
+	it("returns false for an empty string content", () => {
+		const msg: TrimmableMessage = { role: "user", content: "" };
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+
+	it("returns false for an empty array content", () => {
+		const msg: TrimmableMessage = { role: "assistant", content: [] };
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+
+	it("returns false for an array content whose first block is not a text block", () => {
+		// A non-text block first (e.g. a toolCall) is not the envelope
+		// carrier; the envelope lives in `{ type: "text" }` blocks.
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", name: "search", arguments: { q: "x" } }],
+		};
+		assert.equal(isAlreadySummarized(msg), false);
+	});
+});
+
+describe("messageFingerprint", () => {
+	it("returns the first 200 chars of a string content", () => {
+		const longText = "a".repeat(500);
+		const msg: TrimmableMessage = { role: "user", content: longText };
+		assert.equal(messageFingerprint(msg), "a".repeat(200));
+	});
+
+	it("returns the full string when shorter than 200 chars", () => {
+		const msg: TrimmableMessage = { role: "user", content: "short" };
+		assert.equal(messageFingerprint(msg), "short");
+	});
+
+	it("returns the first 200 chars of the first text block for array content", () => {
+		const longText = "b".repeat(500);
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [
+				{ type: "text", text: longText },
+				{ type: "text", text: "second block (ignored after the first)" },
+			],
+		};
+		assert.equal(messageFingerprint(msg), "b".repeat(200));
+	});
+
+	it("returns an empty string for array content with no text blocks", () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "toolCall", name: "search", arguments: { q: "x" } }],
+		};
+		assert.equal(messageFingerprint(msg), "");
+	});
+
+	it("returns an empty string for an empty string content", () => {
+		const msg: TrimmableMessage = { role: "user", content: "" };
+		assert.equal(messageFingerprint(msg), "");
+	});
+
+	it("returns exactly 200 chars for content longer than 200 chars (not 201, not 199)", () => {
+		const longText = "x".repeat(250);
+		const msg: TrimmableMessage = { role: "user", content: longText };
+		const fp = messageFingerprint(msg);
+		assert.equal(fp.length, 200);
+		assert.equal(fp, "x".repeat(200));
+	});
+
+	it("returns the same fingerprint for two messages whose first 200 chars are identical", () => {
+		const base = "c".repeat(200);
+		const msg1: TrimmableMessage = { role: "user", content: base + "trailing" };
+		const msg2: TrimmableMessage = { role: "user", content: base + "different trailing" };
+		assert.equal(messageFingerprint(msg1), messageFingerprint(msg2));
+	});
+
+	it("returns different fingerprints for two messages whose first 200 chars differ", () => {
+		const msg1: TrimmableMessage = { role: "user", content: "d".repeat(200) + "trailing" };
+		const msg2: TrimmableMessage = { role: "user", content: "e".repeat(200) + "trailing" };
+		assert.notEqual(messageFingerprint(msg1), messageFingerprint(msg2));
+	});
+});
+
+describe("applyThreeTierTrim — skip already-summarized by envelope (case a)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("skips a message whose content carries the summa envelope and summarizes a non-summarized message instead", () => {
+		// Two trimmable messages: one already-summarized (carries the
+		// envelope) and one fresh. Set `verbatimMaxTokens` so the
+		// fresh message's mass forces a summarize pass; the
+		// already-summarized message must be left alone.
+		const alreadySummarized = summarizedAssistantMsg(20_000, 50, "preexisting summary body");
+		const fresh = assistantMsg("f".repeat(30_000 * 4));
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), alreadySummarized, fresh];
+		// The fresh message is 30,000 tokens; the already-summarized
+		// message is ~25 tokens. Total = 30,025. Setting
+		// verbatimMaxTokens to 25,000 puts the total OVER the cap so
+		// the tier-2 summarize path fires.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: 25_000,
+		});
+		// (i) At least one summarize fired on the fresh message.
+		assert.ok(result.summarized >= 1, "at least one non-summarized message should be summarized");
+		// (ii) The already-summarized message's content is unchanged
+		// in the returned array (its position is preserved; its
+		// content is the original envelope, not a re-summary).
+		const survivor = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content),
+		);
+		assert.ok(survivor, "the already-summarized message survives the trim");
+		const survivorText = (survivor!.content as Array<{ type: string; text: string }>)[0].text;
+		assert.ok(survivorText.startsWith("[summa: ~"), "the survivor still carries the summa envelope");
+		assert.ok(survivorText.includes("preexisting summary body"), "the survivor's original summary body is preserved (not re-summarized)");
+		// (iii) The fresh message was rewritten (its 'f'.repeat(...) string
+		// content is gone — the summarize path replaced it).
+		const rewrittenAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("[summa:"),
+			) && m !== survivor,
+		);
+		assert.ok(rewrittenAssistant, "the fresh message was rewritten with a summa envelope");
+	});
+});
+
+describe("applyThreeTierTrim — escape clause when only summarized candidates remain (case b)", () => {
+	it("re-summarizes an already-summarized candidate when the total is still over the verbatim cap", () => {
+		// Two trimmable messages, BOTH already-summarized with LARGE
+		// summaries (the summaries themselves are big — 3000 chars /
+		// 4 = 750 tokens each, ×2 = 1500 tokens). Set `verbatimMax`
+		// to 1000 so the total (1500) is still over the cap. With the
+		// skip flag ON, both candidates are skipped and `findOldest`
+		// returns -1; the escape clause retries with the skip flag
+		// OFF and re-summarizes the first message. The new summary
+		// shrinks the total under the cap and the loop exits.
+		const summarized1: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "[summa: ~20000 tokens originally → ~3000 tokens summary]\n" + "s".repeat(3000) }],
+		};
+		const summarized2: TrimmableMessage = {
+			role: "toolResult",
+			content: [{ type: "text", text: "[summa: ~20000 tokens originally → ~3000 tokens summary]\n" + "s".repeat(3000) }],
+		};
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), summarized1, summarized2];
+		// A summarizer that returns a small fixed string — the
+		// post-replacement content is much smaller than the original.
+		const result = applyThreeTierTrim(messages, {
+			summarizer: () => "x".repeat(20),
+			verbatimMaxTokens: 1000,
+		});
+		// The escape clause fired: at least one message was re-summarized.
+		assert.ok(result.summarized >= 1, "the escape clause must re-summarize when only summarized candidates remain and the total is over the cap");
+		// The post-trim total is now at or below the verbatim cap.
+		assert.ok(totalTrimmableTokens(result.messages) <= 1000, "the total is brought under the verbatim cap after the escape clause");
+		// `summarizedFingerprints` records the re-summarized message's
+		// ORIGINAL fingerprint (the pre-replacement envelope header).
+		assert.ok(result.summarizedFingerprints.length >= 1, "summarizedFingerprints is populated");
+		// Every recorded fingerprint is a non-empty string (a
+		// pre-replacement envelope header is at least the envelope tag
+		// itself, which is well over 0 chars).
+		for (const fp of result.summarizedFingerprints) {
+			assert.ok(fp.length > 0, "every recorded fingerprint is non-empty");
+		}
+	});
+});
+
+describe("applyThreeTierTrim — does not re-summarize already-summarized when total is under cap (case c)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("leaves an already-summarized message untouched when a non-summarized alternative covers the budget", () => {
+		// One already-summarized trimmable message (small) + one fresh
+		// trimmable message. The fresh message, once summarized by the
+		// stub (which returns "summary"), shrinks the total under the
+		// verbatim cap. The already-summarized message must NOT be
+		// re-summarized.
+		const alreadySummarized = summarizedAssistantMsg(5_000, 20, "small preexisting summary");
+		const fresh = assistantMsg("g".repeat(20_000 * 4));
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), alreadySummarized, fresh];
+		// The fresh message is 20,000 tokens; the already-summarized
+		// is ~20 tokens. Total = 20,020. Setting verbatimMaxTokens
+		// to 15,000 puts the total OVER the cap, so the tier-2
+		// summarize path fires. The stub returns "summary" (7 chars
+		// / 4 = 2 tokens) — summarizing the fresh message alone
+		// brings the total to 22, well under 15,000, so exactly
+		// one summarize fires.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: 15_000,
+		});
+		// (i) Exactly one summary fired — on the fresh message.
+		assert.equal(result.summarized, 1, "exactly one summarize fires (on the fresh message)");
+		// (ii) The already-summarized message's content is unchanged.
+		const survivor = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("small preexisting summary"),
+			),
+		);
+		assert.ok(survivor, "the already-summarized message is preserved verbatim");
+		// (iii) The fresh message was rewritten (its 'g'.repeat(...)
+		// string content is gone — the summarize path replaced it
+		// with a summa envelope).
+		const rewritten = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa: ~") && !b.text.includes("small preexisting summary"),
+			),
+		);
+		assert.ok(rewritten, "the fresh message was rewritten with a summa envelope");
+	});
+});
+
+describe("applyThreeTierTrim — alreadySummarizedHashes threads through TrimOptions (case d)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("skips a message whose fingerprint is in alreadySummarizedHashes and summarizes a different message", () => {
+		// Two fresh trimmable messages, neither carrying the envelope.
+		// Pass `alreadySummarizedHashes` containing the fingerprint of
+		// the FIRST trimmable message. The skip branch must lift that
+		// message out of the candidates list and the policy
+		// summarizes the second one instead.
+		const firstContent = "h".repeat(15_000 * 4);
+		const secondContent = "i".repeat(15_000 * 4);
+		const first = assistantMsg(firstContent);
+		const second = assistantMsg(secondContent);
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), first, second];
+		// Each trimmable message is 15,000 tokens; total trimmable
+		// is 30,000. Setting verbatimMaxTokens to 25,000 puts the
+		// total OVER the cap, so the tier-2 summarize path fires.
+		// The fingerprint of `first` is the first 200 chars of its
+		// string content. Build the set directly.
+		const firstFp = messageFingerprint(first);
+		const alreadySummarizedHashes = new Set<string>([firstFp]);
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			alreadySummarizedHashes,
+			verbatimMaxTokens: 25_000,
+		});
+		// (i) At least one summary fired.
+		assert.ok(result.summarized >= 1, "at least one message was summarized");
+		// (ii) The first message's content is unchanged (it was in the
+		// skip set; it was NOT re-summarized).
+		const firstSurvivor = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string) === firstContent,
+		);
+		assert.ok(firstSurvivor, "the first message's content is preserved verbatim (skipped via fingerprint)");
+		// (iii) The second message was rewritten.
+		const secondRewritten = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa: ~"),
+			),
+		);
+		assert.ok(secondRewritten, "the second message was rewritten with a summa envelope");
+		// (iv) `summarizedFingerprints` contains the fingerprint of the
+		// SECOND message (the one that was actually summarized), NOT
+		// the first's fingerprint (which was in the skip set).
+		const secondFp = messageFingerprint(second);
+		assert.ok(result.summarizedFingerprints.includes(secondFp), "summarizedFingerprints contains the fingerprint of the actually-summarized message");
+		assert.ok(!result.summarizedFingerprints.includes(firstFp), "summarizedFingerprints does NOT contain the fingerprint of the skipped message");
+	});
+});
+
+describe("applyThreeTierTrim — within-pass cursor does not infinite-loop (case e)", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("terminates with the already-summarized oldest message untouched and a younger message summarized", () => {
+		// The oldest trimmable message already carries the summa
+		// envelope. The verbatim cap is set so a younger fresh
+		// trimmable message must be summarized. The cursor must
+		// advance past the youngest-summarized message so the loop
+		// terminates — the already-summarized oldest message is NOT
+		// re-picked.
+		const oldestAlreadySummarized = summarizedAssistantMsg(5_000, 20, "oldest preexisting summary");
+		const younger = assistantMsg("j".repeat(20_000 * 4));
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), oldestAlreadySummarized, younger];
+		// The function MUST return (no infinite loop). The single
+		// summarize pass on `younger` shrinks the total under the
+		// cap; the loop exits cleanly.
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: 5_000,
+		});
+		// (i) The function returned (the call resolved).
+		assert.ok(result, "the trim function returns (no infinite loop)");
+		// (ii) The already-summarized oldest message is preserved.
+		const survivor = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.includes("oldest preexisting summary"),
+			),
+		);
+		assert.ok(survivor, "the already-summarized oldest message is preserved verbatim");
+		// (iii) The younger non-summarized message was summarized.
+		assert.ok(result.summarized >= 1, "the younger non-summarized message was summarized");
+		const rewritten = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa: ~") && !b.text.includes("oldest preexisting summary"),
+			),
+		);
+		assert.ok(rewritten, "the younger non-summarized message was rewritten with a summa envelope");
 	});
 });
 
