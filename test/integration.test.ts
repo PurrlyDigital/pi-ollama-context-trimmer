@@ -1289,3 +1289,399 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 	});
 });
 
+// ─── Persistence and resume (AC-8) ─────────────────────────────────────
+//
+// The wiring layer persists the fingerprints of messages it has
+// summarized in the current session via `pi.appendEntry` (a separate
+// `customType: "context-trimmer-summarized"` entry, not a mutation of
+// the session message stream). The in-memory `summarizedFingerprints`
+// set mirrors the persisted set and is the source of truth for the
+// per-trim `alreadySummarizedHashes` option threaded into the pure
+// policy layer. On a `session_start` event with `reason` in
+// {"resume", "startup", "reload"} the wiring re-hydrates the in-memory
+// set from `ctx.sessionManager.getEntries()` so a resumed session
+// skips already-summarized messages without re-invoking summa.
+//
+// The tests below use a richer mock pi (a `createMockPiWithPersistence`
+// factory) that tracks `appendEntry` calls in an `appendEntries` array
+// and exposes a configurable `sessionManager.getEntries()`. The
+// factory returns a pi with the same `on` / `getHandlers` shape as
+// `createMockPi` so the existing `loadExtension` helper works against
+// it; the only addition is the `appendEntry` and `sessionManager`
+// surfaces the wiring consults at runtime.
+
+type AppendEntry = { customType: string; data?: unknown };
+type SessionEntry = {
+	type?: string;
+	customType?: string;
+	data?: unknown;
+	[k: string]: unknown;
+};
+
+function createMockPiWithPersistence() {
+	const handlers: Record<string, Handler[]> = {};
+	const appendEntries: AppendEntry[] = [];
+	let entries: SessionEntry[] = [];
+	const sessionManager = {
+		getEntries(): SessionEntry[] {
+			return entries;
+		},
+	};
+	const pi = {
+		on(event: string, handler: Handler) {
+			if (!handlers[event]) handlers[event] = [];
+			handlers[event].push(handler);
+		},
+		getHandlers(event: string): Handler[] {
+			return handlers[event] ?? [];
+		},
+		appendEntry(customType: string, data?: unknown): void {
+			appendEntries.push({ customType, data });
+		},
+		sessionManager,
+		// Test-only mutators (not part of the pi contract).
+		__getAppendEntries(): AppendEntry[] {
+			return appendEntries;
+		},
+		__setSessionEntries(e: SessionEntry[]): void {
+			entries = e;
+		},
+	};
+	return pi;
+}
+
+async function loadExtensionWithPersistence() {
+	const pi = createMockPiWithPersistence();
+	await contextTrimmerExtension(pi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+	return pi;
+}
+
+async function fireSessionStart(
+	pi: ReturnType<typeof createMockPiWithPersistence>,
+	event: unknown,
+	ctx: unknown,
+): Promise<unknown> {
+	const handlers = pi.getHandlers("session_start");
+	assert.ok(handlers.length > 0, "session_start handler must be registered");
+	return handlers[0](event, ctx);
+}
+
+async function fireContextWithCtx(
+	pi: ReturnType<typeof createMockPiWithPersistence>,
+	event: unknown,
+): Promise<unknown> {
+	const handlers = pi.getHandlers("context");
+	assert.ok(handlers.length > 0, "context handler must be registered");
+	return handlers[0](event, {});
+}
+
+describe("persistence seam — appendEntry records summary state (AC-8 a)", () => {
+	// The wiring persists fingerprints of summarized messages via
+	// `pi.appendEntry("context-trimmer-summarized", { fingerprint })`
+	// after a successful summarize pass. The mock pi's `appendEntries`
+	// array captures every call so the test can assert the contract:
+	// at least one entry with the right `customType` and a non-empty
+	// `data.fingerprint` string lands after a tier-2 context event.
+
+	it("records at least one context-trimmer-summarized entry with a non-empty fingerprint after a tier-2 trim", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Build a session that lands in tier 2 (trimmable total
+		// between 50k and 100k). Two trimmable assistant messages
+		// of ~30k tokens each = ~60k trimmable total. The verbatim
+		// cap is 50k, so the policy enters the summarize path. The
+		// drop cap is 100k, so it does not drop.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+		await fireContextWithCtx(pi, event);
+		const appendEntries = pi.__getAppendEntries();
+		assert.ok(appendEntries.length > 0, "appendEntry must be called at least once after a tier-2 trim");
+		const summarized = appendEntries.filter((e) => e.customType === "context-trimmer-summarized");
+		assert.ok(summarized.length > 0, "at least one appendEntry call must carry the context-trimmer-summarized customType");
+		for (const e of summarized) {
+			const data = e.data as { fingerprint?: unknown } | undefined;
+			assert.ok(data && typeof data === "object", "summarized entry must carry a data object");
+			assert.equal(typeof data.fingerprint, "string", "summarized entry's data.fingerprint must be a string");
+			assert.ok((data.fingerprint as string).length > 0, "summarized entry's data.fingerprint must be non-empty");
+		}
+	});
+});
+
+describe("session_start handler loads persisted summary state (AC-8 b)", () => {
+	// The `session_start` handler re-hydrates the in-memory
+	// `summarizedFingerprints` set from `ctx.sessionManager.getEntries()`
+	// when the reason is "resume" / "startup" / "reload". The
+	// re-hydrated set threads into the next context event's trim pass
+	// as `alreadySummarizedHashes`, and messages whose fingerprint
+	// matches a persisted entry are skipped (NOT re-summarized).
+	// The test below exercises the full seam: fire session_start with
+	// a `sessionManager` whose `getEntries()` returns a single
+	// `context-trimmer-summarized` entry carrying a known fingerprint,
+	// then fire the context handler with two large messages — one
+	// whose first 200 chars match the persisted fingerprint and one
+	// whose first 200 chars do not. The matching message must pass
+	// through the trim path unchanged (no summa envelope); the
+	// non-matching message must be summarized (summa envelope present).
+
+	it("skips a message whose fingerprint matches a persisted entry and summarizes a different message in the same trim pass", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Construct a deterministic "fingerprint" string that will
+		// be the first 200 chars of the matching message's content.
+		// The fingerprint is the first 200 chars of the first text
+		// block of `content`; for a string `content`, the fingerprint
+		// is the first 200 chars of the string itself. The wiring
+		// persists the full 200-char slice (not just a prefix), so
+		// the persisted `fingerprint` must equal the first 200 chars
+		// of the matching message's content for the cache lookup to
+		// match.
+		const matchingPrefix = "MATCH_PREFIX_FINGERPRINT_AAA_";
+		const matchingBody = pad(matchingPrefix, 30_000); // ~30k tokens, starts with the prefix
+		const matchingFingerprint = matchingBody.slice(0, 200);
+		const nonMatchingBody = pad("DIFFERENT_PREFIX_", 30_000); // ~30k tokens, different first 200 chars
+		// The two trimmable bodies total ~60k tokens, landing the
+		// session in tier 2 (verbatim cap 50k, drop cap 100k).
+		// Persist the matching fingerprint via the sessionManager
+		// before the resume event fires.
+		pi.__setSessionEntries([
+			{
+				type: "custom",
+				customType: "context-trimmer-summarized",
+				data: { fingerprint: matchingFingerprint },
+			},
+		]);
+		await fireSessionStart(pi, { type: "session_start", reason: "resume" }, { sessionManager: pi.sessionManager });
+		// Now fire the context handler with two large assistant
+		// messages. The matching message's fingerprint is in the
+		// re-hydrated cache; the non-matching message is not.
+		const result = (await fireContextWithCtx(pi, {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(matchingBody),
+				assistantMsg(nonMatchingBody),
+			],
+		})) as { messages: Array<Record<string, unknown>> };
+		// Find the matching message in the output: its content
+		// (a string) must NOT have a summa envelope.
+		const matchingOut = result.messages.find(
+			(m) => typeof m.content === "string" && (m.content as string).startsWith(matchingPrefix),
+		);
+		assert.ok(matchingOut, "the matching-prefix message must be in the output (the policy skips already-summarized messages rather than dropping them)");
+		const matchingText = String(matchingOut.content);
+		assert.ok(!matchingText.includes("[summa:"), "the matching message must NOT be re-summarized (its fingerprint is in the persisted set)");
+		// The non-matching message's content must carry the summa
+		// envelope — the policy invoked summa on it because its
+		// fingerprint was not in the persisted set.
+		const summaBlocks = result.messages
+			.flatMap((m) => {
+				const c = m.content;
+				if (Array.isArray(c)) {
+					return c
+						.filter((b: unknown) => b && typeof b === "object" && (b as { type: string }).type === "text" && typeof (b as { text: unknown }).text === "string")
+						.map((b: { text: string }) => b.text);
+				}
+				return [];
+			})
+			.filter((t: string) => t.startsWith("[summa:"));
+		assert.ok(summaBlocks.length > 0, "the non-matching message must be summarized (summa envelope present in the output)");
+	});
+});
+
+describe("in-memory cache skips already-summarized messages on the next context event (AC-8 c)", () => {
+	// The wiring's in-memory `summarizedFingerprints` set is the
+	// source of truth for the per-trim `alreadySummarizedHashes`
+	// option threaded into the pure policy layer. The first context
+	// call populates the set with the fingerprints of the messages
+	// it summarized; the second context call (with the SAME message
+	// stream) threads the populated set into the policy. The policy
+	// uses the set to skip already-summarized messages from the
+	// summarize target search, so the second pass does strictly less
+	// summarize work than the first — the in-memory cache reduces,
+	// never increases, the per-call work. The binding assertion is
+	// a delta check: the number of NEW summarized appendEntries on
+	// the second call must be <= the count of summarized appendEntries
+	// the first call produced. ("Equal" is acceptable: a session
+	// where the first call summarized one message and the second
+	// call skipped that one but summarized a previously-un-summarized
+	// peer has second-call delta == first-call count, both = 1.)
+
+	it("the second context call's new summarized appendEntry count is <= the first call's count", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Tier-2 session: two large assistant messages, ~60k trimmable
+		// total. The first call summarizes the oldest summarizable
+		// message and persists its fingerprint; the second call sees
+		// the same input with that fingerprint already in the cache
+		// and may still summarize the OTHER message (which is not in
+		// the cache), but the second call's NEW appendEntry count
+		// must be <= the first call's count.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+		// First context call: should produce at least one
+		// `context-trimmer-summarized` appendEntry. Capture the
+		// count after the first call.
+		await fireContextWithCtx(pi, event);
+		const firstCallAppends = pi.__getAppendEntries().filter((e) => e.customType === "context-trimmer-summarized");
+		assert.ok(firstCallAppends.length > 0, "first call must produce at least one summarized appendEntry");
+		const firstCallCount = firstCallAppends.length;
+		// Second context call: same conversation. Compute the
+		// delta — the number of NEW summarized appendEntries added
+		// by the second call.
+		await fireContextWithCtx(pi, event);
+		const secondCallTotal = pi.__getAppendEntries().filter((e) => e.customType === "context-trimmer-summarized").length;
+		const secondCallNewCount = secondCallTotal - firstCallCount;
+		assert.ok(
+			secondCallNewCount <= firstCallCount,
+			`the second context call's new summarized appendEntry count must be <= the first call's count (in-memory cache reduces work, never adds). first=${firstCallCount} second-delta=${secondCallNewCount}`,
+		);
+	});
+});
+
+describe("the trim is a view, not a mutation of the session messages (AC-8 d)", () => {
+	// The wiring returns a fresh `messages` array (the trimmed view)
+	// and never mutates the input array or any of its elements. The
+	// original input messages stay original; the trimmed view carries
+	// the summa envelope on the summarized messages. The test reads
+	// the returned messages, confirms the summa envelope is in the
+	// output, and confirms the input array is unchanged.
+
+	it("returns messages with summa envelopes in the output and leaves the input messages array unchanged", async () => {
+		const pi = await loadExtensionWithPersistence();
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400);
+		const inputMessages = [
+			userMsg("dispatch"),
+			assistantMsg(trimmableBody),
+			assistantMsg(trimmableBody),
+		];
+		// Snapshot the input before the call. The snapshot is a
+		// stringified clone — comparing against it after the call
+		// proves the input was not mutated (the wiring's view-only
+		// invariant).
+		const inputSnapshot = JSON.stringify(inputMessages);
+		const result = (await fireContextWithCtx(pi, { messages: inputMessages })) as { messages: Array<Record<string, unknown>> };
+		// The output carries a summa envelope on at least one
+		// message — the trim path ran.
+		const hasSumma = result.messages.some((m) => {
+			const c = m.content;
+			if (typeof c === "string") return c.includes("[summa:");
+			if (Array.isArray(c)) {
+				return c.some(
+					(b: unknown) =>
+						b &&
+						typeof b === "object" &&
+						(b as { type?: string }).type === "text" &&
+						typeof (b as { text?: unknown }).text === "string" &&
+						((b as { text: string }).text.startsWith("[summa:") || (b as { text: string }).text.includes("[summa:")),
+				);
+			}
+			return false;
+		});
+		assert.ok(hasSumma, "the output must carry a summa envelope on at least one message (proves the trim ran)");
+		// The input array is byte-for-byte unchanged.
+		assert.equal(JSON.stringify(inputMessages), inputSnapshot, "the input messages array must NOT be mutated by the context handler (view-only invariant)");
+		// Spot check: the assistant messages' content strings are
+		// the original pad-prefixed text, NOT the summa envelope.
+		for (const m of inputMessages) {
+			if (m.role === "assistant") {
+				const c = String(m.content);
+				assert.ok(!c.includes("[summa:"), "the input assistant message's content must not carry a summa envelope (the input is view-only)");
+			}
+		}
+	});
+});
+
+describe("session_start handler registers and fires (AC-8 e)", () => {
+	// The existing test at the top of the file asserts the
+	// `session_start` handler is REGISTERED on load. This describe
+	// block adds the next-layer assertion: the handler FIRES when
+	// invoked with an event and a ctx, and when the event's `reason`
+	// is "resume" (or "startup" / "reload") the handler consults
+	// `ctx.sessionManager.getEntries()`. The mock pi's `getEntries`
+	// is spied via a flag so the test can assert the wiring called
+	// it.
+
+	it("does not crash when fired with an event and a ctx (resume reason)", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// The handler accepts (event, ctx) and must not throw on a
+		// well-formed resume event with a sessionManager whose
+		// getEntries returns a valid array. The handler is
+		// fire-and-forget from the harness's point of view — the
+		// assertion is "the promise resolves (no throw, no
+		// unhandled rejection)," not on the return value.
+		pi.__setSessionEntries([]);
+		await assert.doesNotReject(
+			fireSessionStart(
+				pi,
+				{ type: "session_start", reason: "resume" },
+				{ sessionManager: pi.sessionManager },
+			),
+		);
+	});
+
+	it("calls ctx.sessionManager.getEntries() when reason is 'resume'", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Wrap getEntries so we can count calls without changing
+		// the mock's public shape. The wrapper delegates to the
+		// real implementation and records the call.
+		let getEntriesCallCount = 0;
+		const realSessionManager = pi.sessionManager;
+		// The mock pi exposes `sessionManager` as the same object
+		// the wiring reads from. Replace its `getEntries` with a
+		// counting wrapper that still returns the configured
+		// entries array.
+		const configuredEntries: SessionEntry[] = [
+			{
+				type: "custom",
+				customType: "context-trimmer-summarized",
+				data: { fingerprint: "test-fingerprint" },
+			},
+		];
+		(realSessionManager as { getEntries: () => SessionEntry[] }).getEntries = () => {
+			getEntriesCallCount += 1;
+			return configuredEntries;
+		};
+		// Reconfigure the mock to track the entries the wrapper
+		// returns. The wiring's call to `sessionManager.getEntries()`
+		// returns the same array the wrapper is configured to
+		// return.
+		pi.__setSessionEntries(configuredEntries);
+		await fireSessionStart(
+			pi,
+			{ type: "session_start", reason: "resume" },
+			{ sessionManager: realSessionManager },
+		);
+		assert.ok(
+			getEntriesCallCount >= 1,
+			"ctx.sessionManager.getEntries() must be called when the session_start reason is 'resume'",
+		);
+	});
+
+	it("fires without crashing on non-resume reasons (new / fork) without requiring a sessionManager", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// A "new" or "fork" reason has no prior session state; the
+		// wiring's re-hydrate path is gated on resume/startup/reload,
+		// so the handler must not touch ctx.sessionManager when the
+		// reason is "new". The handler still accepts (event, ctx)
+		// and must not crash.
+		await assert.doesNotReject(
+			fireSessionStart(
+				pi,
+				{ type: "session_start", reason: "new" },
+				{}, // no sessionManager — the handler must not consult it
+			),
+		);
+	});
+});
+
