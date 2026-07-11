@@ -79,6 +79,12 @@ export interface ContextTrimmerConfig {
 	 *  integer; the wiring layer coerces with `Math.trunc` (summaWords
 	 *  precedent). Overrides the policy default when set. */
 	readonly loopGuardHardBlock?: number;
+	/** Whether background (non-blocking) summarization is enabled.
+	 *  When true (default), the trim path fires summarizer promises in
+	 *  the background and returns immediately, caching the results for
+	 *  the next context event. When false, the trim path awaits each
+	 *  summarizer call synchronously (legacy behavior). */
+	readonly asyncMode?: boolean;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -89,6 +95,12 @@ export const DEFAULT_PROTECT_DISPATCH: ProtectDispatchMode = "auto";
  *  dropped because behavioral-loop detection is the same concern
  *  whether the model is in a parent or a subagent session. */
 export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
+
+/** Default async mode: ON (non-blocking summarization). Backgrounding
+ *  is the default; operators who need legacy synchronous behavior opt
+ *  out with `false` (env `PI_CONTEXT_TRIMMER_ASYNC_MODE=0` or
+ *  `"asyncMode": false` in the config file). */
+export const DEFAULT_ASYNC_MODE = true;
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
  *  the wiring layer and tests reference a single source of truth. */
@@ -104,6 +116,7 @@ export const ENV = {
 	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
+	asyncMode: "PI_CONTEXT_TRIMMER_ASYNC_MODE",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -124,6 +137,7 @@ export interface ParsedConfigFile {
 	loopGuard?: LoopGuardMode;
 	loopGuardThreshold?: number;
 	loopGuardHardBlock?: number;
+	asyncMode?: boolean;
 }
 
 /**
@@ -170,6 +184,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.loopGuardHardBlock)) {
 		out.loopGuardHardBlock = o.loopGuardHardBlock;
+	}
+	if (o.asyncMode === true || o.asyncMode === false) {
+		out.asyncMode = o.asyncMode;
 	}
 	return out;
 }
@@ -225,6 +242,18 @@ export function resolveConfig(opts: {
 	const loopGuardHardBlock =
 		parseNumberEnv(env[ENV.loopGuardHardBlock]) ?? file.loopGuardHardBlock;
 
+	let asyncMode: boolean;
+	const envAm = env[ENV.asyncMode];
+	if (envAm === "1") {
+		asyncMode = true;
+	} else if (envAm === "0") {
+		asyncMode = false;
+	} else if (file.asyncMode === true || file.asyncMode === false) {
+		asyncMode = file.asyncMode;
+	} else {
+		asyncMode = DEFAULT_ASYNC_MODE;
+	}
+
 	let protectDispatch: ProtectDispatchMode;
 	const envPd = env[ENV.protectDispatch];
 	if (envPd === "1") {
@@ -249,6 +278,7 @@ export function resolveConfig(opts: {
 		loopGuard,
 		loopGuardThreshold,
 		loopGuardHardBlock,
+		asyncMode,
 	};
 }
 

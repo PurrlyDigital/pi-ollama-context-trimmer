@@ -13,6 +13,7 @@ import {
 	ENV,
 	DEFAULT_PROTECT_DISPATCH,
 	DEFAULT_LOOP_GUARD,
+	DEFAULT_ASYNC_MODE,
 	type EnvRecord,
 } from "../config.ts";
 
@@ -1043,3 +1044,121 @@ describe("loopGuardHardBlock", () => {
 	});
 });
 
+
+// ─── asyncMode (the background-summarizer opt-out) ─────────────────────
+//
+// `asyncMode` is a boolean toggle. `true` (default) turns the
+// background (non-blocking) summarizer ON; `false` restores the
+// legacy synchronous behavior. The knob is exposed in BOTH
+// channels (env `PI_CONTEXT_TRIMMER_ASYNC_MODE` and the config-file
+// `asyncMode` field) per the tandem principle; precedence is
+// env > file > default. Badly-typed values are treated as absent
+// (the resolver falls through to the next precedence layer).
+
+describe("asyncMode — file channel (parseConfigFile)", () => {
+	it("file parse: true is accepted", () => {
+		assert.equal(parseConfigFile({ asyncMode: true }).asyncMode, true);
+	});
+
+	it("file parse: false is accepted", () => {
+		assert.equal(parseConfigFile({ asyncMode: false }).asyncMode, false);
+	});
+
+	it("file parse: badly-typed values are treated as absent", () => {
+		// Strings, numbers, null, undefined, and objects are
+		// all rejected — only the strict `true` or `false`
+		// boolean survives. The fallback chain (env > file >
+		// default) means a badly-typed value falls through to
+		// the next layer rather than crashing the resolver.
+		assert.equal(parseConfigFile({ asyncMode: "yes" }).asyncMode, undefined, "string 'yes' is rejected");
+		assert.equal(parseConfigFile({ asyncMode: 1 }).asyncMode, undefined, "number 1 is rejected (strict-boolean guard)");
+		assert.equal(parseConfigFile({ asyncMode: 0 }).asyncMode, undefined, "number 0 is rejected (strict-boolean guard)");
+		assert.equal(parseConfigFile({ asyncMode: null }).asyncMode, undefined, "null is rejected");
+		assert.equal(parseConfigFile({ asyncMode: undefined }).asyncMode, undefined, "undefined is rejected");
+		assert.equal(parseConfigFile({ asyncMode: {} }).asyncMode, undefined, "object is rejected");
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).asyncMode, undefined);
+	});
+});
+
+describe("asyncMode — resolveConfig (precedence)", () => {
+	it("default: nothing configured → DEFAULT_ASYNC_MODE (true)", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.asyncMode, DEFAULT_ASYNC_MODE, "default asyncMode matches DEFAULT_ASYNC_MODE");
+		assert.equal(cfg.asyncMode, true, "DEFAULT_ASYNC_MODE is true (background ON by default)");
+	});
+
+	it("file override: asyncMode: false wins over the default", () => {
+		const cfg = resolveConfig({ file: { asyncMode: false } });
+		assert.equal(cfg.asyncMode, false, "file value (false) overrides the default (true)");
+	});
+
+	it("file override: asyncMode: true matches the default but is honored when set", () => {
+		const cfg = resolveConfig({ file: { asyncMode: true } });
+		assert.equal(cfg.asyncMode, true);
+	});
+
+	it("env override: PI_CONTEXT_TRIMMER_ASYNC_MODE=1 → true", () => {
+		const cfg = resolveConfig({ env: { [ENV.asyncMode]: "1" } as EnvRecord });
+		assert.equal(cfg.asyncMode, true, "env '1' forces asyncMode ON");
+	});
+
+	it("env override: PI_CONTEXT_TRIMMER_ASYNC_MODE=0 → false", () => {
+		const cfg = resolveConfig({ env: { [ENV.asyncMode]: "0" } as EnvRecord });
+		assert.equal(cfg.asyncMode, false, "env '0' forces asyncMode OFF");
+	});
+
+	it("env > file: env=0 wins over file=true", () => {
+		// When the operator sets both channels, env wins.
+		const cfg = resolveConfig({
+			file: { asyncMode: true },
+			env: { [ENV.asyncMode]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.asyncMode, false, "env '0' overrides file true");
+	});
+
+	it("env > file: env=1 wins over file=false", () => {
+		const cfg = resolveConfig({
+			file: { asyncMode: false },
+			env: { [ENV.asyncMode]: "1" } as EnvRecord,
+		});
+		assert.equal(cfg.asyncMode, true, "env '1' overrides file false");
+	});
+
+	it("env unset falls back to file value", () => {
+		const cfg = resolveConfig({
+			file: { asyncMode: false },
+			env: {},
+		});
+		assert.equal(cfg.asyncMode, false, "env unset → file value (false)");
+	});
+
+	it("non-'1'/'0' env value falls back to file value", () => {
+		// Only the strict "1" / "0" tokens are honored. Any other
+		// string (including "true", "yes", "on", an empty string)
+		// is treated as "no override" so the resolver falls
+		// through to the file / default layer.
+		const cfg = resolveConfig({
+			file: { asyncMode: false },
+			env: { [ENV.asyncMode]: "true" } as EnvRecord,
+		});
+		assert.equal(cfg.asyncMode, false, "env 'true' is not honored; file false wins");
+		const cfgEmpty = resolveConfig({
+			file: { asyncMode: false },
+			env: { [ENV.asyncMode]: "" } as EnvRecord,
+		});
+		assert.equal(cfgEmpty.asyncMode, false, "empty env string is treated as no override");
+	});
+
+	it("ENV.asyncMode is the documented namespace", () => {
+		assert.equal(ENV.asyncMode, "PI_CONTEXT_TRIMMER_ASYNC_MODE");
+	});
+});
+
+describe("DEFAULT_ASYNC_MODE", () => {
+	it("is the documented boolean constant (true — background ON by default)", () => {
+		assert.equal(DEFAULT_ASYNC_MODE, true);
+	});
+});
