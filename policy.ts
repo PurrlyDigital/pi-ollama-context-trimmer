@@ -401,6 +401,14 @@ function applyReasoningModePass(
 		let summarizedHere = 0;
 		for (const block of msg.content as ReadonlyArray<Record<string, unknown>>) {
 			if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+				// Skip already-summarized blocks: if the block already
+				// carries the [summa: …] envelope from a prior pass,
+				// pass it through unchanged and do not count it as
+				// summarized.
+				if (typeof block.text === "string" && block.text.startsWith("[summa:")) {
+					newContent.push(block);
+					continue;
+				}
 				const original = typeof block.thinking === "string" ? block.thinking : "";
 				let summary: string;
 				try {

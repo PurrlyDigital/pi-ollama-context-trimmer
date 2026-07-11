@@ -1909,6 +1909,248 @@ describe("applyThreeTierTrim — reasoning-mode: 'summa-all-but-latest'", () => 
 	it("DEFAULT_REASONING_MODE is the documented 'summa-all-but-latest'", () => {
 		assert.equal(DEFAULT_REASONING_MODE, "summa-all-but-latest");
 	});
+
+	// ─── already-enveloped skip behavior ─────────────────────────
+	// The pass is invoked on every `context` event. After a first
+	// pass rewrites a thinking block with the `[summa: …]`
+	// envelope, a second pass must not re-invoke the summarizer on
+	// that block — doing so makes the harness appear unresponsive.
+
+	function envelopedThinkingBlock(thinking: string): Record<string, unknown> {
+		return {
+			type: "thinking",
+			thinking: "summary",
+			text: `[summa: ~10 tokens originally → ~1 tokens summary]\nsummary`,
+		};
+	}
+
+	function makeCountingSummarizer() {
+		let calls = 0;
+		const fn = (_text: string) => {
+			calls += 1;
+			return "summary";
+		};
+		(fn as unknown as { callCount: () => number }).callCount = () => calls;
+		return fn as unknown as ((text: string, words: number) => string) & { callCount: () => number };
+	}
+
+	it("skips thinking blocks that already carry the [summa: …] envelope from a prior pass", () => {
+		// Build a session where the older two turns' thinking blocks
+		// already carry the envelope (simulating a second `context`
+		// event after a prior pass). The latest turn carries a fresh
+		// un-enveloped thinking block.
+		const counting = makeCountingSummarizer();
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("earliest original"),
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("middle original"),
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer: counting,
+			reasoningMode: "summa-all-but-latest",
+		});
+		// The two envelope-carrying blocks must NOT be re-summarized
+		// — the prior pass already did that work, and the pass does
+		// not invoke the summarizer on a block whose `text` field
+		// starts with `[summa:`.
+		assert.equal(counting.callCount(), 0, "summarizer must not be invoked on envelope-carrying blocks");
+		// The envelope-carrying blocks pass through unchanged.
+		const envelopedSurvive = result.messages
+			.slice(0, 2)
+			.flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+			.filter((b): b is Record<string, unknown> => !!b && typeof b === "object" && (b as { type?: unknown }).type === "thinking")
+			.every((b) => typeof b.text === "string" && (b.text as string).startsWith("[summa:"));
+		assert.ok(envelopedSurvive, "envelope-carrying blocks must pass through unchanged (text field still starts with `[summa:`)");
+		// reasoningSummarized is 0 — none of the older turns'
+		// thinking blocks were summarized on this pass.
+		assert.equal(result.reasoningSummarized, 0, "reasoningSummarized must be 0 when all non-latest thinking blocks are already enveloped");
+		assert.equal(result.reasoningDropped, 0);
+	});
+
+	it("preserves the latest assistant turn's thinking block verbatim (no envelope) when older turns are already-enveloped", () => {
+		// Cross-cuts the skip path: when the session arrives with
+		// older turns already-enveloped, the latest turn must still
+		// survive verbatim — the pass neither rewrites it nor
+		// envelops it.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("earliest original"),
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("middle original"),
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer: makeTrimmingSummarizer(5),
+			reasoningMode: "summa-all-but-latest",
+		});
+		const latestContent = result.messages[result.messages.length - 1].content as ReadonlyArray<Record<string, unknown>>;
+		const latestThinking = latestContent.find((b) => (b as { type?: unknown }).type === "thinking") as Record<string, unknown> | undefined;
+		assert.ok(latestThinking, "latest turn must still carry a thinking block");
+		assert.equal(latestThinking.thinking, "latest thoughts", "latest turn's thinking text must survive verbatim");
+		assert.equal(latestThinking.text, undefined, "latest turn's thinking block must not acquire a `text` field from the pass");
+		assert.equal(result.reasoningSummarized, 0);
+	});
+
+	it("does not re-invoke the summarizer on already-enveloped blocks; only the new thinking blocks get summarized", () => {
+		// Counts the summarizer invocations across two sessions that
+		// differ only in whether the older turns' thinking blocks
+		// already carry the envelope. The session with enveloped
+		// older turns must see zero invocations; a parallel session
+		// with one extra fresh thinking block must see exactly one
+		// invocation.
+		const countingAllEnveloped = makeCountingSummarizer();
+		const allEnveloped: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("earliest original"),
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("middle original"),
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+		const rAllEnveloped = applyThreeTierTrim(allEnveloped, {
+			summarizer: countingAllEnveloped,
+			reasoningMode: "summa-all-but-latest",
+		});
+		assert.equal(countingAllEnveloped.callCount(), 0, "all-enveloped session: zero summarizer calls");
+		assert.equal(rAllEnveloped.reasoningSummarized, 0);
+
+		const countingOneNew = makeCountingSummarizer();
+		const oneNew: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("earliest original"),
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "newly-bearing middle thoughts" },
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+		const rOneNew = applyThreeTierTrim(oneNew, {
+			summarizer: countingOneNew,
+			reasoningMode: "summa-all-but-latest",
+		});
+		assert.equal(countingOneNew.callCount(), 1, "one-new session: exactly one summarizer call (the un-enveloped non-latest thinking block)");
+		assert.equal(rOneNew.reasoningSummarized, 1);
+	});
+
+	it("mixed session: only the un-enveloped, non-latest thinking block is summarized", () => {
+		// Three assistant turns: oldest is enveloped, middle carries
+		// a fresh un-enveloped thinking block, latest is fresh and
+		// preserved. The pass must summarize exactly the middle
+		// turn's thinking block and leave the oldest and the latest
+		// alone.
+		const counting = makeCountingSummarizer();
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					envelopedThinkingBlock("earliest original"),
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "newly-bearing middle thoughts" },
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer: counting,
+			reasoningMode: "summa-all-but-latest",
+		});
+		assert.equal(counting.callCount(), 1, "only the un-enveloped non-latest thinking block invokes the summarizer");
+		assert.equal(result.reasoningSummarized, 1);
+		// The oldest (enveloped) survives unchanged.
+		const oldestContent = result.messages[1].content as ReadonlyArray<Record<string, unknown>>;
+		const oldestThinking = oldestContent.find((b) => (b as { type?: unknown }).type === "thinking") as Record<string, unknown>;
+		assert.ok(typeof oldestThinking.text === "string" && oldestThinking.text.startsWith("[summa:"), "oldest turn's thinking block must keep its envelope unchanged");
+		// The middle is rewritten with a fresh envelope.
+		const middleContent = result.messages[2].content as ReadonlyArray<Record<string, unknown>>;
+		const middleThinking = middleContent.find((b) => (b as { type?: unknown }).type === "thinking") as Record<string, unknown>;
+		assert.ok(typeof middleThinking.text === "string" && middleThinking.text.startsWith("[summa:"), "middle turn's thinking block must be enveloped by this pass");
+		assert.notEqual(middleThinking.text, oldestThinking.text, "middle turn's envelope is freshly computed, not the same as the oldest's");
+		// The latest survives verbatim.
+		const latestContent = result.messages[3].content as ReadonlyArray<Record<string, unknown>>;
+		const latestThinking = latestContent.find((b) => (b as { type?: unknown }).type === "thinking") as Record<string, unknown>;
+		assert.equal(latestThinking.thinking, "latest thoughts", "latest turn's thinking text must survive verbatim");
+		assert.equal(latestThinking.text, undefined, "latest turn's thinking block must not acquire a `text` field from the pass");
+	});
 });
 
 describe("applyThreeTierTrim — reasoning-mode: 'drop-all-but-latest'", () => {
