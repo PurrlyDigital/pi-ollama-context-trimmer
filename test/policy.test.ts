@@ -1278,7 +1278,7 @@ describe("exported constants", () => {
 
 // ─── Loop-guard detection (AC-1, AC-4) ────────────────────────────────
 //
-// Pure-function coverage of the loop-guard layer added in Unit 1:
+// Pure-function coverage of the loop-guard layer:
 //   - `fingerprintToolCall`: deterministic per-tool-call signature
 //     with sorted-key argument normalization.
 //   - `fingerprintAssistantTurn`: per-turn signature; reasoning-only

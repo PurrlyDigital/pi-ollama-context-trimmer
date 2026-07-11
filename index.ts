@@ -205,7 +205,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	// startup / reload) re-populates this set from
 	// `sessionManager.getEntries()`. The cache is the source of truth
 	// for the per-trim `alreadySummarizedHashes` option threaded into
-	// the pure policy layer; without it, the Unit-1 skip clause
+	// the pure policy layer; without it, the skip clause
 	// cannot fire across context events (pi-core's `emitContext`
 	// discards the trimmed view via `structuredClone` each call).
 	const summarizedFingerprints = new Set<string>();
