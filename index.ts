@@ -392,6 +392,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			summaWords: summaWordsInt,
 			dropFloorTokens,
 			recencyFloor: recencyFloorTokens,
+			// @ts-expect-error — reasoningMode added in Unit 2 (feat/reasoning-config-23)
+			reasoningMode: cfg.reasoningMode,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
