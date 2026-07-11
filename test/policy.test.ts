@@ -80,6 +80,21 @@ function assistantWithToolCalls(toolCalls: Array<{ name: string; arguments: unkn
 	};
 }
 
+/** Build an assistant-turn fixture with mixed content: prose + toolCall. */
+function assistantWithMixedBlock(
+	prose: string,
+	name: string,
+	args: unknown,
+): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: [
+			{ type: "text", text: prose },
+			{ type: "toolCall", name, arguments: args },
+		],
+	};
+}
+
 /** Build a trimmable mass of roughly N tokens (chars = N * 4). */
 function trimmableMass(n: number): TrimmableMessage[] {
 	// Build a single trimmable message of n tokens. The dispatch
@@ -2116,5 +2131,108 @@ describe("applyThreeTierTrim — background summarizer mode", () => {
 		// to that text.
 		const summaryText = await result.pendingSummaries![0].promise;
 		assert.equal(summaryText, "summary", "the pending promise resolves to the summarizer's return value");
+	});
+});
+
+// ─── Summarize-tier input hygiene (AC-1) ─────────────────────────────
+//
+// The summarizer callback must receive only the prose content of a
+// message. Tool-call and tool-result content blocks are structural
+// (they describe what the model asked the agent to do, or what the
+// agent returned) — feeding their raw JSON into summa's TextRank
+// embeds the JSON in the summary, which corrupts it.
+//
+// The fix lives in `policy.ts`: a dedicated prose-only extraction
+// helper replaces the one `extractText(msg.content)` call site in
+// `summarizeOldestUntilUnder`. `extractText` itself is unchanged
+// so `approximateMessageTokens` keeps counting the full message.
+
+describe("applyThreeTierTrim — summarize tier: prose-only input (AC-1)", () => {
+	it("assistant turn with text + toolCall mixed: summarizer sees only prose, not tool-call JSON", async () => {
+		const prose = "I will look up the answer and report back. " + "a".repeat(60_000 * 4);
+		const toolCallArgs = { query: "secret-token", limit: 10 };
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithMixedBlock(prose, "search", toolCallArgs),
+		];
+		let captured: { text: string; words: number } | null = null;
+		const tracking = async (text: string, w: number) => {
+			captured = { text, words: w };
+			return "summary";
+		};
+		await applyThreeTierTrim(messages, { summarizer: tracking });
+		assert.ok(captured !== null, "summarizer was invoked");
+		assert.ok(
+			(captured as { text: string }).text.includes("I will look up the answer and report back."),
+			"captured summarizer input contains the prose",
+		);
+		assert.ok(
+			!(captured as { text: string }).text.includes("toolCall"),
+			"captured summarizer input does not contain the literal 'toolCall' marker",
+		);
+		assert.ok(
+			!(captured as { text: string }).text.includes("secret-token"),
+			"captured summarizer input does not contain the tool-call argument value",
+		);
+		assert.ok(
+			!(captured as { text: string }).text.includes('"name"'),
+			"captured summarizer input does not contain the JSON-stringified name field",
+		);
+	});
+
+	it("toolResult message: summarizer does not see the raw tool-result JSON when content is object array", async () => {
+		// A toolResult whose content is an array of blocks
+		// (e.g. mixed text + image / file blocks) is summarized
+		// in place by the summarize path. Only the text blocks
+		// should reach the summarizer.
+		const prose = "Result body: " + "b".repeat(60_000 * 4);
+		const toolResultMsg: TrimmableMessage = {
+			role: "toolResult",
+			content: [
+				{ type: "text", text: prose },
+				{ type: "image", mediaType: "image/png", data: "BASE64DATA" },
+			],
+		};
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			toolResultMsg,
+		];
+		let captured: { text: string; words: number } | null = null;
+		const tracking = async (text: string, w: number) => {
+			captured = { text, words: w };
+			return "summary";
+		};
+		await applyThreeTierTrim(messages, { summarizer: tracking });
+		assert.ok(captured !== null, "summarizer was invoked on the toolResult");
+		assert.ok(
+			(captured as { text: string }).text.includes("Result body:"),
+			"captured summarizer input contains the prose",
+		);
+		assert.ok(
+			!(captured as { text: string }).text.includes("BASE64DATA"),
+			"captured summarizer input does not contain the non-text block data",
+		);
+		assert.ok(
+			!(captured as { text: string }).text.includes('"type"'),
+			"captured summarizer input does not contain JSON-stringified block metadata",
+		);
+	});
+
+	it("approximateMessageTokens still counts the full message including the tool-call JSON (AC-2)", async () => {
+		const prose = "short prose";
+		const toolCallArgs = { query: "x".repeat(2000) };
+		const msg = assistantWithMixedBlock(prose, "search", toolCallArgs);
+		const tokens = approximateMessageTokens(msg);
+		// The unchanged extractText concatenates `text` blocks AND
+		// JSON.stringify-falls-back for the tool-call block. So
+		// the count must be much larger than just the prose's
+		// `Math.ceil(prose.length / 4)` (~3 tokens). The exact
+		// number depends on the JSON shape; the budget-math
+		// invariant is that the count is not zero and not
+		// prose-only.
+		assert.ok(
+			tokens > Math.ceil(prose.length / 4),
+			`approximateMessageTokens must include the tool-call JSON in its count (got ${tokens})`,
+		);
 	});
 });
