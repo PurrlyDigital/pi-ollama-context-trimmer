@@ -302,7 +302,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		pinnedTier.bumpTurn();
 	});
 
-	pi.on("context", async (event) => {
+	pi.on("context", async (event, ctx) => {
 		// Read the current message stream.
 		const rawMessages = (event.messages ?? []) as unknown as ReadonlyArray<Record<string, unknown>>;
 		// Stamp userTurnAge on every message. The stamp is the source
@@ -424,65 +424,79 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// guard treats the default as a no-op. `Math.trunc` matches
 		// the existing `summaWords` integer-coercion primitive.
 		const recencyFloorTokens = cfg.recencyFloor !== undefined ? Math.trunc(cfg.recencyFloor) : undefined;
-		const result = applyThreeTierTrim(withPinned, {
-			summarizer: defaultSummaSummarizer,
-			verbatimMaxTokens: cfg.tier1MaxTokens,
-			summarizeMaxTokens: cfg.tier2MaxTokens,
-			summaWords: summaWordsInt,
-			dropFloorTokens,
-			recencyFloor: recencyFloorTokens,
-			protectedCustomTypes: protectedTypes,
-			protectDispatch: resolveProtectDispatch(),
-			preservedPatterns: expandedPreservedPatterns,
-			alreadySummarizedHashes: summarizedFingerprints,
-		});
-		// Persist the fingerprints of messages summarized in this
-		// pass. The pure policy emits `summarizedFingerprints` as
-		// the ORIGINAL-message fingerprints (computed before the
-		// content was rewritten with the summa envelope) so the
-		// persisted key matches the fingerprint the policy will
-		// recompute on the next context event. `pi.appendEntry`
-		// writes a separate `customType: "context-trimmer-summarized"`
-		// entry — it does NOT mutate the session message stream.
-		// The trim is a view, not a mutation; the persisted
-		// messages stay original. The try/catch degrades silently
-		// when `pi.appendEntry` is unavailable (tests, minimal
-		// mocks); the in-memory set still updates so the same-
-		// process skip still works.
-		if (result.summarizedFingerprints.length > 0) {
-			const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
-			if (typeof appendEntry === "function") {
-				for (const fingerprint of result.summarizedFingerprints) {
-					summarizedFingerprints.add(fingerprint);
-					try {
-						appendEntry("context-trimmer-summarized", { fingerprint });
-					} catch {
-						// Best-effort: degrade silently
+		// Status indicator while summa runs — set before trim, clear
+		// after. The try/finally ensures the status is always cleared,
+		// even if the trim throws. The `ctx?.hasUI` guard skips UI
+		// calls in non-TUI modes (rpc, json, print) and in test mocks
+		// that pass `{}` as ctx (where `hasUI` is `undefined`, falsy).
+		if (ctx?.hasUI) {
+			ctx.ui.setStatus("context-trimmer", "Summarizing…");
+		}
+		try {
+			const result = applyThreeTierTrim(withPinned, {
+				summarizer: defaultSummaSummarizer,
+				verbatimMaxTokens: cfg.tier1MaxTokens,
+				summarizeMaxTokens: cfg.tier2MaxTokens,
+				summaWords: summaWordsInt,
+				dropFloorTokens,
+				recencyFloor: recencyFloorTokens,
+				protectedCustomTypes: protectedTypes,
+				protectDispatch: resolveProtectDispatch(),
+				preservedPatterns: expandedPreservedPatterns,
+				alreadySummarizedHashes: summarizedFingerprints,
+			});
+			// Persist the fingerprints of messages summarized in this
+			// pass. The pure policy emits `summarizedFingerprints` as
+			// the ORIGINAL-message fingerprints (computed before the
+			// content was rewritten with the summa envelope) so the
+			// persisted key matches the fingerprint the policy will
+			// recompute on the next context event. `pi.appendEntry`
+			// writes a separate `customType: "context-trimmer-summarized"`
+			// entry — it does NOT mutate the session message stream.
+			// The trim is a view, not a mutation; the persisted
+			// messages stay original. The try/catch degrades silently
+			// when `pi.appendEntry` is unavailable (tests, minimal
+			// mocks); the in-memory set still updates so the same-
+			// process skip still works.
+			if (result.summarizedFingerprints.length > 0) {
+				const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
+				if (typeof appendEntry === "function") {
+					for (const fingerprint of result.summarizedFingerprints) {
+						summarizedFingerprints.add(fingerprint);
+						try {
+							appendEntry("context-trimmer-summarized", { fingerprint });
+						} catch {
+							// Best-effort: degrade silently
+						}
+					}
+				} else {
+					for (const fingerprint of result.summarizedFingerprints) {
+						summarizedFingerprints.add(fingerprint);
 					}
 				}
-			} else {
-				for (const fingerprint of result.summarizedFingerprints) {
-					summarizedFingerprints.add(fingerprint);
-				}
+			}
+			// Loop-guard integration. Runs AFTER the trim (operates on
+			// the trimmed view the LLM is about to see) and BEFORE the
+			// handler returns. Re-injection on every qualifying turn is
+			// the simpler safe default; the hard-block naturally dedupes
+			// because stripping the tool call breaks the fingerprint
+			// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
+			// signature → the run resets on the next invocation).
+			const out: TrimmableMessage[] = applyLoopGuard(result.messages);
+			// Cast back to the session message shape and return. The
+			// pinned message rides out at the top (when injected); the rest
+			// are the trimmed trimmable messages. The double-cast mirrors the
+			// pattern in the prior wiring: `TrimmableMessage` and
+			// `AgentMessage` share a structural core (role, content, etc.)
+			// but the session type carries provider-specific fields the
+			// policy does not inspect.
+			const outCasted = out.map((m) => m as unknown as Record<string, unknown>);
+			return { messages: outCasted as unknown as typeof event.messages };
+		} finally {
+			if (ctx?.hasUI) {
+				ctx.ui.setStatus("context-trimmer", undefined);
 			}
 		}
-		// Loop-guard integration. Runs AFTER the trim (operates on
-		// the trimmed view the LLM is about to see) and BEFORE the
-		// handler returns. Re-injection on every qualifying turn is
-		// the simpler safe default; the hard-block naturally dedupes
-		// because stripping the tool call breaks the fingerprint
-		// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
-		// signature → the run resets on the next invocation).
-		const out: TrimmableMessage[] = applyLoopGuard(result.messages);
-		// Cast back to the session message shape and return. The
-		// pinned message rides out at the top (when injected); the rest
-		// are the trimmed trimmable messages. The double-cast mirrors the
-		// pattern in the prior wiring: `TrimmableMessage` and
-		// `AgentMessage` share a structural core (role, content, etc.)
-		// but the session type carries provider-specific fields the
-		// policy does not inspect.
-		const outCasted = out.map((m) => m as unknown as Record<string, unknown>);
-		return { messages: outCasted as unknown as typeof event.messages };
 	});
 
 	/**
