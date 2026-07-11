@@ -36,7 +36,7 @@ import {
 
 /** A test summarizer that returns a fixed short summary string. */
 function makeTrimmingSummarizer(_words: number = 10) {
-	return (_text: string) => "summary";
+	return async (_text: string, _w: number) => "summary";
 }
 
 /** Build a user-message fixture. */
@@ -94,11 +94,11 @@ function trimmableMass(n: number): TrimmableMessage[] {
 // ─── Per-message token accounting ─────────────────────────────────────
 
 describe("approximateMessageTokens (chars / 4)", () => {
-	it("returns ceil(chars / 4) for a string content", () => {
+	it("returns ceil(chars / 4) for a string content", async () => {
 		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 3);
 	});
 
-	it("sums text across an array of content blocks", () => {
+	it("sums text across an array of content blocks", async () => {
 		const msg: TrimmableMessage = {
 			role: "assistant",
 			content: [
@@ -109,11 +109,11 @@ describe("approximateMessageTokens (chars / 4)", () => {
 		assert.equal(approximateMessageTokens(msg), 3);
 	});
 
-	it("returns 0 for an empty string content", () => {
+	it("returns 0 for an empty string content", async () => {
 		assert.equal(approximateMessageTokens({ role: "user", content: "" }), 0);
 	});
 
-	it("extracts text from object content via JSON.stringify fallback", () => {
+	it("extracts text from object content via JSON.stringify fallback", async () => {
 		const msg: TrimmableMessage = {
 			role: "custom",
 			content: { foo: "bar" },
@@ -124,11 +124,11 @@ describe("approximateMessageTokens (chars / 4)", () => {
 });
 
 describe("extractText", () => {
-	it("returns a string content as-is", () => {
+	it("returns a string content as-is", async () => {
 		assert.equal(extractText("hello"), "hello");
 	});
 
-	it("concatenates text blocks from an array", () => {
+	it("concatenates text blocks from an array", async () => {
 		assert.equal(
 			extractText([
 				{ type: "text", text: "foo " },
@@ -138,7 +138,7 @@ describe("extractText", () => {
 		);
 	});
 
-	it("falls back to JSON.stringify for non-text object content", () => {
+	it("falls back to JSON.stringify for non-text object content", async () => {
 		assert.equal(extractText({ a: 1 }), '{"a":1}');
 	});
 });
@@ -151,18 +151,18 @@ describe("isProtectedSlot", () => {
 	const pinned: TrimmableMessage = pinnedMsg("agent def");
 	const assistant: TrimmableMessage = assistantMsg("hi");
 
-	it("protects the first user message (userTurnAge === 0)", () => {
+	it("protects the first user message (userTurnAge === 0)", async () => {
 		const messages = [dispatch, assistant];
 		assert.equal(isProtectedSlot(dispatch, 0, messages), true);
 		assert.equal(isProtectedSlot(assistant, 1, messages), false);
 	});
 
-	it("does not protect a follow-up user message", () => {
+	it("does not protect a follow-up user message", async () => {
 		const messages = [dispatch, followUp];
 		assert.equal(isProtectedSlot(followUp, 1, messages), false);
 	});
 
-	it("protects a context-trimmer-pinned synthetic when its customType is in the protected set", () => {
+	it("protects a context-trimmer-pinned synthetic when its customType is in the protected set", async () => {
 		const protectedSet = new Set(["context-trimmer-pinned"]);
 		const messages = [pinned, dispatch, assistant];
 		assert.equal(isProtectedSlot(pinned, 0, messages, protectedSet), true);
@@ -170,12 +170,12 @@ describe("isProtectedSlot", () => {
 		assert.equal(isProtectedSlot(assistant, 2, messages, protectedSet), false);
 	});
 
-	it("does not protect a custom message whose customType is not in the protected set", () => {
+	it("does not protect a custom message whose customType is not in the protected set", async () => {
 		const messages = [pinned, dispatch, assistant];
 		assert.equal(isProtectedSlot(pinned, 0, messages, new Set()), false);
 	});
 
-	it("falls back to 'first user message by position' when userTurnAge is missing", () => {
+	it("falls back to 'first user message by position' when userTurnAge is missing", async () => {
 		const messages = [
 			{ role: "user", content: "first" } as TrimmableMessage,
 			{ role: "user", content: "second" } as TrimmableMessage,
@@ -184,13 +184,13 @@ describe("isProtectedSlot", () => {
 		assert.equal(isProtectedSlot(messages[1], 1, messages), false);
 	});
 
-	it("does NOT protect the first user message when protectDispatch is false", () => {
+	it("does NOT protect the first user message when protectDispatch is false", async () => {
 		const messages = [dispatch, assistant];
 		assert.equal(isProtectedSlot(dispatch, 0, messages, new Set(), false), false);
 		assert.equal(isProtectedSlot(assistant, 1, messages, new Set(), false), false);
 	});
 
-	it("still protects a pinned customType when protectDispatch is false", () => {
+	it("still protects a pinned customType when protectDispatch is false", async () => {
 		const protectedSet = new Set(["context-trimmer-pinned"]);
 		const messages = [pinned, dispatch, assistant];
 		assert.equal(isProtectedSlot(pinned, 0, messages, protectedSet, false), true);
@@ -205,7 +205,7 @@ describe("isProtectedSlot", () => {
 // ─── Budget accounting ────────────────────────────────────────────────
 
 describe("totalTrimmableTokens", () => {
-	it("sums per-message tokens for trimmable messages", () => {
+	it("sums per-message tokens for trimmable messages", async () => {
 		const messages = [
 			userMsg("hi", 0),
 			assistantMsg("hello"),
@@ -214,7 +214,7 @@ describe("totalTrimmableTokens", () => {
 		assert.equal(totalTrimmableTokens(messages), 2);
 	});
 
-	it("subtracts protected-slot tokens from the total", () => {
+	it("subtracts protected-slot tokens from the total", async () => {
 		const protectedSet = new Set(["context-trimmer-pinned"]);
 		const messages = [
 			pinnedMsg("agent def " + "x".repeat(1000)),
@@ -231,9 +231,9 @@ describe("totalTrimmableTokens", () => {
 describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("returns the input unchanged for a small conversation", () => {
+	it("returns the input unchanged for a small conversation", async () => {
 		const messages = [userMsg("dispatch", 0), assistantMsg("hi")];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(result.summarized, 0);
 		assert.equal(result.droppedTurns, 0);
 		assert.equal(result.messages.length, messages.length);
@@ -241,20 +241,20 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 		assert.equal(result.messages[1].content, "hi");
 	});
 
-	it("does not invoke the summarizer in the verbatim tier", () => {
+	it("does not invoke the summarizer in the verbatim tier", async () => {
 		let called = false;
-		const tracking = (text: string) => {
+		const tracking = async (text: string, _w: number) => {
 			called = true;
 			return text;
 		};
 		const messages = [userMsg("dispatch", 0), assistantMsg("hello world")];
-		applyThreeTierTrim(messages, { summarizer: tracking });
+		await applyThreeTierTrim(messages, { summarizer: tracking });
 		assert.equal(called, false);
 	});
 
-	it("boundary at exactly 50k total tokens is verbatim", () => {
+	it("boundary at exactly 50k total tokens is verbatim", async () => {
 		const messages = trimmableMass(VERBATIM_TIER_MAX_TOKENS);
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(result.summarized, 0);
 		assert.equal(result.droppedTurns, 0);
 	});
@@ -265,9 +265,9 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("summarizes the oldest non-protected trimmable message when over 50k", () => {
+	it("summarizes the oldest non-protected trimmable message when over 50k", async () => {
 		const messages = trimmableMass(60_000);
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// The assistant message is oldest non-protected (after the
 		// dispatch). The summarizer should fire on it.
 		assert.ok(result.summarized >= 1);
@@ -275,9 +275,9 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 		assert.equal(result.messages[0].content, "dispatch task — do X");
 	});
 
-	it("preserves the dispatch task through summarization", () => {
+	it("preserves the dispatch task through summarization", async () => {
 		const messages = trimmableMass(60_000);
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// The first message is the dispatch — content unchanged.
 		const first = result.messages[0];
 		assert.equal(first.role, "user");
@@ -285,28 +285,28 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 		assert.equal(first.content, "dispatch task — do X");
 	});
 
-	it("loops until total ≤ 50k, summarizing multiple messages if needed", () => {
+	it("loops until total ≤ 50k, summarizing multiple messages if needed", async () => {
 		// Build a session with several trimmable turns at ~20k each.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			assistantMsg("a".repeat(30_000 * 4)),
 			toolResultMsg("b".repeat(30_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// 60k total — at least one summarization should bring us under 50k.
 		assert.ok(result.summarized >= 1);
 		// Re-check: after summarize, total is under 50k.
 		assert.ok(totalTrimmableTokens(result.messages) <= VERBATIM_TIER_MAX_TOKENS);
 	});
 
-	it("protects a context-trimmer-pinned synthetic in the summarize tier", () => {
+	it("protects a context-trimmer-pinned synthetic in the summarize tier", async () => {
 		const protectedSet = new Set(["context-trimmer-pinned"]);
 		const messages = [
 			pinnedMsg("agent def " + "p".repeat(20_000 * 4)),
 			userMsg("dispatch", 0),
 			assistantMsg("x".repeat(30_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			protectedCustomTypes: protectedSet,
 		});
@@ -318,7 +318,7 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 		assert.equal(pinned!.content, messages[0].content);
 	});
 
-	it("the budget excludes protected-slot tokens", () => {
+	it("the budget excludes protected-slot tokens", async () => {
 		// A session whose only over-budget contributor is the pinned
 		// message (the agent def) should NOT trigger a trim.
 		const protectedSet = new Set(["context-trimmer-pinned"]);
@@ -327,7 +327,7 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 			userMsg("dispatch", 0),
 			assistantMsg("short"),
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			protectedCustomTypes: protectedSet,
 		});
@@ -337,9 +337,9 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 		assert.equal(result.summarized, 0);
 	});
 
-	it("boundary at exactly 50k+1 tokens triggers a single summarize pass", () => {
+	it("boundary at exactly 50k+1 tokens triggers a single summarize pass", async () => {
 		const messages = trimmableMass(50_001);
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.ok(result.summarized >= 1);
 	});
 });
@@ -349,13 +349,13 @@ describe("applyThreeTierTrim — summarize tier (50k < total ≤ 100k)", () => {
 describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("hard-drops the oldest trimmable turn when over 100k", () => {
+	it("hard-drops the oldest trimmable turn when over 100k", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			assistantMsg("a".repeat(60_000 * 4)), // First trimmable turn.
 			toolResultMsg("b".repeat(60_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// Total trimmable is ~120k, which is > 100k. The first
 		// trimmable turn should be dropped.
 		assert.ok(result.droppedTurns >= 1);
@@ -371,14 +371,14 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
 	});
 
-	it("preserves the pinned-tier synthetic through a drop", () => {
+	it("preserves the pinned-tier synthetic through a drop", async () => {
 		const protectedSet = new Set(["context-trimmer-pinned"]);
 		const messages = [
 			pinnedMsg("agent def " + "p".repeat(1000)),
 			userMsg("dispatch", 0),
 			assistantMsg("a".repeat(60_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			protectedCustomTypes: protectedSet,
 		});
@@ -388,7 +388,7 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 		assert.ok(pinned, "pinned message must survive the drop");
 	});
 
-	it("drops multiple oldest trimmable turns if needed to reach 100k", () => {
+	it("drops multiple oldest trimmable turns if needed to reach 100k", async () => {
 		// Build a session with three trimmable turns, each ~40k tokens.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
@@ -399,7 +399,7 @@ describe("applyThreeTierTrim — drop tier (total > 100k)", () => {
 			assistantMsg("e".repeat(40_000 * 4)), // Turn 3: 40k
 			toolResultMsg("f".repeat(40_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// 120k total → must drop at least one oldest trimmable turn.
 		assert.ok(result.droppedTurns >= 1);
 		assert.ok(totalTrimmableTokens(result.messages) <= SUMMARIZE_TIER_MAX_TOKENS);
@@ -428,13 +428,13 @@ describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () =>
 		return count;
 	}
 
-	it("emits exactly one reminder when droppedTurns > 0 (single drop event)", () => {
+	it("emits exactly one reminder when droppedTurns > 0 (single drop event)", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch task — do X", 0),
 			assistantMsg("a".repeat(60_000 * 4)),
 			toolResultMsg("b".repeat(60_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// The drop fires; one reminder is emitted at the start of the
 		// returned array. Exactly one — not N (aggregate, not per-turn).
 		assert.equal(reminderCount(result.messages), 1);
@@ -473,7 +473,7 @@ describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () =>
 		assert.equal(droppedContent.length, 0, "the dropped turn's content must be gone");
 	});
 
-	it("emits exactly one reminder for a multi-turn drop (aggregate, not per-turn)", () => {
+	it("emits exactly one reminder for a multi-turn drop (aggregate, not per-turn)", async () => {
 		// 4 distinct trimmable turns of 60k each → 240k total →
 		// drops the oldest three to land at 60k (under 100k, no
 		// summarize-fallback fires). ONE reminder total, not three.
@@ -492,25 +492,25 @@ describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () =>
 			assistantMsg("g".repeat(30_000 * 4)),
 			toolResultMsg("h".repeat(30_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// 3 turns dropped, but only 1 reminder (aggregate).
 		assert.equal(result.droppedTurns, 3);
 		assert.equal(reminderCount(result.messages), 1, "one reminder total for a multi-turn drop");
 	});
 
-	it("does NOT emit a reminder on the tier-2 summarize path (only tier-3 drops emit)", () => {
+	it("does NOT emit a reminder on the tier-2 summarize path (only tier-3 drops emit)", async () => {
 		const messages = trimmableMass(60_000);
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-2 summarize path");
 	});
 
-	it("does NOT emit a reminder on the tier-1 verbatim path", () => {
+	it("does NOT emit a reminder on the tier-1 verbatim path", async () => {
 		const messages = [userMsg("dispatch", 0), assistantMsg("hi")];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-1 verbatim path");
 	});
 
-	it("does NOT emit a reminder on the tier-3 summarize-fallback path (single oversized turn)", () => {
+	it("does NOT emit a reminder on the tier-3 summarize-fallback path (single oversized turn)", async () => {
 		// A single trimmable turn, all by itself, is over 100k. The
 		// policy falls into the summarize-fallback (not the drop
 		// path). No drop, no reminder; the existing Tier-2
@@ -519,7 +519,7 @@ describe("applyThreeTierTrim — aggregate plain-English reminder (AC-1)", () =>
 			userMsg("dispatch", 0),
 			assistantMsg("x".repeat(150_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(result.droppedTurns, 0, "the summarize-fallback path does not drop any turns");
 		assert.equal(reminderCount(result.messages), 0, "no reminder on the tier-3 summarize-fallback path");
 	});
@@ -557,7 +557,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 
 	// ── AC-1: drop-floor fall-through ───────────────────────────
 
-	it("falls through to summarize when dropping a whole turn would push the trimmable total below the drop-floor (AC-1)", () => {
+	it("falls through to summarize when dropping a whole turn would push the trimmable total below the drop-floor (AC-1)", async () => {
 		// One oversized trimmable turn (the post-dispatch
 		// synthetic trimmable turn — 3 trimmable messages,
 		// 120k total) with `dropFloorTokens: 5_000`. The
@@ -581,7 +581,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 			toolResultMsg("b".repeat(50_000 * 4)), // 50k tokens
 			assistantMsg("c".repeat(10_000 * 4)), // 10k tokens
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			protectedCustomTypes: protectedSet,
 			dropFloorTokens: 5_000,
@@ -662,7 +662,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 
 	// ── AC-2: recency-floor cross-path (tier-2 + tier-3) ───────
 
-	it("preserves the recency slice across the tier-2 summarize path (AC-2)", () => {
+	it("preserves the recency slice across the tier-2 summarize path (AC-2)", async () => {
 		// Three older trimmable messages (turn 1, ~60k
 		// total) plus a recency slice of two trimmable
 		// messages (turn 2, ~90k total). The recency slice
@@ -684,7 +684,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
 			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			recencyFloor: 50_000,
 		});
@@ -727,7 +727,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 		assert.ok(result.summarized >= 1);
 	});
 
-	it("preserves the recency slice across the tier-3 drop path (AC-2)", () => {
+	it("preserves the recency slice across the tier-3 drop path (AC-2)", async () => {
 		// Five older trimmable messages (150k total) plus
 		// a recency slice of two trimmable messages (~90k
 		// total). `recencyFloor: 50_000` covers the recency
@@ -750,7 +750,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
 			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			recencyFloor: 50_000,
 		});
@@ -799,28 +799,28 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 describe("applyThreeTierTrim — degenerate cases", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("returns an empty array for an empty input", () => {
-		const result = applyThreeTierTrim([], { summarizer });
+	it("returns an empty array for an empty input", async () => {
+		const result = await applyThreeTierTrim([], { summarizer });
 		assert.equal(result.messages.length, 0);
 		assert.equal(result.summarized, 0);
 		assert.equal(result.droppedTurns, 0);
 		assert.equal(result.totalTokens, 0);
 	});
 
-	it("returns the dispatch task unchanged when it is the only message", () => {
+	it("returns the dispatch task unchanged when it is the only message", async () => {
 		const messages = [userMsg("dispatch", 0)];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		assert.equal(result.messages.length, 1);
 		assert.equal(result.messages[0].content, "dispatch");
 	});
 
-	it("does not infinite-loop when the summarizer returns the source unchanged", () => {
+	it("does not infinite-loop when the summarizer returns the source unchanged", async () => {
 		// Pathological summarizer: always returns the input. The
 		// loop's defensive bound (`summaryTokens >= originalTokens`)
 		// bails after one iteration, so the function returns.
-		const noProgress = (text: string) => text;
+		const noProgress = async (text: string, _w: number) => text;
 		const messages = trimmableMass(60_000);
-		const result = applyThreeTierTrim(messages, { summarizer: noProgress });
+		const result = await applyThreeTierTrim(messages, { summarizer: noProgress });
 		// The first eligible message IS summarized (the summarize
 		// path runs once), but the post-summarize content has the
 		// same length, so the loop bails. The function returns.
@@ -828,7 +828,7 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 		assert.ok(typeof result.totalTokens === "number");
 	});
 
-	it("a single oversized message (over 100k) is summarized, not dropped", () => {
+	it("a single oversized message (over 100k) is summarized, not dropped", async () => {
 		// One trimmable message, all by itself, is larger than the
 		// drop tier. The policy's fallback summarizes it (since
 		// dropping the only trimmable message would leave the
@@ -837,12 +837,12 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 			userMsg("dispatch", 0),
 			assistantMsg("x".repeat(150_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		// The fallback summarize path fires.
 		assert.ok(result.summarized >= 1);
 	});
 
-	it("the recency slice survives the summarize-fallback path (single oversized + recency)", () => {
+	it("the recency slice survives the summarize-fallback path (single oversized + recency)", async () => {
 		// One oversized trimmable (150k) plus one small
 		// trimmable in the recency window. `recencyFloor`
 		// covers the small trimmable. The budget excludes the
@@ -860,7 +860,7 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 			assistantMsg("x".repeat(150_000 * 4)), // oversized → summarized via fallback
 			assistantMsg("RECENT ".repeat(3_000)), // ~5250 tokens, recency slice → preserved
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			recencyFloor: 5_000,
 		});
@@ -897,7 +897,7 @@ describe("applyThreeTierTrim — degenerate cases", () => {
 // ─── isPathPreserved predicate (pure) ──────────────────────────────
 
 describe("isPathPreserved (pure path-match predicate)", () => {
-	it("matches a fuzzy pattern (no leading / or ~/) by basename", () => {
+	it("matches a fuzzy pattern (no leading / or ~/) by basename", async () => {
 		assert.equal(
 			isPathPreserved("/home/operator/project/AGENTS.md", ["AGENTS.md"]),
 			true,
@@ -908,14 +908,14 @@ describe("isPathPreserved (pure path-match predicate)", () => {
 		);
 	});
 
-	it("does not match a fuzzy pattern when the basename differs", () => {
+	it("does not match a fuzzy pattern when the basename differs", async () => {
 		assert.equal(
 			isPathPreserved("/home/operator/project/CLAUDE.md", ["AGENTS.md"]),
 			false,
 		);
 	});
 
-	it("matches an absolute pattern (leading /) by path.normalize equality", () => {
+	it("matches an absolute pattern (leading /) by path.normalize equality", async () => {
 		assert.equal(
 			isPathPreserved("/home/operator/AGENTS.md", ["/home/operator/AGENTS.md"]),
 			true,
@@ -927,14 +927,14 @@ describe("isPathPreserved (pure path-match predicate)", () => {
 		);
 	});
 
-	it("does not match an absolute pattern when the normalized path differs", () => {
+	it("does not match an absolute pattern when the normalized path differs", async () => {
 		assert.equal(
 			isPathPreserved("/home/operator/CLAUDE.md", ["/home/operator/AGENTS.md"]),
 			false,
 		);
 	});
 
-	it("matches an absolute pattern with ~ (the wiring has expanded ~/)", () => {
+	it("matches an absolute pattern with ~ (the wiring has expanded ~/)", async () => {
 		// The wiring expands ~/ via os.homedir(); the predicate
 		// sees the expanded form on both sides. We test the
 		// predicate at its seam: the expanded pattern matches the
@@ -945,16 +945,16 @@ describe("isPathPreserved (pure path-match predicate)", () => {
 		);
 	});
 
-	it("returns false when sourcePath is undefined", () => {
+	it("returns false when sourcePath is undefined", async () => {
 		assert.equal(isPathPreserved(undefined, ["AGENTS.md"]), false);
 		assert.equal(isPathPreserved(undefined, ["/abs/path"]), false);
 	});
 
-	it("returns false when patterns is empty", () => {
+	it("returns false when patterns is empty", async () => {
 		assert.equal(isPathPreserved("/abs/AGENTS.md", []), false);
 	});
 
-	it("returns false when no pattern matches (all-or-nothing validation: an invalid entry is skipped, not a global no-op)", () => {
+	it("returns false when no pattern matches (all-or-nothing validation: an invalid entry is skipped, not a global no-op)", async () => {
 		// Empty strings and non-string entries are skipped; a valid
 		// entry that does not match still leaves the predicate as
 		// false. The all-or-nothing contract is in the config
@@ -965,7 +965,7 @@ describe("isPathPreserved (pure path-match predicate)", () => {
 		);
 	});
 
-	it("returns true on first match in the patterns list", () => {
+	it("returns true on first match in the patterns list", async () => {
 		assert.equal(
 			isPathPreserved("/abs/AGENTS.md", ["CLAUDE.md", "AGENTS.md"]),
 			true,
@@ -976,7 +976,7 @@ describe("isPathPreserved (pure path-match predicate)", () => {
 // ─── isProtectedSlot with preservedPatterns ────────────────────────
 
 describe("isProtectedSlot — preservedPatterns channel", () => {
-	it("protects a message whose details.sourcePath matches a fuzzy pattern", () => {
+	it("protects a message whose details.sourcePath matches a fuzzy pattern", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("contents of AGENTS.md", "/repo/AGENTS.md"),
@@ -987,7 +987,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 		);
 	});
 
-	it("protects a message whose details.sourcePath matches an absolute pattern", () => {
+	it("protects a message whose details.sourcePath matches an absolute pattern", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("contents", "/home/operator/AGENTS.md"),
@@ -1005,7 +1005,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 		);
 	});
 
-	it("does not protect a message whose sourcePath is absent", () => {
+	it("does not protect a message whose sourcePath is absent", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultMsg("no source path"),
@@ -1016,7 +1016,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 		);
 	});
 
-	it("does not protect a message whose sourcePath does not match", () => {
+	it("does not protect a message whose sourcePath does not match", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("contents", "/repo/CLAUDE.md"),
@@ -1027,7 +1027,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 		);
 	});
 
-	it("preservedPatterns is independent of the dispatch and customType channels", () => {
+	it("preservedPatterns is independent of the dispatch and customType channels", async () => {
 		// A custom pinned message is still protected even when its
 		// sourcePath does not match a preserved pattern.
 		const messages: TrimmableMessage[] = [
@@ -1052,7 +1052,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 		);
 	});
 
-	it("preservedPatterns defaults to empty (no paths preserved)", () => {
+	it("preservedPatterns defaults to empty (no paths preserved)", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("contents", "/repo/AGENTS.md"),
@@ -1068,7 +1068,7 @@ describe("isProtectedSlot — preservedPatterns channel", () => {
 // ─── Budget accounting with preservedPatterns ───────────────────────
 
 describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
-	it("subtracts tokens of a tool-result whose sourcePath matches a preserved pattern", () => {
+	it("subtracts tokens of a tool-result whose sourcePath matches a preserved pattern", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("a".repeat(2000), "/repo/AGENTS.md"),
@@ -1082,7 +1082,7 @@ describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
 		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 500);
 	});
 
-	it("preserved tokens are not counted in the budget", () => {
+	it("preserved tokens are not counted in the budget", async () => {
 		// A session whose only over-budget contributor is a
 		// preserved-path message does not trigger a trim. Build
 		// exactly that: a preserved message is the only over-50k
@@ -1105,7 +1105,7 @@ describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
 describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("preserves a message whose sourcePath matches a fuzzy pattern in tier 2 (summarize)", () => {
+	it("preserves a message whose sourcePath matches a fuzzy pattern in tier 2 (summarize)", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("a".repeat(40_000 * 4), "/repo/AGENTS.md"),
@@ -1116,7 +1116,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		// So this session should NOT trigger a summarize on the
 		// preserved message; the assistant, if over cap, would be
 		// the only candidate.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			preservedPatterns: ["AGENTS.md"],
 		});
@@ -1130,7 +1130,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.equal(preserved!.content, "a".repeat(40_000 * 4));
 	});
 
-	it("preserves a message whose sourcePath matches an absolute pattern in tier 3 (drop)", () => {
+	it("preserves a message whose sourcePath matches an absolute pattern in tier 3 (drop)", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath(
@@ -1141,7 +1141,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		];
 		// Trimmable mass without patterns: 120k → tier 3. With the
 		// absolute pattern, only the assistant counts (60k) → tier 2.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			preservedPatterns: ["/home/operator/CLAUDE.md"],
 		});
@@ -1156,13 +1156,13 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.equal(result.droppedTurns, 0);
 	});
 
-	it("a session whose only over-budget contributor is a preserved message does not trigger a trim", () => {
+	it("a session whose only over-budget contributor is a preserved message does not trigger a trim", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
 			assistantMsg("short"),
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			preservedPatterns: ["AGENTS.md"],
 		});
@@ -1172,7 +1172,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.equal(result.droppedTurns, 0);
 	});
 
-	it("preservedPatterns and protectedCustomTypes are independent channels", () => {
+	it("preservedPatterns and protectedCustomTypes are independent channels", async () => {
 		// A custom pinned message stays protected even when its
 		// sourcePath does not match any preserved pattern.
 		const protectedSet = new Set(["context-trimmer-pinned"]);
@@ -1181,7 +1181,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 			userMsg("dispatch", 0),
 			toolResultWithPath("a".repeat(30_000 * 4), "/repo/AGENTS.md"),
 		];
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			protectedCustomTypes: protectedSet,
 			preservedPatterns: ["AGENTS.md"],
@@ -1196,7 +1196,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.ok(preserved, "preserved tool result must survive");
 	});
 
-	it("preservedPatterns defaults to no paths preserved (no behavior change for callers)", () => {
+	it("preservedPatterns defaults to no paths preserved (no behavior change for callers)", async () => {
 		// A tool result carrying a source path is not protected
 		// when preservedPatterns is not passed.
 		const messages: TrimmableMessage[] = [
@@ -1204,7 +1204,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 			toolResultWithPath("a".repeat(60_000 * 4), "/repo/AGENTS.md"),
 			assistantMsg("b".repeat(60_000 * 4)),
 		];
-		const result = applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, { summarizer });
 		const preserved = result.messages.find(
 			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
 		);
@@ -1214,7 +1214,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		assert.ok(result.droppedTurns >= 1);
 	});
 
-	it("carves a preserved-path message out of a dropped trimmable turn (tier-3) — AC-6 (b)", () => {
+	it("carves a preserved-path message out of a dropped trimmable turn (tier-3) — AC-6 (b)", async () => {
 		// Build a session that lands in tier 3 (trimmable total > 100k).
 		// The preserved-path message sits inside the dropped trimmable
 		// turn slice. With the carve-out in `dropOldestTurns`
@@ -1238,7 +1238,7 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 		// indices [1, 4) (everything after the dispatch user anchor
 		// through end-of-stream). The preserved message at index 1
 		// must be carved out of the dropped slice and survive.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			preservedPatterns: ["AGENTS.md"],
 		});
@@ -1265,13 +1265,13 @@ describe("applyThreeTierTrim — preserved-paths channel end-to-end", () => {
 // ─── Public constants ─────────────────────────────────────────────────
 
 describe("exported constants", () => {
-	it("VERBATIM_TIER_MAX_TOKENS is 50_000", () => {
+	it("VERBATIM_TIER_MAX_TOKENS is 50_000", async () => {
 		assert.equal(VERBATIM_TIER_MAX_TOKENS, 50_000);
 	});
-	it("SUMMARIZE_TIER_MAX_TOKENS is 100_000", () => {
+	it("SUMMARIZE_TIER_MAX_TOKENS is 100_000", async () => {
 		assert.equal(SUMMARIZE_TIER_MAX_TOKENS, 100_000);
 	});
-	it("SUMMA_WORDS is positive", () => {
+	it("SUMMA_WORDS is positive", async () => {
 		assert.ok(SUMMA_WORDS > 0);
 	});
 });
@@ -1298,31 +1298,31 @@ describe("exported constants", () => {
 describe("loop-guard detection (AC-1, AC-4)", () => {
 	// ── fingerprintToolCall ─────────────────────────────────────
 
-	it("fingerprintToolCall: deterministic signature (same input → same output)", () => {
+	it("fingerprintToolCall: deterministic signature (same input → same output)", async () => {
 		const a = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3 } });
 		const b = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3 } });
 		assert.equal(a, b);
 	});
 
-	it("fingerprintToolCall: sorted-keys normalization (reordered keys fingerprint identically)", () => {
+	it("fingerprintToolCall: sorted-keys normalization (reordered keys fingerprint identically)", async () => {
 		const a = fingerprintToolCall({ name: "search", arguments: { q: "x", n: 3, extra: "y" } });
 		const b = fingerprintToolCall({ name: "search", arguments: { extra: "y", n: 3, q: "x" } });
 		assert.equal(a, b, "argument key order must not change the fingerprint");
 	});
 
-	it("fingerprintToolCall: distinct toolName → distinct fingerprint", () => {
+	it("fingerprintToolCall: distinct toolName → distinct fingerprint", async () => {
 		const a = fingerprintToolCall({ name: "search", arguments: { q: "x" } });
 		const b = fingerprintToolCall({ name: "lookup", arguments: { q: "x" } });
 		assert.notEqual(a, b, "different tool names must fingerprint differently");
 	});
 
-	it("fingerprintToolCall: distinct argument values → distinct fingerprint", () => {
+	it("fingerprintToolCall: distinct argument values → distinct fingerprint", async () => {
 		const a = fingerprintToolCall({ name: "search", arguments: { q: "x" } });
 		const b = fingerprintToolCall({ name: "search", arguments: { q: "y" } });
 		assert.notEqual(a, b);
 	});
 
-	it("fingerprintToolCall: nested objects are sorted recursively", () => {
+	it("fingerprintToolCall: nested objects are sorted recursively", async () => {
 		const a = fingerprintToolCall({
 			name: "search",
 			arguments: { q: "x", filter: { kind: "and", values: [1, 2, 3] } },
@@ -1334,7 +1334,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(a, b, "nested object key order must not change the fingerprint");
 	});
 
-	it("fingerprintToolCall: array order is preserved (it is part of the call's identity)", () => {
+	it("fingerprintToolCall: array order is preserved (it is part of the call's identity)", async () => {
 		const a = fingerprintToolCall({ name: "search", arguments: { items: [1, 2, 3] } });
 		const b = fingerprintToolCall({ name: "search", arguments: { items: [3, 2, 1] } });
 		assert.notEqual(a, b, "array order is part of the call's identity (the position of each element is semantically meaningful)");
@@ -1342,7 +1342,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 
 	// ── fingerprintAssistantTurn ───────────────────────────────
 
-	it("fingerprintAssistantTurn: a turn with no toolCall blocks returns a distinct signature (AC-9 — reasoning-only resets the run)", () => {
+	it("fingerprintAssistantTurn: a turn with no toolCall blocks returns a distinct signature (AC-9 — reasoning-only resets the run)", async () => {
 		const textOnly = fingerprintAssistantTurn([{ type: "text", text: "hello" }]);
 		assert.equal(
 			textOnly,
@@ -1351,7 +1351,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		);
 	});
 
-	it("fingerprintAssistantTurn: a turn with a single toolCall returns the call's fingerprint", () => {
+	it("fingerprintAssistantTurn: a turn with a single toolCall returns the call's fingerprint", async () => {
 		const turn = fingerprintAssistantTurn([
 			{ type: "text", text: "I'll search" },
 			{ type: "toolCall", name: "search", arguments: { q: "x" } },
@@ -1360,7 +1360,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(turn, expected);
 	});
 
-	it("fingerprintAssistantTurn: a multi-tool-call turn's fingerprint is the sorted conjunction of all calls", () => {
+	it("fingerprintAssistantTurn: a multi-tool-call turn's fingerprint is the sorted conjunction of all calls", async () => {
 		// fingerprintAssistantTurn sorts the per-call fingerprints
 		// before joining, so the per-turn signature is order-
 		// independent (a turn with [search, lookup] and a turn with
@@ -1375,13 +1375,13 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(turn, expected);
 	});
 
-	it("fingerprintAssistantTurn: two turns with identical tool-call sets match", () => {
+	it("fingerprintAssistantTurn: two turns with identical tool-call sets match", async () => {
 		const a = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
 		const b = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
 		assert.equal(a, b);
 	});
 
-	it("fingerprintAssistantTurn: different argument values → different fingerprints", () => {
+	it("fingerprintAssistantTurn: different argument values → different fingerprints", async () => {
 		const a = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "x" } }]);
 		const b = fingerprintAssistantTurn([{ type: "toolCall", name: "search", arguments: { q: "y" } }]);
 		assert.notEqual(a, b);
@@ -1389,7 +1389,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 
 	// ── detectConsecutiveIdenticalToolCalls ───────────────────
 
-	it("detectConsecutiveIdenticalToolCalls: a run of N identical assistant turns yields runLength === N and matching signature", () => {
+	it("detectConsecutiveIdenticalToolCalls: a run of N identical assistant turns yields runLength === N and matching signature", async () => {
 		const N = 4;
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
@@ -1403,7 +1403,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "loop-test" } }));
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: a different assistant turn in the middle resets the run", () => {
+	it("detectConsecutiveIdenticalToolCalls: a different assistant turn in the middle resets the run", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			assistantWithToolCall("search", { q: "same" }),
@@ -1416,7 +1416,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "same" } }));
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: non-assistant messages do not break the run and do not extend it", () => {
+	it("detectConsecutiveIdenticalToolCalls: non-assistant messages do not break the run and do not extend it", async () => {
 		// The walk is over assistant turns only. A user or toolResult
 		// message inside the candidate run is skipped: it neither
 		// contributes to the run count nor resets it (a toolResult
@@ -1436,7 +1436,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(lastSignature, fingerprintToolCall({ name: "search", arguments: { q: "x" } }));
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: reasoning-only trailing turn yields runLength 0 (AC-9)", () => {
+	it("detectConsecutiveIdenticalToolCalls: reasoning-only trailing turn yields runLength 0 (AC-9)", async () => {
 		// A no-toolCall assistant turn at the end resets the run
 		// (the predicate returns the dedicated no-tool-calls
 		// signature, which never matches a real tool-call signature,
@@ -1453,7 +1453,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(lastSignature, null, "no run detected when the last assistant turn is reasoning-only");
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: threshold <= 0 disables detection (no run counted)", () => {
+	it("detectConsecutiveIdenticalToolCalls: threshold <= 0 disables detection (no run counted)", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
 			assistantWithToolCall("search", { q: "x" }),
@@ -1470,7 +1470,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		);
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: multi-tool-call turn matches iff the conjunction matches", () => {
+	it("detectConsecutiveIdenticalToolCalls: multi-tool-call turn matches iff the conjunction matches", async () => {
 		// Two identical multi-tool-call turns → run is 2.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch", 0),
@@ -1488,7 +1488,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.ok(lastSignature && lastSignature.length > 0);
 	});
 
-	it("detectConsecutiveIdenticalToolCalls: reordered tools in the same turn do NOT match (order is part of the conjunction)", () => {
+	it("detectConsecutiveIdenticalToolCalls: reordered tools in the same turn do NOT match (order is part of the conjunction)", async () => {
 		// The two turns call the same tools in different orders. The
 		// conjunction sorts the per-call fingerprints before joining
 		// (fingerprintAssistantTurn sorts), so reordering still
@@ -1508,7 +1508,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 
 	// ── computeFlatInputTokenSignal ───────────────────────────
 
-	it("computeFlatInputTokenSignal: flat last-N token counts → flat: true", () => {
+	it("computeFlatInputTokenSignal: flat last-N token counts → flat: true", async () => {
 		// All five last assistant turns are the same string → same
 		// approximateMessageTokens → flat.
 		const sameTurn = assistantMsg("the same content repeated");
@@ -1529,7 +1529,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		}
 	});
 
-	it("computeFlatInputTokenSignal: token counts varying > 5% → flat: false", () => {
+	it("computeFlatInputTokenSignal: token counts varying > 5% → flat: false", async () => {
 		// Build five assistant turns of increasing size so the
 		// spread between the largest and smallest is more than 5%.
 		const tokens = [100, 100, 100, 200, 1000];
@@ -1541,7 +1541,7 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(sampleTokens.length, 5);
 	});
 
-	it("computeFlatInputTokenSignal: small variation within tolerance → flat: true", () => {
+	it("computeFlatInputTokenSignal: small variation within tolerance → flat: true", async () => {
 		// Five turns sized 1000, 1000, 1000, 1000, 1010 tokens. The
 		// spread is 10/1000 = 1%, well within the 5% tolerance.
 		const tokens = [1000, 1000, 1000, 1000, 1010];
@@ -1551,43 +1551,43 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.equal(flat, true, "1% spread is within the 5% tolerance");
 	});
 
-	it("computeFlatInputTokenSignal: fewer than 2 assistant turns → flat: false (no signal)", () => {
+	it("computeFlatInputTokenSignal: fewer than 2 assistant turns → flat: false (no signal)", async () => {
 		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), assistantMsg("hi")];
 		const { flat } = computeFlatInputTokenSignal(messages);
 		assert.equal(flat, false, "single sample yields no signal");
 	});
 
-	it("FLAT_INPUT_TOKEN_TOLERANCE is the documented 0.05", () => {
+	it("FLAT_INPUT_TOKEN_TOLERANCE is the documented 0.05", async () => {
 		assert.equal(FLAT_INPUT_TOKEN_TOLERANCE, 0.05);
 	});
 
 	// ── shouldHardBlock ───────────────────────────────────────
 
-	it("shouldHardBlock: undefined threshold → false (hard-block off by default)", () => {
+	it("shouldHardBlock: undefined threshold → false (hard-block off by default)", async () => {
 		assert.equal(shouldHardBlock(5, undefined), false);
 		assert.equal(shouldHardBlock(100, undefined), false);
 	});
 
-	it("shouldHardBlock: runLength >= threshold → true", () => {
+	it("shouldHardBlock: runLength >= threshold → true", async () => {
 		assert.equal(shouldHardBlock(3, 3), true, "exact-equal run length meets the threshold");
 		assert.equal(shouldHardBlock(10, 3), true, "run length above the threshold");
 	});
 
-	it("shouldHardBlock: runLength < threshold → false", () => {
+	it("shouldHardBlock: runLength < threshold → false", async () => {
 		assert.equal(shouldHardBlock(2, 3), false);
 		assert.equal(shouldHardBlock(0, 3), false);
 	});
 
 	// ── Nudge / block text shape ──────────────────────────────
 
-	it("LOOP_GUARD_NUDGE_TEXT is non-empty, names the repetition, and uses non-directive phrasing", () => {
+	it("LOOP_GUARD_NUDGE_TEXT is non-empty, names the repetition, and uses non-directive phrasing", async () => {
 		assert.ok(LOOP_GUARD_NUDGE_TEXT.length > 0);
 		assert.ok(/called the same tool/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must reference the repeated tool call");
 		assert.ok(/same arguments/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must reference the same arguments");
 		assert.ok(!/you must/i.test(LOOP_GUARD_NUDGE_TEXT), "nudge must not use directive 'you must' language");
 	});
 
-	it("LOOP_GUARD_BLOCK_TEXT is non-empty, names the block, and routes the model to text", () => {
+	it("LOOP_GUARD_BLOCK_TEXT is non-empty, names the block, and routes the model to text", async () => {
 		assert.ok(LOOP_GUARD_BLOCK_TEXT.length > 0);
 		assert.ok(/blocked/i.test(LOOP_GUARD_BLOCK_TEXT), "block must name the block action");
 		assert.ok(/reasoning in text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed by text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed via text/i.test(LOOP_GUARD_BLOCK_TEXT), "block must route the model to text-only reasoning");
@@ -1631,7 +1631,7 @@ function summarizedAssistantMsg(originalTokens: number, summaryTokens: number, s
 }
 
 describe("isAlreadySummarized", () => {
-	it("returns true for an array content whose first text block starts with the summa envelope", () => {
+	it("returns true for an array content whose first text block starts with the summa envelope", async () => {
 		const msg: TrimmableMessage = {
 			role: "assistant",
 			content: [
@@ -1641,7 +1641,7 @@ describe("isAlreadySummarized", () => {
 		assert.equal(isAlreadySummarized(msg), true);
 	});
 
-	it("returns true even when the envelope tag is followed by a long summary body", () => {
+	it("returns true even when the envelope tag is followed by a long summary body", async () => {
 		const msg: TrimmableMessage = {
 			role: "toolResult",
 			content: [
@@ -1651,7 +1651,7 @@ describe("isAlreadySummarized", () => {
 		assert.equal(isAlreadySummarized(msg), true);
 	});
 
-	it("returns false for an array content whose first text block is plain text", () => {
+	it("returns false for an array content whose first text block is plain text", async () => {
 		const msg: TrimmableMessage = {
 			role: "assistant",
 			content: [{ type: "text", text: "hello, this is a regular assistant turn" }],
@@ -1659,7 +1659,7 @@ describe("isAlreadySummarized", () => {
 		assert.equal(isAlreadySummarized(msg), false);
 	});
 
-	it("returns false for an array content whose first text block starts with a different bracket tag", () => {
+	it("returns false for an array content whose first text block starts with a different bracket tag", async () => {
 		// Other bracket-leading strings (e.g. a hypothetical "[note:" tag) are
 		// not the summa envelope; the predicate must reject them.
 		const msg: TrimmableMessage = {
@@ -1669,7 +1669,7 @@ describe("isAlreadySummarized", () => {
 		assert.equal(isAlreadySummarized(msg), false);
 	});
 
-	it("returns false for a string content (the envelope only lives in array text blocks)", () => {
+	it("returns false for a string content (the envelope only lives in array text blocks)", async () => {
 		const msg: TrimmableMessage = {
 			role: "assistant",
 			content: "[summa: ~100 tokens originally → ~20 tokens summary]\nsummary text",
@@ -1677,17 +1677,17 @@ describe("isAlreadySummarized", () => {
 		assert.equal(isAlreadySummarized(msg), false);
 	});
 
-	it("returns false for an empty string content", () => {
+	it("returns false for an empty string content", async () => {
 		const msg: TrimmableMessage = { role: "user", content: "" };
 		assert.equal(isAlreadySummarized(msg), false);
 	});
 
-	it("returns false for an empty array content", () => {
+	it("returns false for an empty array content", async () => {
 		const msg: TrimmableMessage = { role: "assistant", content: [] };
 		assert.equal(isAlreadySummarized(msg), false);
 	});
 
-	it("returns false for an array content whose first block is not a text block", () => {
+	it("returns false for an array content whose first block is not a text block", async () => {
 		// A non-text block first (e.g. a toolCall) is not the envelope
 		// carrier; the envelope lives in `{ type: "text" }` blocks.
 		const msg: TrimmableMessage = {
@@ -1699,18 +1699,18 @@ describe("isAlreadySummarized", () => {
 });
 
 describe("messageFingerprint", () => {
-	it("returns the first 200 chars of a string content", () => {
+	it("returns the first 200 chars of a string content", async () => {
 		const longText = "a".repeat(500);
 		const msg: TrimmableMessage = { role: "user", content: longText };
 		assert.equal(messageFingerprint(msg), "a".repeat(200));
 	});
 
-	it("returns the full string when shorter than 200 chars", () => {
+	it("returns the full string when shorter than 200 chars", async () => {
 		const msg: TrimmableMessage = { role: "user", content: "short" };
 		assert.equal(messageFingerprint(msg), "short");
 	});
 
-	it("returns the first 200 chars of the first text block for array content", () => {
+	it("returns the first 200 chars of the first text block for array content", async () => {
 		const longText = "b".repeat(500);
 		const msg: TrimmableMessage = {
 			role: "assistant",
@@ -1722,7 +1722,7 @@ describe("messageFingerprint", () => {
 		assert.equal(messageFingerprint(msg), "b".repeat(200));
 	});
 
-	it("returns an empty string for array content with no text blocks", () => {
+	it("returns an empty string for array content with no text blocks", async () => {
 		const msg: TrimmableMessage = {
 			role: "assistant",
 			content: [{ type: "toolCall", name: "search", arguments: { q: "x" } }],
@@ -1730,12 +1730,12 @@ describe("messageFingerprint", () => {
 		assert.equal(messageFingerprint(msg), "");
 	});
 
-	it("returns an empty string for an empty string content", () => {
+	it("returns an empty string for an empty string content", async () => {
 		const msg: TrimmableMessage = { role: "user", content: "" };
 		assert.equal(messageFingerprint(msg), "");
 	});
 
-	it("returns exactly 200 chars for content longer than 200 chars (not 201, not 199)", () => {
+	it("returns exactly 200 chars for content longer than 200 chars (not 201, not 199)", async () => {
 		const longText = "x".repeat(250);
 		const msg: TrimmableMessage = { role: "user", content: longText };
 		const fp = messageFingerprint(msg);
@@ -1743,14 +1743,14 @@ describe("messageFingerprint", () => {
 		assert.equal(fp, "x".repeat(200));
 	});
 
-	it("returns the same fingerprint for two messages whose first 200 chars are identical", () => {
+	it("returns the same fingerprint for two messages whose first 200 chars are identical", async () => {
 		const base = "c".repeat(200);
 		const msg1: TrimmableMessage = { role: "user", content: base + "trailing" };
 		const msg2: TrimmableMessage = { role: "user", content: base + "different trailing" };
 		assert.equal(messageFingerprint(msg1), messageFingerprint(msg2));
 	});
 
-	it("returns different fingerprints for two messages whose first 200 chars differ", () => {
+	it("returns different fingerprints for two messages whose first 200 chars differ", async () => {
 		const msg1: TrimmableMessage = { role: "user", content: "d".repeat(200) + "trailing" };
 		const msg2: TrimmableMessage = { role: "user", content: "e".repeat(200) + "trailing" };
 		assert.notEqual(messageFingerprint(msg1), messageFingerprint(msg2));
@@ -1760,7 +1760,7 @@ describe("messageFingerprint", () => {
 describe("applyThreeTierTrim — skip already-summarized by envelope (case a)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("skips a message whose content carries the summa envelope and summarizes a non-summarized message instead", () => {
+	it("skips a message whose content carries the summa envelope and summarizes a non-summarized message instead", async () => {
 		// Two trimmable messages: one already-summarized (carries the
 		// envelope) and one fresh. Set `verbatimMaxTokens` so the
 		// fresh message's mass forces a summarize pass; the
@@ -1772,7 +1772,7 @@ describe("applyThreeTierTrim — skip already-summarized by envelope (case a)", 
 		// message is ~25 tokens. Total = 30,025. Setting
 		// verbatimMaxTokens to 25,000 puts the total OVER the cap so
 		// the tier-2 summarize path fires.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			verbatimMaxTokens: 25_000,
 		});
@@ -1800,7 +1800,7 @@ describe("applyThreeTierTrim — skip already-summarized by envelope (case a)", 
 });
 
 describe("applyThreeTierTrim — escape clause when only summarized candidates remain (case b)", () => {
-	it("re-summarizes an already-summarized candidate when the total is still over the verbatim cap", () => {
+	it("re-summarizes an already-summarized candidate when the total is still over the verbatim cap", async () => {
 		// Two trimmable messages, BOTH already-summarized with LARGE
 		// summaries (the summaries themselves are big — 3000 chars /
 		// 4 = 750 tokens each, ×2 = 1500 tokens). Set `verbatimMax`
@@ -1820,8 +1820,8 @@ describe("applyThreeTierTrim — escape clause when only summarized candidates r
 		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), summarized1, summarized2];
 		// A summarizer that returns a small fixed string — the
 		// post-replacement content is much smaller than the original.
-		const result = applyThreeTierTrim(messages, {
-			summarizer: () => "x".repeat(20),
+		const result = await applyThreeTierTrim(messages, {
+			summarizer: async () => "x".repeat(20),
 			verbatimMaxTokens: 1000,
 		});
 		// The escape clause fired: at least one message was re-summarized.
@@ -1843,7 +1843,7 @@ describe("applyThreeTierTrim — escape clause when only summarized candidates r
 describe("applyThreeTierTrim — does not re-summarize already-summarized when total is under cap (case c)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("leaves an already-summarized message untouched when a non-summarized alternative covers the budget", () => {
+	it("leaves an already-summarized message untouched when a non-summarized alternative covers the budget", async () => {
 		// One already-summarized trimmable message (small) + one fresh
 		// trimmable message. The fresh message, once summarized by the
 		// stub (which returns "summary"), shrinks the total under the
@@ -1859,7 +1859,7 @@ describe("applyThreeTierTrim — does not re-summarize already-summarized when t
 		// / 4 = 2 tokens) — summarizing the fresh message alone
 		// brings the total to 22, well under 15,000, so exactly
 		// one summarize fires.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			verbatimMaxTokens: 15_000,
 		});
@@ -1887,7 +1887,7 @@ describe("applyThreeTierTrim — does not re-summarize already-summarized when t
 describe("applyThreeTierTrim — alreadySummarizedHashes threads through TrimOptions (case d)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("skips a message whose fingerprint is in alreadySummarizedHashes and summarizes a different message", () => {
+	it("skips a message whose fingerprint is in alreadySummarizedHashes and summarizes a different message", async () => {
 		// Two fresh trimmable messages, neither carrying the envelope.
 		// Pass `alreadySummarizedHashes` containing the fingerprint of
 		// the FIRST trimmable message. The skip branch must lift that
@@ -1905,7 +1905,7 @@ describe("applyThreeTierTrim — alreadySummarizedHashes threads through TrimOpt
 		// string content. Build the set directly.
 		const firstFp = messageFingerprint(first);
 		const alreadySummarizedHashes = new Set<string>([firstFp]);
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			alreadySummarizedHashes,
 			verbatimMaxTokens: 25_000,
@@ -1937,7 +1937,7 @@ describe("applyThreeTierTrim — alreadySummarizedHashes threads through TrimOpt
 describe("applyThreeTierTrim — within-pass cursor does not infinite-loop (case e)", () => {
 	const summarizer = makeTrimmingSummarizer(5);
 
-	it("terminates with the already-summarized oldest message untouched and a younger message summarized", () => {
+	it("terminates with the already-summarized oldest message untouched and a younger message summarized", async () => {
 		// The oldest trimmable message already carries the summa
 		// envelope. The verbatim cap is set so a younger fresh
 		// trimmable message must be summarized. The cursor must
@@ -1950,7 +1950,7 @@ describe("applyThreeTierTrim — within-pass cursor does not infinite-loop (case
 		// The function MUST return (no infinite loop). The single
 		// summarize pass on `younger` shrinks the total under the
 		// cap; the loop exits cleanly.
-		const result = applyThreeTierTrim(messages, {
+		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			verbatimMaxTokens: 5_000,
 		});
@@ -1974,3 +1974,147 @@ describe("applyThreeTierTrim — within-pass cursor does not infinite-loop (case
 	});
 });
 
+
+// ─── Background summarizer mode (backgroundSummarize: true) ───────────
+//
+// When `backgroundSummarize: true`, the policy fires summarizer
+// promises in the background and returns immediately, leaving the
+// original (un-summarized) message content in place. The pending
+// promises are carried in `TrimResult.pendingSummaries` for the
+// wiring layer to await and cache. The returned `backgroundPending`
+// flag is `true` when at least one promise was fired, `false` when
+// no summarization was needed (verbatim tier) or no summarizer
+// callback was provided.
+
+describe("applyThreeTierTrim — background summarizer mode", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	it("returns backgroundPending: true and pendingSummaries when the trim would summarize in background mode", async () => {
+		// Build a session that lands in tier 2 (>50k trimmable).
+		const messages: TrimmableMessage[] = trimmableMass(60_000);
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			backgroundSummarize: true,
+		});
+		// (i) At least one background promise was fired.
+		assert.equal(result.backgroundPending, true, "backgroundPending must be true when the trim fired at least one background promise");
+		assert.ok(result.pendingSummaries, "pendingSummaries must be present when backgroundPending is true");
+		assert.ok(result.pendingSummaries!.length >= 1, "pendingSummaries must have at least one entry");
+		// (ii) The original message content is NOT replaced (the
+		// background path leaves content untouched).
+		const assistantInResult = result.messages.find(
+			(m) => m.role === "assistant" && typeof m.content === "string" && (m.content as string).includes("a".repeat(100)),
+		);
+		assert.ok(assistantInResult, "the original assistant message survives verbatim in background mode (content is the original string)");
+		// (iii) `summarized` is the count of fired promises (the
+		// background path increments the same counter).
+		assert.ok(result.summarized >= 1, "summarized counter is at least 1 (fired promises count)");
+	});
+
+	it("backgroundSummarize: true does NOT replace message content in place (messages stay original)", async () => {
+		// Build a tier-2 session: a single trimmable message over 50k.
+		const trimmableBody = "x".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg(trimmableBody),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			backgroundSummarize: true,
+		});
+		// (i) The assistant's content is the ORIGINAL string —
+		// not rewritten to a summa envelope array.
+		const assistant = result.messages.find((m) => m.role === "assistant");
+		assert.ok(assistant, "assistant must be in the output");
+		assert.equal(assistant!.content, trimmableBody, "background mode leaves content untouched (the original string)");
+		assert.ok(!Array.isArray(assistant!.content), "background mode content is NOT a summa envelope array");
+	});
+
+	it("backgroundSummarize: false (default) replaces content in place (sync mode, but async function)", async () => {
+		// The same fixture, but with backgroundSummarize omitted (default false).
+		// Sync mode awaits the summarizer and rewrites content in place.
+		const trimmableBody = "y".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg(trimmableBody),
+		];
+		const result = await applyThreeTierTrim(messages, { summarizer });
+		// (i) backgroundPending is false (sync mode, no background).
+		assert.equal(result.backgroundPending, false, "backgroundPending is false in sync mode");
+		assert.equal(result.pendingSummaries, undefined, "no pendingSummaries in sync mode");
+		// (ii) Content is replaced with the summa envelope (the
+		// message's content is now an array, not the original string).
+		const assistant = result.messages.find((m) => m.role === "assistant");
+		assert.ok(assistant, "assistant must be in the output");
+		assert.ok(Array.isArray(assistant!.content), "sync mode rewrites content to a summa envelope array");
+	});
+
+	it("backgroundPending is false when the trim is in the verbatim tier (no summarization needed)", async () => {
+		// A small session — verbatim tier, no summarization.
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), assistantMsg("hi")];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			backgroundSummarize: true,
+		});
+		// No summarization fired — backgroundPending is false.
+		assert.equal(result.backgroundPending, false, "verbatim tier → no background promise fired");
+		assert.equal(result.pendingSummaries, undefined, "verbatim tier → no pendingSummaries");
+		assert.equal(result.summarized, 0, "verbatim tier → summarized counter is 0");
+	});
+
+	it("pendingSummaries carries the correct index, fingerprint, originalMessage, and promise for each summarized message", async () => {
+		// Two trimmable messages, both over 50k, both candidates
+		// for summarization. Both fired as background promises.
+		const first = assistantMsg("p".repeat(30_000 * 4));
+		const second = assistantMsg("q".repeat(30_000 * 4));
+		const messages: TrimmableMessage[] = [userMsg("dispatch", 0), first, second];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			backgroundSummarize: true,
+		});
+		// (i) At least one entry in pendingSummaries.
+		assert.ok(result.pendingSummaries && result.pendingSummaries.length >= 1);
+		// (ii) Each entry carries the right shape: index (number),
+		// fingerprint (string), originalMessage (TrimmableMessage),
+		// promise (Promise<string>).
+		for (const entry of result.pendingSummaries!) {
+			assert.equal(typeof entry.index, "number", "entry.index is a number");
+			assert.ok(entry.index >= 0, "entry.index is a valid index");
+			assert.equal(typeof entry.fingerprint, "string", "entry.fingerprint is a string");
+			assert.ok(entry.fingerprint.length > 0, "entry.fingerprint is non-empty");
+			assert.ok(entry.originalMessage, "entry.originalMessage is present");
+			assert.equal(typeof entry.originalMessage.role, "string", "entry.originalMessage has a role");
+			assert.ok(entry.promise && typeof entry.promise.then === "function", "entry.promise is a thenable");
+		}
+		// (iii) The first pending entry's index is the first
+		// trimmable message in the array (oldest-first selection
+		// picks index 1 in [dispatch, first, second]).
+		assert.equal(result.pendingSummaries![0].index, 1, "the first fired background promise targets the oldest trimmable message");
+		// (iv) The fingerprint is the first 200 chars of the
+		// original content (per the policy's messageFingerprint
+		// semantics).
+		const expectedFp = messageFingerprint(first);
+		assert.equal(result.pendingSummaries![0].fingerprint, expectedFp, "fingerprint matches messageFingerprint(original)");
+	});
+
+	it("the pending promise resolves to the summary text", async () => {
+		// Build a session that fires at least one background
+		// promise and await the promise directly to verify it
+		// resolves to the summary text.
+		const trimmableBody = "z".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg(trimmableBody),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			backgroundSummarize: true,
+		});
+		assert.ok(result.pendingSummaries && result.pendingSummaries.length >= 1);
+		// Await the first pending promise. The summarizer stub
+		// returns "summary" (7 chars). Verify the promise resolves
+		// to that text.
+		const summaryText = await result.pendingSummaries![0].promise;
+		assert.equal(summaryText, "summary", "the pending promise resolves to the summarizer's return value");
+	});
+});

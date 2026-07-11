@@ -37,6 +37,7 @@ let fixtureDir: string;
 let savedPersonalityEnv: string | undefined;
 let savedProtectEnv: string | undefined;
 let savedConfigPathEnv: string | undefined;
+let savedAsyncModeEnv: string | undefined;
 
 before(() => {
 	fixtureDir = mkdtempSync(join(tmpdir(), "ctx-trimmer-"));
@@ -44,12 +45,18 @@ before(() => {
 	savedPersonalityEnv = process.env[CONFIG_ENV.personalityPath];
 	savedProtectEnv = process.env[CONFIG_ENV.protectDispatch];
 	savedConfigPathEnv = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	savedAsyncModeEnv = process.env[CONFIG_ENV.asyncMode];
 	// Point the config file at a non-existent path so the file channel
 	// is empty for every test (env is the only input).
 	process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 	process.env[CONFIG_ENV.personalityPath] = join(fixtureDir, "personality.md");
 	// Dispatch protection ON (simulates pi-subagents being installed).
 	process.env[CONFIG_ENV.protectDispatch] = "1";
+	// Sync mode (asyncMode OFF) — the existing tests assert the
+	// set/clear status lifecycle on the trim path's synchronous span.
+	// Background mode is exercised by its own dedicated describe block
+	// below, which restores async mode to ON in beforeEach.
+	process.env[CONFIG_ENV.asyncMode] = "0";
 });
 
 after(() => {
@@ -57,6 +64,7 @@ after(() => {
 		[CONFIG_ENV.personalityPath, savedPersonalityEnv],
 		[CONFIG_ENV.protectDispatch, savedProtectEnv],
 		["PI_CONTEXT_TRIMMER_CONFIG_PATH", savedConfigPathEnv],
+		[CONFIG_ENV.asyncMode, savedAsyncModeEnv],
 	] as const) {
 		if (v === undefined) delete process.env[k];
 		else process.env[k] = v;
@@ -615,22 +623,29 @@ describe("default summa subprocess", () => {
 	// here end-to-end to confirm summa is installed and reachable. The
 	// input is a paragraph long enough for summa to produce a
 	// non-trivial summary (>200 chars).
+	//
+	// The default summarizer lives in `index.ts` (the wiring layer),
+	// not `policy.ts` — it was moved out of the pure module so the
+	// subprocess I/O doesn't pollute the policy's purity contract.
+	// Tests import from `index.ts` and assert both the resolved
+	// summary text and the `lastSummarizerFailed` diagnostic export
+	// against the index module.
 	let result: string | undefined;
 	before(async () => {
-		// Import the policy module and invoke the default summarizer
+		// Import the wiring module and invoke the default summarizer
 		// directly. We do this via dynamic import to keep the path
-		// test-only and avoid pulling the policy into the harness
+		// test-only and avoid pulling the wiring into the harness
 		// startup.
-		const policyPath = resolve(import.meta.dirname ?? ".", "..", "policy.ts");
-		const policy = await import(policyPath);
-		const summarizer = policy.defaultSummaSummarizer;
+		const modulePath = resolve(import.meta.dirname ?? ".", "..", "index.ts");
+		const mod = await import(modulePath);
+		const summarizer = mod.defaultSummaSummarizer;
 		const longText = [
 			"The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel.",
 			"Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees.",
 			"It was a sunny day with a gentle breeze. Everyone was happy and the end was near.",
 			"The park was green and lush, full of life and sound. The end of the day was approaching.",
 		].join(" ");
-		result = summarizer(longText, 20);
+		result = await summarizer(longText, 20);
 	});
 
 	it("returns a shorter string than the input", () => {
@@ -644,11 +659,11 @@ describe("default summa subprocess", () => {
 	});
 
 	it("the lastSummarizerFailed flag is the diagnostic export", async () => {
-		const policyPath = resolve(import.meta.dirname ?? ".", "..", "policy.ts");
-		const policy = await import(policyPath);
+		const modulePath = resolve(import.meta.dirname ?? ".", "..", "index.ts");
+		const mod = await import(modulePath);
 		// The export must be a boolean (it's mutated by the default
 		// summarizer on failure).
-		assert.equal(typeof policy.lastSummarizerFailed, "boolean");
+		assert.equal(typeof mod.lastSummarizerFailed, "boolean");
 	});
 });
 
@@ -1857,3 +1872,180 @@ describe("session_start handler registers and fires (AC-8 e)", () => {
 	});
 });
 
+
+// ─── Background-mode integration (asyncMode: true) ────────────────────
+//
+// The wiring exposes `PI_CONTEXT_TRIMMER_ASYNC_MODE` (and the
+// `asyncMode` config-file key) for the operator to opt OUT of the
+// default async behavior. The module-level `before` block above
+// forces `PI_CONTEXT_TRIMMER_ASYNC_MODE=0` so the existing tests
+// exercise the sync path. This describe block flips asyncMode ON
+// in a per-test beforeEach and restores the suite-level setting
+// in afterEach; the existing tests' sync assertions still hold.
+//
+// Background mode is the production default (DEFAULT_ASYNC_MODE =
+// true) but the existing tests assert the synchronous status
+// lifecycle (set/clear around the awaited trim). Background mode
+// changes the status lifecycle: the status is set at departure
+// (after the trim returns, when background promises are pending)
+// and cleared at re-enter (when the next context event applies
+// the resolved cache entry). The tests below exercise the
+// fire-once / apply-on-next-event interlock end-to-end against
+// the production wiring.
+
+describe("background-mode integration — asyncMode: true", () => {
+	let sAsyncMode: string | undefined;
+	beforeEach(() => {
+		sAsyncMode = process.env[CONFIG_ENV.asyncMode];
+		process.env[CONFIG_ENV.asyncMode] = "1";
+	});
+	afterEach(() => {
+		if (sAsyncMode === undefined) delete process.env[CONFIG_ENV.asyncMode];
+		else process.env[CONFIG_ENV.asyncMode] = sAsyncMode;
+	});
+
+	// Build a tier-2 fixture: two trimmable assistant messages of
+	// ~30k tokens each. Trimmable total ≈ 60k, which lands in the
+	// tier-2 (summarize) band when the 50k verbatim cap is in effect.
+	// In background mode the trim fires summarizer promises for the
+	// trimmable messages and returns immediately with the original
+	// content intact.
+	function buildTier2Event() {
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
+		return {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+	}
+
+	it("the first context call returns messages WITHOUT summa envelopes (background mode defers rewriting)", async () => {
+		// The trim fires the production `defaultSummaSummarizer` (a
+		// Python summa subprocess) in the background. The returned
+		// messages carry the ORIGINAL assistant content — no
+		// `[summa: ~N tokens originally → ~M tokens summary]`
+		// envelope is rewritten into the array because background
+		// mode leaves content untouched. The background promise
+		// resolves later (asynchronously, outside the handler's
+		// await chain) and builds a cache entry.
+		const pi = await loadExtension();
+		const result = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
+		// The trimmable assistants are returned with their ORIGINAL
+		// string content (no envelope, no rewrite).
+		const assistants = result.messages.filter((m) => m.role === "assistant");
+		assert.ok(assistants.length >= 1, "at least one assistant survives the trim");
+		for (const a of assistants) {
+			if (typeof a.content === "string") {
+				// String content: original, no envelope.
+				assert.ok(
+					!a.content.startsWith("[summa:"),
+					"background mode leaves content untouched (no summa envelope on the string content)",
+				);
+			} else if (Array.isArray(a.content)) {
+				// Array content would only appear if the message was
+				// already-summarized; in the first call there is no
+				// cache to substitute, so no array content should
+				// appear in the output. Defensive check.
+				const hasEnvelope = a.content.some(
+					(b: unknown) => b && typeof b === "object" && (b as { type?: string }).type === "text" && typeof (b as { text?: string }).text === "string" && (b as { text: string }).text.startsWith("[summa:"),
+				);
+				assert.ok(!hasEnvelope, "background mode does not rewrite content in place (no envelope array)");
+			}
+		}
+	});
+
+	it("the second context call substitutes the cached summarized message before the trim runs (apply-on-next-event)", async () => {
+		// Fire the first context call (background mode fires the
+		// production `defaultSummaSummarizer` promise). Wait for
+		// the promise to resolve (the production summarizer uses
+		// `execFile` with a 5s timeout; for a long input it
+		// resolves in well under a second). Fire the second
+		// context call — the cache substitution applies the
+		// resolved summary (with the `[summa:` envelope in its
+		// content) into the trimmable message array before the
+		// trim runs. The behavioral proof: the second call's
+		// returned messages DO carry summa envelopes.
+		const pi = await loadExtension();
+		// First call: fires the background promise; returned
+		// messages have original content (no envelope).
+		const firstResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
+		// Sanity: the first call's output does NOT have envelopes.
+		const firstEnvelopes = firstResult.messages.filter(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
+			),
+		);
+		assert.equal(firstEnvelopes.length, 0, "first call: no summa envelopes in the output (background mode defers rewriting)");
+		// Wait for the background promise to resolve and build the
+		// cache entry. The production summarizer shells out to
+		// Python summa; for a 30k-token input it typically
+		// resolves in well under a second, but we wait up to 3s
+		// to be safe across slow machines.
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
+		// Second call: the cache substitution applies the
+		// resolved summary BEFORE the trim runs. The returned
+		// messages now carry summa envelopes on the trimmable
+		// messages.
+		const secondResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
+		const secondEnvelopes = secondResult.messages.filter(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
+			),
+		);
+		assert.ok(
+			secondEnvelopes.length >= 1,
+			"second call: at least one trimmable message carries a summa envelope (cache substitution applied)",
+		);
+	});
+
+	it("fire-once consume: the third context call does NOT substitute the cache entry again (one-shot)", async () => {
+		// After the second call applies the cache, the cache
+		// entry is deleted (fire-once consume). The third call
+		// with the same input does not substitute the cache
+		// again — the message goes through the normal trim
+		// path. With the cache gone, the policy's
+		// `isAlreadySummarized` check (via the now-substituted
+		// summa envelope on the message) catches the already-
+		// summarized message in `result.messages` and skips it.
+		// The behavioral proof: a trimmable message that came
+		// in with a summa envelope (carried over from the
+		// second call's output via the persistent message
+		// stream) is NOT re-summarized on the third call.
+		const pi = await loadExtension();
+		// First call: fires the background promise.
+		await invokeContext(pi, buildTier2Event());
+		// Wait for the cache to fill.
+		await new Promise((resolve) => setTimeout(resolve, 3_000));
+		// Second call: cache substitution applies.
+		const secondResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
+		// The second call's output carries the substituted
+		// summa envelopes. In a real session, the third call's
+		// `event.messages` is the persisted message stream —
+		// which would carry those envelopes. For the test, we
+		// feed the second call's output back in as the third
+		// call's input (the "messages from a prior event" are
+		// the persisted stream with the substituted envelopes).
+		const persistedWithEnvelopes = {
+			messages: secondResult.messages,
+		};
+		// Third call: the cache is empty (consumed on the
+		// second call). The trimmable messages with summa
+		// envelopes enter the trim path; the policy's
+		// `isAlreadySummarized` check skips them. The
+		// returned messages still carry the envelopes (no
+		// re-summarization fired).
+		const thirdResult = (await invokeContext(pi, persistedWithEnvelopes)) as { messages: Array<Record<string, unknown>> };
+		const thirdEnvelopes = thirdResult.messages.filter(
+			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
+			),
+		);
+		assert.ok(
+			thirdEnvelopes.length >= 1,
+			"third call: at least one trimmable message still carries a summa envelope (no re-summarization, the skip clause caught it)",
+		);
+	});
+});
