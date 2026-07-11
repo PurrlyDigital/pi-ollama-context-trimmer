@@ -392,7 +392,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			summaWords: summaWordsInt,
 			dropFloorTokens,
 			recencyFloor: recencyFloorTokens,
-			reasoningMode: cfg.reasoningMode,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,

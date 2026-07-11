@@ -163,21 +163,6 @@ export type TrimOptions = {
 	 * message is a candidate for summarize or drop).
 	 */
 	recencyFloor?: number;
-	/**
-	 * How reasoning/thinking content blocks are handled before tier
-	 * selection runs. The pass runs on every call regardless of token
-	 * budget, so the post-pass mass is what the three-tier trim
-	 * accounts against. `"keep"` lets reasoning blocks flow through
-	 * unchanged; `"summa-all-but-latest"` (default) summarizes every
-	 * assistant message's thinking blocks except the most recent
-	 * assistant message that has any; `"drop-all-but-latest"` removes
-	 * every assistant message's thinking blocks except the most recent
-	 * one. The "latest" message is the most recent assistant message
-	 * in the array that contains at least one `type: "thinking"`
-	 * block; its thinking blocks are preserved in all three modes.
-	 * `undefined` falls through to the default.
-	 */
-	reasoningMode?: ReasoningMode;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -188,34 +173,11 @@ export type TrimResult = {
 	summarized: number;
 	droppedTurns: number;
 	/**
-	 * Number of `type: "thinking"` blocks summarized by the
-	 * reasoning-mode pass (mode `"summa-all-but-latest"`). Always 0
-	 * for modes `"keep"` and `"drop-all-but-latest"`.
-	 */
-	reasoningSummarized: number;
-	/**
-	 * Number of `type: "thinking"` blocks removed by the
-	 * reasoning-mode pass (mode `"drop-all-but-latest"`). Always 0
-	 * for modes `"keep"` and `"summa-all-but-latest"`.
-	 */
-	reasoningDropped: number;
-	/**
 	 * Total tokens of the returned messages (including protected slots;
 	 * informational only).
 	 */
 	totalTokens: number;
 };
-
-/**
- * The reasoning/thinking-block handling mode for the
- * `applyThreeTierTrim` pre-pass. The pass runs before tier selection
- * on every call, so the chosen mode reduces the trimmable mass
- * before the three-tier trim accounts it.
- */
-export type ReasoningMode = "keep" | "summa-all-but-latest" | "drop-all-but-latest";
-
-/** Default reasoning mode when `TrimOptions.reasoningMode` is unset. */
-export const DEFAULT_REASONING_MODE: ReasoningMode = "summa-all-but-latest";
 
 // ─── Per-message token accounting (chars / 4) ──────────────────────────
 
@@ -265,172 +227,6 @@ export function extractText(content: unknown): string {
 		return JSON.stringify(content);
 	}
 	return String(content ?? "");
-}
-
-// ─── Reasoning/thinking block identification ────────────────────
-//
-// pi-ai `ThinkingContent` content blocks carry `{ type: "thinking",
-// thinking: string, ... }`. The two helpers below identify those
-// blocks and extract their `thinking` text, so the reasoning-mode
-// pass at the top of `applyThreeTierTrim` can rewrite or drop them
-// per the operator's chosen mode. The function is intentionally
-// permissive on the content shape: the message type is structural,
-// and content blocks vary by role and provider.
-
-/**
- * Concatenate the `thinking` string of every `type: "thinking"`
- * content block in the supplied content. Returns an empty string
- * when the content is not an array of blocks, when no thinking
- * blocks are present, or when the input is nullish. Pure: no
- * mutation of the input.
- */
-export function extractReasoningText(content: unknown): string {
-	if (!Array.isArray(content)) return "";
-	let out = "";
-	for (const block of content) {
-		if (!block || typeof block !== "object") continue;
-		const b = block as { type?: unknown; thinking?: unknown };
-		if (b.type !== "thinking") continue;
-		if (typeof b.thinking === "string") {
-			out += b.thinking;
-		}
-	}
-	return out;
-}
-
-/**
- * Pure predicate: does the message's content array contain at least
- * one `type: "thinking"` block? Non-array content yields `false`.
- * Used by the reasoning-mode pass to identify the "latest"
- * assistant message and by tests to gate mode-application
- * expectations.
- */
-export function hasReasoning(msg: TrimmableMessage): boolean {
-	if (!Array.isArray(msg.content)) return false;
-	for (const block of msg.content) {
-		if (!block || typeof block !== "object") continue;
-		if ((block as { type?: unknown }).type === "thinking") return true;
-	}
-	return false;
-}
-
-// ─── Reasoning-mode pre-pass ─────────────────────────────────────
-
-/**
- * Apply the reasoning-mode pre-pass to a messages array. Runs at
- * the top of `applyThreeTierTrim`, BEFORE the recency slice is
- * computed and BEFORE tier selection, so the post-pass mass is
- * what the three-tier trim accounts against. Pure: the input is
- * not mutated; a fresh array is returned.
- *
- * The "latest" assistant message is the most recent assistant
- * message in the array whose content contains at least one
- * `type: "thinking"` block. The latest message's thinking blocks
- * are preserved in all three modes.
- *
- * Modes:
- *   - `"keep"`: every message is returned unchanged.
- *   - `"summa-all-but-latest"`: every assistant message EXCEPT the
- *     latest thinking-bearing one has each `type: "thinking"`
- *     block's `thinking` text replaced with the `summarizer`
- *     callback's output, wrapped in the existing
- *     `[summa: ~N tokens originally → ~M tokens summary]` envelope
- *     grammar (the same envelope `summarizeOldestUntilUnder` uses
- *     for Tier-2 in-place summarization). The summarizer is the
- *     caller-supplied callback (the `options.summarizer` field,
- *     defaulted to `defaultSummaSummarizer` upstream).
- *   - `"drop-all-but-latest"`: every assistant message EXCEPT the
- *     latest thinking-bearing one has all `type: "thinking"`
- *     blocks removed from its content array. Non-thinking blocks
- *     in the same message (e.g. `type: "text"`) are preserved.
- *
- * Returns the fresh array plus the two diagnostic counters
- * (per-block counts; the mode is exclusive, so one of them is 0
- * for every call).
- */
-function applyReasoningModePass(
-	messages: ReadonlyArray<TrimmableMessage>,
-	mode: ReasoningMode,
-	summarizer: (text: string, words: number) => string,
-	summaWords: number,
-): { messages: TrimmableMessage[]; summarized: number; dropped: number } {
-	if (mode === "keep") {
-		return { messages: messages.slice(), summarized: 0, dropped: 0 };
-	}
-
-	// Find the "latest" assistant message: the most recent assistant
-	// message in the array containing at least one `type: "thinking"`
-	// block. Walk from the end; the first hit is the latest.
-	let latestIdx = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (messages[i].role === "assistant" && hasReasoning(messages[i])) {
-			latestIdx = i;
-			break;
-		}
-	}
-
-	let summarized = 0;
-	let dropped = 0;
-	const out: TrimmableMessage[] = new Array(messages.length);
-	for (let i = 0; i < messages.length; i++) {
-		const msg = messages[i];
-		if (i === latestIdx) {
-			out[i] = msg;
-			continue;
-		}
-		if (msg.role !== "assistant" || !hasReasoning(msg)) {
-			out[i] = msg;
-			continue;
-		}
-		if (mode === "drop-all-but-latest") {
-			const newContent: unknown[] = [];
-			let droppedHere = 0;
-			for (const block of msg.content as ReadonlyArray<{ type?: unknown; [k: string]: unknown }>) {
-				if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
-					droppedHere += 1;
-					continue;
-				}
-				newContent.push(block);
-			}
-			dropped += droppedHere;
-			out[i] = { ...msg, content: newContent };
-			continue;
-		}
-		// mode === "summa-all-but-latest"
-		const newContent: unknown[] = [];
-		let summarizedHere = 0;
-		for (const block of msg.content as ReadonlyArray<Record<string, unknown>>) {
-			if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
-				// Skip already-summarized blocks: if the block already
-				// carries the [summa: …] envelope from a prior pass,
-				// pass it through unchanged and do not count it as
-				// summarized.
-				if (typeof block.text === "string" && block.text.startsWith("[summa:")) {
-					newContent.push(block);
-					continue;
-				}
-				const original = typeof block.thinking === "string" ? block.thinking : "";
-				let summary: string;
-				try {
-					summary = summarizer(original, summaWords);
-				} catch {
-					summary = original;
-				}
-				const summaryText = summary.length > 0 ? summary : original;
-				const originalTokens = approximateMessageTokens({ role: "assistant", content: original });
-				const summaryTokens = approximateMessageTokens({ role: "assistant", content: summaryText });
-				const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
-				const rewritten: Record<string, unknown> = { ...block, thinking: summaryText, text: `${tag}\n${summaryText}` };
-				newContent.push(rewritten);
-				summarizedHere += 1;
-				continue;
-			}
-			newContent.push(block);
-		}
-		summarized += summarizedHere;
-		out[i] = { ...msg, content: newContent };
-	}
-	return { messages: out, summarized, dropped };
 }
 
 // ─── Protected-slot predicate ──────────────────────────────────────────
@@ -716,18 +512,6 @@ export function applyThreeTierTrim(
 	const preservedPatterns = options.preservedPatterns ?? [];
 	const dropFloorTokens = options.dropFloorTokens;
 	const recencyFloor = options.recencyFloor;
-	const reasoningMode = options.reasoningMode ?? DEFAULT_REASONING_MODE;
-
-	// Reasoning-mode pre-pass: runs at the top of every call, BEFORE
-	// the recency slice is computed and BEFORE tier selection. The
-	// chosen mode reduces the trimmable mass before the three-tier
-	// trim accounts it, so the post-pass mass is what tier selection
-	// sees. The pass returns a fresh messages array (no input
-	// mutation) and the two diagnostic counters.
-	const reasoningPass = applyReasoningModePass(messages, reasoningMode, summarizer, summaWords);
-	const messagesAfterReasoning = reasoningPass.messages;
-	const reasoningSummarized = reasoningPass.summarized;
-	const reasoningDropped = reasoningPass.dropped;
 
 	// Compute the recency-protected slice once and thread it through
 	// every internal call. The slice is the operator's
@@ -738,7 +522,7 @@ export function applyThreeTierTrim(
 	// so already-protected messages are excluded — they are
 	// already subtracted from the budget by their own channels.
 	const recencyProtectedIndices = computeRecencyProtectedIndices(
-		messagesAfterReasoning,
+		messages,
 		recencyFloor,
 		protectedCustomTypes,
 		protectDispatch,
@@ -746,7 +530,7 @@ export function applyThreeTierTrim(
 	);
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messagesAfterReasoning, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
 	// The "turn" is bounded by user messages: a turn is everything from
@@ -755,7 +539,7 @@ export function applyThreeTierTrim(
 	// oldest end.
 	if (total > summarizeMax) {
 		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
-			messagesAfterReasoning,
+			messages,
 			summarizeMax,
 			protectedCustomTypes,
 			protectDispatch,
@@ -785,8 +569,6 @@ export function applyThreeTierTrim(
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				reasoningSummarized,
-				reasoningDropped,
 				totalTokens: totalTrimmableTokens(
 					result.messages,
 					protectedCustomTypes,
@@ -808,8 +590,6 @@ export function applyThreeTierTrim(
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				reasoningSummarized,
-				reasoningDropped,
 				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 			};
 		}
@@ -817,8 +597,6 @@ export function applyThreeTierTrim(
 			messages: dropped,
 			summarized: 0,
 			droppedTurns,
-			reasoningSummarized,
-			reasoningDropped,
 			totalTokens: total,
 		};
 	}
@@ -826,24 +604,20 @@ export function applyThreeTierTrim(
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messagesAfterReasoning, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			reasoningSummarized,
-			reasoningDropped,
 			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 		};
 	}
 
 	// Tier 1: verbatim.
 	return {
-		messages: messagesAfterReasoning.slice(),
+		messages: messages.slice(),
 		summarized: 0,
 		droppedTurns: 0,
-		reasoningSummarized,
-		reasoningDropped,
 		totalTokens: total,
 	};
 }
