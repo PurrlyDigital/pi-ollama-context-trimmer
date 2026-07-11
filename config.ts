@@ -33,9 +33,6 @@ export type ProtectDispatchMode = "auto" | boolean;
  *  shape semantically; the two surfaces are now independent. */
 export type LoopGuardMode = boolean;
 
-import type { ReasoningMode } from "./policy.ts";
-export type { ReasoningMode };
-
 /** The resolved trimmer config. Every field is optional — when nothing
  *  is configured the trimmer runs with no pinned surfaces and no
  *  dispatch protection (the opt-out default). */
@@ -82,16 +79,6 @@ export interface ContextTrimmerConfig {
 	 *  integer; the wiring layer coerces with `Math.trunc` (summaWords
 	 *  precedent). Overrides the policy default when set. */
 	readonly loopGuardHardBlock?: number;
-	/** Reasoning/thinking-block handling mode. The trim pipeline
-	 *  runs a reasoning-mode pass on every call regardless of token
-	 *  budget. `"keep"` preserves reasoning blocks as ordinary
-	 *  content; `"summa-all-but-latest"` (default) summarizes every
-	 *  assistant turn's thinking blocks except the most recent one
-	 *  containing at least one `type: "thinking"` block;
-	 *  `"drop-all-but-latest"` removes thinking blocks from every
-	 *  assistant turn except the most recent one. Overrides the
-	 *  policy default when set. */
-	readonly reasoningMode?: ReasoningMode;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -102,13 +89,6 @@ export const DEFAULT_PROTECT_DISPATCH: ProtectDispatchMode = "auto";
  *  dropped because behavioral-loop detection is the same concern
  *  whether the model is in a parent or a subagent session. */
 export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
-
-/** Default reasoning-mode: `"summa-all-but-latest"` (mode 2). The
- *  operator's specified default; per-turn reasoning content from
- *  every prior assistant turn is summarized (not dropped) so a
- *  future turn can still reach the prior reasoning as a compressed
- *  context anchor. */
-export const DEFAULT_REASONING_MODE: ReasoningMode = "summa-all-but-latest";
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
  *  the wiring layer and tests reference a single source of truth. */
@@ -124,7 +104,6 @@ export const ENV = {
 	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
-	reasoningMode: "PI_CONTEXT_TRIMMER_REASONING_MODE",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -145,7 +124,6 @@ export interface ParsedConfigFile {
 	loopGuard?: LoopGuardMode;
 	loopGuardThreshold?: number;
 	loopGuardHardBlock?: number;
-	reasoningMode?: ReasoningMode;
 }
 
 /**
@@ -192,10 +170,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.loopGuardHardBlock)) {
 		out.loopGuardHardBlock = o.loopGuardHardBlock;
-	}
-	const rm = o.reasoningMode;
-	if (rm === "keep" || rm === "summa-all-but-latest" || rm === "drop-all-but-latest") {
-		out.reasoningMode = rm;
 	}
 	return out;
 }
@@ -263,24 +237,6 @@ export function resolveConfig(opts: {
 		protectDispatch = DEFAULT_PROTECT_DISPATCH;
 	}
 
-	let reasoningMode: ReasoningMode;
-	const envRm = env[ENV.reasoningMode];
-	if (envRm === "1") {
-		reasoningMode = "keep";
-	} else if (envRm === "2") {
-		reasoningMode = "summa-all-but-latest";
-	} else if (envRm === "3") {
-		reasoningMode = "drop-all-but-latest";
-	} else if (
-		file.reasoningMode === "keep" ||
-		file.reasoningMode === "summa-all-but-latest" ||
-		file.reasoningMode === "drop-all-but-latest"
-	) {
-		reasoningMode = file.reasoningMode;
-	} else {
-		reasoningMode = DEFAULT_REASONING_MODE;
-	}
-
 	return {
 		personalityPath,
 		protectDispatch,
@@ -293,7 +249,6 @@ export function resolveConfig(opts: {
 		loopGuard,
 		loopGuardThreshold,
 		loopGuardHardBlock,
-		reasoningMode,
 	};
 }
 
