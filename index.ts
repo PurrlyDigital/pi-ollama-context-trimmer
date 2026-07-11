@@ -262,6 +262,21 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	// never re-fires on a later context event.
 	const summaryCache = new Map<string, TrimmableMessage>();
 
+	// Subagent-context pin decision. Resolved once at load — the
+	// inputs (the `PI_SUBAGENT_CHILD` env var + the resolved
+	// `pinSubagent` config field) are stable for the session, and
+	// resolving per-call would just repeat the same boolean. The
+	// decision is: skip the pin in child sessions UNLESS an override
+	// channel has re-enabled it. Default-off for child/subagent
+	// sessions prevents the parent PM persona from crossing the
+	// dispatch boundary. The env var is read here (the wiring
+	// layer) rather than in `config.ts` (the pure module) per the
+	// purity contract — `config.ts` only receives the value through
+	// `process.env` carried by the `env: process.env` arg that
+	// `resolveConfig` already accepts.
+	const isChildSession = process.env.PI_SUBAGENT_CHILD === "1";
+	const shouldPinForCurrentContext = !isChildSession || cfg.pinSubagent === true;
+
 	// Dispatch-protection resolution. Resolved lazily on the first
 	// `context` call (by then every extension, including pi-subagents,
 	// has loaded and `pi.getAllTools()` reflects the full tool set) and
@@ -366,8 +381,12 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		);
 		// Build the pinned-tier synthetic (the agent def). Opt-in: may
 		// return `null` when personality is not configured / resolves
-		// empty. Only prepend when there is content to pin.
-		const pinned = pinnedTier.buildPinnedMessage();
+		// empty. Skipped entirely in child/subagent sessions unless an
+		// override channel (`PI_CONTEXT_TRIMMER_PIN_SUBAGENT` env var
+		// or `pinSubagent` JSON key) has re-enabled the pin — the
+		// parent persona must not cross the dispatch boundary by
+		// default.
+		const pinned = shouldPinForCurrentContext ? pinnedTier.buildPinnedMessage() : null;
 		// Stamp each trimmable message with its source path so the
 		// preserved-paths predicate (pure, in `policy.ts`) can match
 		// by `details.sourcePath`. The source path is the union of:

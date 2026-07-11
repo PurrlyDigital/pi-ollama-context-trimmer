@@ -38,6 +38,7 @@ let savedPersonalityEnv: string | undefined;
 let savedProtectEnv: string | undefined;
 let savedConfigPathEnv: string | undefined;
 let savedAsyncModeEnv: string | undefined;
+let savedPinSubagentEnv: string | undefined;
 
 before(() => {
 	fixtureDir = mkdtempSync(join(tmpdir(), "ctx-trimmer-"));
@@ -46,6 +47,7 @@ before(() => {
 	savedProtectEnv = process.env[CONFIG_ENV.protectDispatch];
 	savedConfigPathEnv = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
 	savedAsyncModeEnv = process.env[CONFIG_ENV.asyncMode];
+	savedPinSubagentEnv = process.env[CONFIG_ENV.pinSubagent];
 	// Point the config file at a non-existent path so the file channel
 	// is empty for every test (env is the only input).
 	process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
@@ -57,6 +59,16 @@ before(() => {
 	// Background mode is exercised by its own dedicated describe block
 	// below, which restores async mode to ON in beforeEach.
 	process.env[CONFIG_ENV.asyncMode] = "0";
+	// Subagent-context pin override ON. The wiring skips the pinned-
+	// tier injection by default when PI_SUBAGENT_CHILD=1 (the parent
+	// PM persona must not cross the dispatch boundary). The test
+	// process inherits PI_SUBAGENT_CHILD=1 when run inside a
+	// pi-subagents child, so the existing pinned-tier / drop-tier /
+	// loop-guard assertions (which expect the pin to ride out) need
+	// the override channel re-enabled here to remain valid in any
+	// context (parent or child). The override is the same channel
+	// the new AC-5 override-path test exercises.
+	process.env[CONFIG_ENV.pinSubagent] = "1";
 });
 
 after(() => {
@@ -65,6 +77,7 @@ after(() => {
 		[CONFIG_ENV.protectDispatch, savedProtectEnv],
 		["PI_CONTEXT_TRIMMER_CONFIG_PATH", savedConfigPathEnv],
 		[CONFIG_ENV.asyncMode, savedAsyncModeEnv],
+		[CONFIG_ENV.pinSubagent, savedPinSubagentEnv],
 	] as const) {
 		if (v === undefined) delete process.env[k];
 		else process.env[k] = v;
@@ -391,6 +404,138 @@ describe("context handler — pinned-tier injection", () => {
 			(m) => m.role === "user" && m.content === "dispatch task — do X",
 		);
 		assert.ok(dispatch, "dispatch task must be preserved");
+	});
+});
+
+// ─── AC-5 — subagent-context pin skip + override path ──────────────
+//
+// The pinned-tier personality injection is suppressed by default in
+// child/subagent sessions (PI_SUBAGENT_CHILD=1) to prevent the parent
+// PM persona from crossing the dispatch boundary. The override channel
+// (PI_CONTEXT_TRIMMER_PIN_SUBAGENT=1 env, or pinSubagent: true JSON
+// key) re-enables the pin. These tests intercept the `context` event
+// return `messages` array — the bleed is view-time only and leaves no
+// session.jsonl trace, so the unit-test layer is the right verification
+// surface for AC-5.
+//
+// The default-off test sets PI_SUBAGENT_CHILD=1 with no override and
+// asserts no `customType: "context-trimmer-pinned"` message is
+// present. The override-path test sets both PI_SUBAGENT_CHILD=1 and
+// PI_CONTEXT_TRIMMER_PIN_SUBAGENT=1 and asserts the pin re-appears.
+// A third test exercises the JSON `pinSubagent: true` channel
+// (file-channel parity with the env channel, per the tandem principle).
+//
+// The tests unset the module-level override (the before hook sets
+// PI_CONTEXT_TRIMMER_PIN_SUBAGENT=1 for the existing pinned-tier /
+// drop-tier / loop-guard assertions) so the default-off assertion is
+// truly default-off, then restore it in the after hook so other
+// suites see the same module-level state they expect.
+
+describe("context handler — subagent-context pin skip (AC-5)", () => {
+	let sChildEnv: string | undefined;
+	let sPinEnv: string | undefined;
+	let sConfigPath: string | undefined;
+
+	beforeEach(() => {
+		// Save and unset the module-level override and child flag so
+		// each test starts from a known state. The tests then set
+		// exactly the channels they want to exercise.
+		sChildEnv = process.env.PI_SUBAGENT_CHILD;
+		sPinEnv = process.env[CONFIG_ENV.pinSubagent];
+		sConfigPath = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	});
+
+	afterEach(() => {
+		for (const [k, v] of [
+			["PI_SUBAGENT_CHILD", sChildEnv],
+			[CONFIG_ENV.pinSubagent, sPinEnv],
+			["PI_CONTEXT_TRIMMER_CONFIG_PATH", sConfigPath],
+		] as const) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+		// Re-arm the module-level default so the test after the AC-5
+		// block (and any test that runs after the suite if the order
+		// changes) sees the override ON again. This matches the
+		// module-level `before` hook's posture.
+		process.env[CONFIG_ENV.pinSubagent] = "1";
+	});
+
+	it("default-off: with PI_SUBAGENT_CHILD=1 and no override, no `context-trimmer-pinned` synthetic is in the returned messages", async () => {
+		// AC-5 surface 1: the default-off intercept. Child session,
+		// no override channel. The bleed is fixed at the layer where
+		// it occurs — the per-LLM-call view, view-time only. The
+		// returned `messages` array must contain no
+		// `customType: "context-trimmer-pinned"` synthetic.
+		process.env.PI_SUBAGENT_CHILD = "1";
+		delete process.env[CONFIG_ENV.pinSubagent];
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [userMsg("dispatch"), assistantMsg("hello")],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.equal(pinned, undefined, "pinned-tier synthetic must be skipped in a child session with no override (default-off intercept)");
+		// The user + assistant pass through verbatim (verbatim tier),
+		// with no prepended synthetic.
+		assert.equal(result.messages.length, 2);
+		assert.equal(result.messages[0].role, "user");
+		assert.equal(result.messages[1].role, "assistant");
+	});
+
+	it("override (env): with PI_SUBAGENT_CHILD=1 AND PI_CONTEXT_TRIMMER_PIN_SUBAGENT=1, the `context-trimmer-pinned` synthetic re-appears", async () => {
+		// AC-5 surface 2: the override-path. The operator's escape
+		// hatch re-enables the pin. With both env vars set, the
+		// returned `messages` array contains the pinned synthetic at
+		// the top, exactly as in a parent session.
+		process.env.PI_SUBAGENT_CHILD = "1";
+		process.env[CONFIG_ENV.pinSubagent] = "1";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [userMsg("dispatch"), assistantMsg("hello")],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.ok(pinned, "pinned-tier synthetic must re-appear when the env override channel is set in a child session");
+		// Three messages out: pinned + dispatch + assistant.
+		assert.equal(result.messages.length, 3);
+		assert.equal(result.messages[0].role, "custom");
+		assert.equal((result.messages[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
+		assert.equal(result.messages[1].role, "user");
+		assert.equal(result.messages[1].content, "dispatch");
+		assert.equal(result.messages[2].role, "assistant");
+	});
+
+	it("override (JSON): with PI_SUBAGENT_CHILD=1 AND a context-trimmer.json `pinSubagent: true`, the pin re-appears (tandem parity with the env channel)", async () => {
+		// AC-5 surface 3: the JSON `pinSubagent: true` channel
+		// (the tandem twin of the env channel, per the project's
+		// tandem principle). Set the env channel to undefined so
+		// the resolver falls through to the file channel; write a
+		// temp config file with `pinSubagent: true`; assert the
+		// pinned synthetic re-appears.
+		process.env.PI_SUBAGENT_CHILD = "1";
+		delete process.env[CONFIG_ENV.pinSubagent];
+		const configPath = join(fixtureDir, "pin-subagent-true.json");
+		writeFileSync(configPath, JSON.stringify({ pinSubagent: true }));
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = configPath;
+		const pi = await loadExtension();
+		const event = {
+			messages: [userMsg("dispatch"), assistantMsg("hello")],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
+		);
+		assert.ok(pinned, "pinned-tier synthetic must re-appear when the JSON `pinSubagent: true` channel is set in a child session (tandem parity)");
+		assert.equal(result.messages.length, 3);
+		assert.equal(result.messages[0].role, "custom");
+		assert.equal((result.messages[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
 	});
 });
 
