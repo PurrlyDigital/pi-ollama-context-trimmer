@@ -27,7 +27,6 @@
 // the prior design are NOT carried forward; the amended spec replaces
 // them with the token tiers alone.
 
-import { spawnSync } from "node:child_process";
 import * as path from "node:path";
 
 // ─── Constants ─────────────────────────────────────────────────────────
@@ -95,9 +94,22 @@ export type TrimOptions = {
 	/**
 	 * The summarizer callback. Production wires this to a Python `summa`
 	 * subprocess; tests pass a deterministic in-process stub. Receives
-	 * the text to summarize and the word budget, returns the summary.
+	 * the text to summarize and the word budget, returns a promise of
+	 * the summary. The pure policy never provides a default; the
+	 * wiring layer is required to pass one, and a missing callback
+	 * short-circuits the summarize path (returns messages unchanged).
 	 */
-	summarizer?: (text: string, words: number) => string;
+	summarizer?: (text: string, words: number) => Promise<string>;
+	/**
+	 * When true, the summarize path fires summarizer promises in the
+	 * background instead of awaiting them. The messages are returned
+	 * with original (un-summarized) content; the pending promises are
+	 * carried in `TrimResult.pendingSummaries` for the wiring layer to
+	 * await and cache. When false (default), the summarize path awaits
+	 * each summarizer call and rewrites content in place (synchronous
+	 * behavior).
+	 */
+	backgroundSummarize?: boolean;
 	/**
 	 * Override the verbatim tier ceiling (default 50k). Useful for tests
 	 * that want to exercise the boundary at a smaller scale.
@@ -190,6 +202,27 @@ export type TrimResult = {
 	 *  layer persists these via `pi.appendEntry` so the next context
 	 *  event can skip them. */
 	summarizedFingerprints: string[];
+	/**
+	 * True when the trim fired background summarizer promises that have
+	 * not yet resolved. The wiring layer uses this to manage the status
+	 * indicator span and to decide whether to await the pending promises
+	 * before the next context event.
+	 */
+	backgroundPending: boolean;
+	/**
+	 * Pending background summarizer promises. Each entry carries the
+	 * index, fingerprint, original message, and the promise that will
+	 * resolve to the summary text. The wiring layer awaits these to
+	 * build cache entries (summarized messages with `[summa:` envelope)
+	 * keyed by fingerprint. Present only when `backgroundPending` is
+	 * true.
+	 */
+	pendingSummaries?: Array<{
+		index: number;
+		fingerprint: string;
+		originalMessage: TrimmableMessage;
+		promise: Promise<string>;
+	}>;
 };
 
 // ─── Per-message token accounting (chars / 4) ──────────────────────────
@@ -503,46 +536,6 @@ export function totalTrimmableTokens(
 	return total;
 }
 
-// ─── Summa subprocess (production summarizer) ──────────────────────────
-
-/**
- * The default production summarizer: shells out to Python `summa`.
- * Reads the source text from argv, prints the summary to stdout. On
- * error (summa missing, input too short, etc.) returns the source text
- * unchanged so the trim path stays total-bounded and the policy still
- * makes progress; the diagnostic is exposed via the
- * `lastSummarizerFailed` export for callers that want to surface it.
- *
- * The subprocess is synchronous and bounded — summa is fast on small
- * inputs and we only ever summarize one message per call. Tests pass
- * their own `summarizer` and never hit this path.
- */
-export const defaultSummaSummarizer: (text: string, words: number) => string = (text, words) => {
-	if (!text || text.length < 200) return text; // Below summa's useful floor.
-	// Python `summa` is installed via `pip install --user summa`; the
-	// subprocess is `/usr/bin/python3 -c "..."`. The script reads argv,
-	// runs `summarize`, prints to stdout.
-	const script =
-		"import sys\n" +
-		"from summa.summarizer import summarize\n" +
-		"text = sys.argv[1]\n" +
-		"n = int(sys.argv[2])\n" +
-		"out = summarize(text, language='english', words=n)\n" +
-		"sys.stdout.write(out or text)\n";
-	const result = spawnSync("/usr/bin/python3", ["-c", script, text, String(words)], {
-		encoding: "utf-8",
-		timeout: 5_000,
-	});
-	if (result.error || result.status !== 0) {
-		lastSummarizerFailed = true;
-		return text;
-	}
-	return result.stdout || text;
-};
-
-/** Diagnostic flag: did the last `defaultSummaSummarizer` call fail? */
-export let lastSummarizerFailed = false;
-
 // ─── The three-tier trim ───────────────────────────────────────────────
 
 /**
@@ -577,13 +570,13 @@ export let lastSummarizerFailed = false;
  * summarized; the policy does not batch — a single trim call
  * summarizes as many messages as it needs, oldest first.
  */
-export function applyThreeTierTrim(
+export async function applyThreeTierTrim(
 	messages: ReadonlyArray<TrimmableMessage>,
 	options: TrimOptions = {},
-): TrimResult {
+): Promise<TrimResult> {
 	const verbatimMax = options.verbatimMaxTokens ?? VERBATIM_TIER_MAX_TOKENS;
 	const summarizeMax = options.summarizeMaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
-	const summarizer = options.summarizer ?? defaultSummaSummarizer;
+	const summarizer = options.summarizer;
 	const summaWords = options.summaWords ?? SUMMA_WORDS;
 	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
 	const protectDispatch = options.protectDispatch ?? true;
@@ -591,6 +584,7 @@ export function applyThreeTierTrim(
 	const dropFloorTokens = options.dropFloorTokens;
 	const recencyFloor = options.recencyFloor;
 	const alreadySummarizedHashes = options.alreadySummarizedHashes ?? new Set<string>();
+	const backgroundSummarize = options.backgroundSummarize ?? false;
 
 	// Compute the recency-protected slice once and thread it through
 	// every internal call. The slice is the operator's
@@ -634,7 +628,7 @@ export function applyThreeTierTrim(
 		// window) down to verbatimMax — the recency slice stays
 		// intact and the drop tier never collapses the floor.
 		if (shouldFallThrough) {
-			const result = summarizeOldestUntilUnder(
+			const result = await summarizeOldestUntilUnder(
 				dropped,
 				verbatimMax,
 				summarizer,
@@ -644,6 +638,7 @@ export function applyThreeTierTrim(
 				preservedPatterns,
 				recencyProtectedIndices,
 				alreadySummarizedHashes,
+				backgroundSummarize,
 			);
 			return {
 				messages: result.messages,
@@ -657,6 +652,8 @@ export function applyThreeTierTrim(
 					recencyProtectedIndices,
 				),
 				summarizedFingerprints: result.summarizedFingerprints,
+				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
+				pendingSummaries: result.pendingSummaries,
 			};
 		}
 		// Re-check; we may have overshot (no trimmable turns left).
@@ -666,13 +663,15 @@ export function applyThreeTierTrim(
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes);
+			const result = await summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
 				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 				summarizedFingerprints: result.summarizedFingerprints,
+				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
+				pendingSummaries: result.pendingSummaries,
 			};
 		}
 		return {
@@ -681,19 +680,22 @@ export function applyThreeTierTrim(
 			droppedTurns,
 			totalTokens: total,
 			summarizedFingerprints: [],
+			backgroundPending: false,
 		};
 	}
 
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes);
+		const result = await summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
 			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
 			summarizedFingerprints: result.summarizedFingerprints,
+			backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
+			pendingSummaries: result.pendingSummaries,
 		};
 	}
 
@@ -704,6 +706,7 @@ export function applyThreeTierTrim(
 		droppedTurns: 0,
 		totalTokens: total,
 		summarizedFingerprints: [],
+		backgroundPending: false,
 	};
 }
 
@@ -892,10 +895,21 @@ function makeTurn(
 
 /**
  * Summarize the oldest non-protected trimmable messages in place until
- * the trimmable total is ≤ `cap`. The summarizer rewrites the
- * `content` of each summarized message to a single text block carrying
- * the `[summa: …]` tag and the summary body. The protected slots
- * (first user message) are never summarized.
+ * the trimmable total is ≤ `cap`. Two modes:
+ *
+ *   - **sync** (`backgroundSummarize: false`, default): the summarizer
+ *     callback is awaited for each candidate; the message content is
+ *     rewritten in place with the `[summa: …]` envelope. Behavior is
+ *     identical to the prior in-place implementation, expressed
+ *     asynchronously.
+ *   - **background** (`backgroundSummarize: true`): the summarizer
+ *     callback is fired as an un-awaited promise; the message content
+ *     is left untouched. A `pendingSummaries` entry is pushed for
+ *     each fired promise, carrying the original fingerprint, index,
+ *     message, and the promise. The loop terminates when an
+ *     estimated total ≤ cap is reached; the estimate subtracts
+ *     `(originalTokens − summaWords)` per fired promise (summa
+ *     produces `summaWords` words ≈ `summaWords` tokens).
  *
  * The loop iterates oldest-first and stops as soon as the total is
  * under the cap OR no trimmable message remains to summarize.
@@ -913,27 +927,70 @@ function makeTurn(
  * rewritten with the summa envelope) — using the original
  * fingerprint keeps the persisted key stable across re-summaries.
  */
-function summarizeOldestUntilUnder(
+async function summarizeOldestUntilUnder(
 	messages: ReadonlyArray<TrimmableMessage>,
 	cap: number,
-	summarizer: (text: string, words: number) => string,
+	summarizer: ((text: string, words: number) => Promise<string>) | undefined,
 	summaWords: number,
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
-): { messages: TrimmableMessage[]; summarized: number; summarizedFingerprints: string[] } {
+	backgroundSummarize: boolean = false,
+): Promise<{
+	messages: TrimmableMessage[];
+	summarized: number;
+	summarizedFingerprints: string[];
+	pendingSummaries?: Array<{
+		index: number;
+		fingerprint: string;
+		originalMessage: TrimmableMessage;
+		promise: Promise<string>;
+	}>;
+}> {
+	// No summarizer wired: short-circuit. The pure policy never shells
+	// out; the wiring layer is required to pass a callback. Returning
+	// the input unchanged with no pending state is the safe no-op.
+	if (summarizer === undefined) {
+		return {
+			messages: messages.map((m) => m),
+			summarized: 0,
+			summarizedFingerprints: [],
+		};
+	}
 	const out = messages.map((m) => m);
 	let summarized = 0;
 	const summarizedFingerprints: string[] = [];
+	const pendingSummaries: Array<{
+		index: number;
+		fingerprint: string;
+		originalMessage: TrimmableMessage;
+		promise: Promise<string>;
+	}> = [];
 	// Cursor: the next index we'll consider for summarization. Starts
 	// at 0 and is advanced past each summarized message so we never
 	// re-summarize the same message in the same pass (which would
 	// infinite-loop: the replacement content is small, but the
 	// message remains the "oldest" candidate and gets re-picked).
 	let cursor = 0;
-	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices) > cap) {
+	// In background mode we never rewrite the messages in `out`, so
+	// the loop condition cannot observe the real trimmable total
+	// (it never decreases). An estimated total — starting from the
+	// real trimmable total and decrementing by `(originalTokens −
+	// summaWords)` per fired promise — drives the loop instead.
+	let estimatedTotal = totalTrimmableTokens(
+		out,
+		protectedCustomTypes,
+		protectDispatch,
+		preservedPatterns,
+		recencyProtectedIndices,
+	);
+	while (
+		(backgroundSummarize
+			? estimatedTotal > cap
+			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices) > cap)
+	) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor. Skip already-summarized by default.
 		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true);
@@ -948,33 +1005,67 @@ function summarizeOldestUntilUnder(
 		// Capture the ORIGINAL fingerprint before the content is
 		// replaced with the summa envelope. Using the original keeps
 		// the persisted key stable across re-summaries.
-		summarizedFingerprints.push(messageFingerprint(messages[target]));
+		const fingerprint = messageFingerprint(messages[target]);
+		summarizedFingerprints.push(fingerprint);
 		const msg = out[target];
 		const original = extractText(msg.content);
 		const originalTokens = approximateMessageTokens(msg);
-		const summary = (() => {
+		// Defensive bound: if the message is too small to benefit
+		// from summarization (summaWords ≥ originalTokens), bail
+		// rather than loop forever. Applies to both modes: in sync
+		// mode the replacement would not shrink the message; in
+		// background mode the estimated decrement would be ≤ 0.
+		if (summaWords >= originalTokens) break;
+		if (backgroundSummarize) {
+			// Fire the summarizer promise in the background; leave
+			// the message content as the original. The promise is
+			// caught so a rejection never crashes the trim path —
+			// the wiring layer sees a resolved `original` and
+			// treats the message as a no-op summary.
+			const promise = summarizer(original, summaWords).catch(() => original);
+			pendingSummaries.push({
+				index: target,
+				fingerprint,
+				originalMessage: msg,
+				promise,
+			});
+			// Update the estimated total: a summary is assumed to be
+			// `summaWords` tokens (summa produces N words ≈ N tokens).
+			estimatedTotal -= (originalTokens - summaWords);
+		} else {
+			let summary: string;
 			try {
-				return summarizer(original, summaWords);
+				summary = await summarizer(original, summaWords);
 			} catch {
-				return original;
+				summary = original;
 			}
-		})();
-		const summaryText = summary.length > 0 ? summary : original;
-		const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText });
-		// Replace content with the summa envelope.
-		const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
-		out[target] = {
-			...msg,
-			content: [{ type: "text", text: `${tag}\n${summaryText}` }],
-		};
+			const summaryText = summary.length > 0 ? summary : original;
+			const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText });
+			// Replace content with the summa envelope.
+			const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
+			out[target] = {
+				...msg,
+				content: [{ type: "text", text: `${tag}\n${summaryText}` }],
+			};
+			summarized += 1;
+			// Advance the cursor past this message so we don't re-pick it.
+			cursor = target + 1;
+			// Defensive bound: if the summarizer returned a longer
+			// string (it shouldn't — summa is lossy), bail rather
+			// than loop forever.
+			if (summaryTokens >= originalTokens) break;
+			continue;
+		}
 		summarized += 1;
 		// Advance the cursor past this message so we don't re-pick it.
 		cursor = target + 1;
-		// Defensive bound: if the summarizer returned a longer string
-		// (it shouldn't — summa is lossy), bail rather than loop forever.
-		if (summaryTokens >= originalTokens) break;
 	}
-	return { messages: out, summarized, summarizedFingerprints };
+	return {
+		messages: out,
+		summarized,
+		summarizedFingerprints,
+		...(pendingSummaries.length > 0 ? { pendingSummaries } : {}),
+	};
 }
 
 /**
