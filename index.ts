@@ -60,6 +60,7 @@ import {
 	isPathPreserved,
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
+	messageFingerprint,
 	SUMMARIZE_TIER_MAX_TOKENS,
 	shouldHardBlock,
 	type TrimmableMessage,
@@ -196,6 +197,19 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		personalityPath: cfg.personalityPath,
 	});
 
+	// Persisted summary-fingerprint cache. Scoped to this extension
+	// factory invocation (one per pi runtime). The cache mirrors the
+	// `customType: "context-trimmer-summarized"` entries persisted in
+	// the session — `pi.appendEntry` writes them after a successful
+	// summarize pass, and the `session_start` handler (resume /
+	// startup / reload) re-populates this set from
+	// `sessionManager.getEntries()`. The cache is the source of truth
+	// for the per-trim `alreadySummarizedHashes` option threaded into
+	// the pure policy layer; without it, the Unit-1 skip clause
+	// cannot fire across context events (pi-core's `emitContext`
+	// discards the trimmed view via `structuredClone` each call).
+	const summarizedFingerprints = new Set<string>();
+
 	// Dispatch-protection resolution. Resolved lazily on the first
 	// `context` call (by then every extension, including pi-subagents,
 	// has loaded and `pi.getAllTools()` reflects the full tool set) and
@@ -254,8 +268,33 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const loopGuardHardBlock =
 		rawHardBlock !== undefined && rawHardBlock < loopGuardThreshold ? loopGuardThreshold : rawHardBlock;
 
-	pi.on("session_start", async () => {
+	pi.on("session_start", async (event, ctx) => {
 		pinnedTier.refresh();
+		// Re-hydrate the persisted summary-fingerprint cache on
+		// resume / startup / reload. The session file already
+		// carries the `customType: "context-trimmer-summarized"`
+		// entries; this read pulls them into the in-memory set so
+		// the next context event's trim pass can skip those
+		// messages. "new" and "fork" create a fresh session with
+		// no prior summary state — the cache stays empty.
+		if (event?.reason === "resume" || event?.reason === "startup" || event?.reason === "reload") {
+			try {
+				const sessionManager = ctx?.sessionManager;
+				if (sessionManager && typeof sessionManager.getEntries === "function") {
+					const entries = sessionManager.getEntries();
+					for (const entry of entries) {
+						if (entry && entry.type === "custom" && entry.customType === "context-trimmer-summarized") {
+							const data = entry.data;
+							if (data && typeof data === "object" && "fingerprint" in data && typeof (data as { fingerprint: unknown }).fingerprint === "string") {
+								summarizedFingerprints.add((data as { fingerprint: string }).fingerprint);
+							}
+						}
+					}
+				}
+			} catch {
+				// Best-effort: degrade to no skip on read failure
+			}
+		}
 	});
 
 	pi.on("turn_end", async () => {
@@ -395,7 +434,38 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
+			alreadySummarizedHashes: summarizedFingerprints,
 		});
+		// Persist the fingerprints of messages summarized in this
+		// pass. The pure policy emits `summarizedFingerprints` as
+		// the ORIGINAL-message fingerprints (computed before the
+		// content was rewritten with the summa envelope) so the
+		// persisted key matches the fingerprint the policy will
+		// recompute on the next context event. `pi.appendEntry`
+		// writes a separate `customType: "context-trimmer-summarized"`
+		// entry — it does NOT mutate the session message stream.
+		// The trim is a view, not a mutation; the persisted
+		// messages stay original. The try/catch degrades silently
+		// when `pi.appendEntry` is unavailable (tests, minimal
+		// mocks); the in-memory set still updates so the same-
+		// process skip still works.
+		if (result.summarizedFingerprints.length > 0) {
+			const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
+			if (typeof appendEntry === "function") {
+				for (const fingerprint of result.summarizedFingerprints) {
+					summarizedFingerprints.add(fingerprint);
+					try {
+						appendEntry("context-trimmer-summarized", { fingerprint });
+					} catch {
+						// Best-effort: degrade silently
+					}
+				}
+			} else {
+				for (const fingerprint of result.summarizedFingerprints) {
+					summarizedFingerprints.add(fingerprint);
+				}
+			}
+		}
 		// Loop-guard integration. Runs AFTER the trim (operates on
 		// the trimmed view the LLM is about to see) and BEFORE the
 		// handler returns. Re-injection on every qualifying turn is
