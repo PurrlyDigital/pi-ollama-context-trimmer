@@ -11,8 +11,10 @@ import {
 	resolveConfig,
 	parseConfigFile,
 	ENV,
+	DEFAULT_REASONING_MODE,
 	DEFAULT_PROTECT_DISPATCH,
 	DEFAULT_LOOP_GUARD,
+	type ReasoningMode,
 	type EnvRecord,
 } from "../config.ts";
 
@@ -1040,5 +1042,204 @@ describe("loopGuardHardBlock", () => {
 
 	it("ENV.loopGuardHardBlock is the documented namespace", () => {
 		assert.equal(ENV.loopGuardHardBlock, "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK");
+	});
+});
+
+// ─── reasoningMode (per-turn reasoning/thinking handling) ────────────
+//
+// The reasoning-mode feature exposes three modes through one
+// operator-controlled knob, gated by the `PI_CONTEXT_TRIMMER_REASONING_MODE`
+// env var and the `reasoningMode` JSON key — co-created per the repo
+// tandem principle. The env var accepts the operator's 1/2/3
+// numbering (keep / summa-all-but-latest / drop-all-but-latest);
+// the JSON key accepts the descriptive strings. resolveConfig applies
+// the existing env > JSON > default precedence chain. The default is
+// `summa-all-but-latest` (mode 2) — the operator-specified default.
+
+describe("reasoningMode", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: 'keep' is extracted", () => {
+		assert.equal(
+			parseConfigFile({ reasoningMode: "keep" }).reasoningMode,
+			"keep",
+		);
+	});
+
+	it("file parse: 'summa-all-but-latest' is extracted", () => {
+		assert.equal(
+			parseConfigFile({ reasoningMode: "summa-all-but-latest" }).reasoningMode,
+			"summa-all-but-latest",
+		);
+	});
+
+	it("file parse: 'drop-all-but-latest' is extracted", () => {
+		assert.equal(
+			parseConfigFile({ reasoningMode: "drop-all-but-latest" }).reasoningMode,
+			"drop-all-but-latest",
+		);
+	});
+
+	it("file parse: numeric strings (the env encoding) are treated as absent (the JSON channel is descriptive strings only)", () => {
+		// The JSON channel only accepts the descriptive strings; the
+		// 1/2/3 numbering is the env-var encoding and is rejected at
+		// the file parse seam (existing `parseConfigFile` pattern of
+		// "badly-typed values treated as absent").
+		assert.equal(parseConfigFile({ reasoningMode: "1" }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: "2" }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: "3" }).reasoningMode, undefined);
+	});
+
+	it("file parse: arbitrary string is treated as absent", () => {
+		assert.equal(parseConfigFile({ reasoningMode: "all" }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: "any" }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: "" }).reasoningMode, undefined);
+	});
+
+	it("file parse: non-string is treated as absent", () => {
+		assert.equal(parseConfigFile({ reasoningMode: 1 }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: 2 }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: true }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: null }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: { mode: "keep" } }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({ reasoningMode: ["keep"] }).reasoningMode, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).reasoningMode, undefined);
+		assert.equal(parseConfigFile({}).reasoningMode, undefined);
+	});
+
+	// --- resolveConfig: env > JSON > default precedence ---
+
+	it("resolveConfig: env '1' → 'keep' (mode 1 numbering)", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningMode]: "1" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "keep");
+	});
+
+	it("resolveConfig: env '2' → 'summa-all-but-latest' (mode 2 numbering, the default)", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningMode]: "2" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "summa-all-but-latest");
+	});
+
+	it("resolveConfig: env '3' → 'drop-all-but-latest' (mode 3 numbering)", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningMode]: "3" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "drop-all-but-latest");
+	});
+
+	it("resolveConfig: env unset falls through to file (file-only path)", () => {
+		const cfg = resolveConfig({
+			file: { reasoningMode: "keep" },
+			env: {} as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "keep");
+	});
+
+	it("resolveConfig: env '1' wins over file 'drop-all-but-latest' (env > file precedence)", () => {
+		const cfg = resolveConfig({
+			file: { reasoningMode: "drop-all-but-latest" },
+			env: { [ENV.reasoningMode]: "1" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "keep");
+	});
+
+	it("resolveConfig: env '3' wins over file 'summa-all-but-latest'", () => {
+		const cfg = resolveConfig({
+			file: { reasoningMode: "summa-all-but-latest" },
+			env: { [ENV.reasoningMode]: "3" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "drop-all-but-latest");
+	});
+
+	it("resolveConfig: env descriptive strings are NOT accepted on the env channel (env is the 1/2/3 numbering only)", () => {
+		// The env channel only accepts the operator's 1/2/3
+		// numbering. Descriptive strings on the env side fall
+		// through to the file channel (or default).
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningMode]: "keep" } as EnvRecord,
+		});
+		// No file set → falls through to the default.
+		assert.equal(cfg.reasoningMode, DEFAULT_REASONING_MODE);
+		assert.equal(cfg.reasoningMode, "summa-all-but-latest");
+	});
+
+	it("resolveConfig: env with out-of-range value (e.g. '4', '0') falls through to file/default", () => {
+		// The env channel only accepts '1' / '2' / '3'. Any other
+		// value (including unset) is no-override and falls through
+		// to the file channel, then the default.
+		const cfgFromDefault = resolveConfig({
+			env: { [ENV.reasoningMode]: "4" } as EnvRecord,
+		});
+		assert.equal(cfgFromDefault.reasoningMode, DEFAULT_REASONING_MODE);
+		assert.equal(cfgFromDefault.reasoningMode, "summa-all-but-latest");
+		const cfgFromFile = resolveConfig({
+			file: { reasoningMode: "drop-all-but-latest" },
+			env: { [ENV.reasoningMode]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgFromFile.reasoningMode, "drop-all-but-latest");
+	});
+
+	it("resolveConfig: env empty-string falls through to file (treated as unset)", () => {
+		const cfg = resolveConfig({
+			file: { reasoningMode: "drop-all-but-latest" },
+			env: { [ENV.reasoningMode]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningMode, "drop-all-but-latest");
+	});
+
+	it("resolveConfig: env with non-numeric junk (e.g. 'maybe', 'off') falls through to file/default", () => {
+		const cfgFromDefault = resolveConfig({
+			env: { [ENV.reasoningMode]: "maybe" } as EnvRecord,
+		});
+		assert.equal(cfgFromDefault.reasoningMode, DEFAULT_REASONING_MODE);
+		assert.equal(cfgFromDefault.reasoningMode, "summa-all-but-latest");
+		const cfgFromFile = resolveConfig({
+			file: { reasoningMode: "keep" },
+			env: { [ENV.reasoningMode]: "off" } as EnvRecord,
+		});
+		assert.equal(cfgFromFile.reasoningMode, "keep");
+	});
+
+	it("resolveConfig: file-only (no env) returns the file value", () => {
+		const cfgKeep = resolveConfig({ file: { reasoningMode: "keep" } });
+		assert.equal(cfgKeep.reasoningMode, "keep");
+		const cfgSumma = resolveConfig({ file: { reasoningMode: "summa-all-but-latest" } });
+		assert.equal(cfgSumma.reasoningMode, "summa-all-but-latest");
+		const cfgDrop = resolveConfig({ file: { reasoningMode: "drop-all-but-latest" } });
+		assert.equal(cfgDrop.reasoningMode, "drop-all-but-latest");
+	});
+
+	it("resolveConfig: nothing configured returns the default 'summa-all-but-latest'", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.reasoningMode, DEFAULT_REASONING_MODE);
+		assert.equal(cfg.reasoningMode, "summa-all-but-latest");
+	});
+
+	it("resolveConfig: file parse failure (badly-typed) falls through to the default", () => {
+		// The file channel is filtered through parseConfigFile; a
+		// badly-typed value (e.g. a number) is treated as absent
+		// there, so the resolver sees no file value and falls
+		// through to the default.
+		const cfg = resolveConfig({ file: parseConfigFile({ reasoningMode: 99 }) });
+		assert.equal(cfg.reasoningMode, DEFAULT_REASONING_MODE);
+		assert.equal(cfg.reasoningMode, "summa-all-but-latest");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.reasoningMode is the documented namespace", () => {
+		assert.equal(ENV.reasoningMode, "PI_CONTEXT_TRIMMER_REASONING_MODE");
+	});
+
+	// --- Default constant ---
+
+	it("DEFAULT_REASONING_MODE is the documented 'summa-all-but-latest'", () => {
+		assert.equal(DEFAULT_REASONING_MODE, "summa-all-but-latest");
 	});
 });

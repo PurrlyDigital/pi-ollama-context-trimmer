@@ -13,6 +13,10 @@ import {
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	extractText,
+	extractReasoningText,
+	hasReasoning,
+	DEFAULT_REASONING_MODE,
+	type ReasoningMode,
 	fingerprintToolCall,
 	fingerprintAssistantTurn,
 	detectConsecutiveIdenticalToolCalls,
@@ -1589,5 +1593,481 @@ describe("loop-guard detection (AC-1, AC-4)", () => {
 		assert.ok(LOOP_GUARD_BLOCK_TEXT.length > 0);
 		assert.ok(/blocked/i.test(LOOP_GUARD_BLOCK_TEXT), "block must name the block action");
 		assert.ok(/reasoning in text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed by text/i.test(LOOP_GUARD_BLOCK_TEXT) || /proceed via text/i.test(LOOP_GUARD_BLOCK_TEXT), "block must route the model to text-only reasoning");
+	});
+});
+
+// ─── Reasoning-mode pass (AC-5) ───────────────────────────────────────
+//
+// Pure-policy coverage of the per-turn reasoning/thinking block pass
+// added in Unit 1 (feat/reasoning-trim-23). The pass runs at the top
+// of `applyThreeTierTrim` regardless of token budget, so the
+// post-pass mass is what the three-tier trim accounts against.
+//
+// Three modes:
+//   - `"keep"`: thinking blocks flow through unchanged.
+//   - `"summa-all-but-latest"` (default): every assistant message's
+//     thinking blocks EXCEPT the latest thinking-bearing one are
+//     summarized via the `summarizer` callback (the
+//     `[summa: ~N tokens originally → ~M tokens summary]` envelope).
+//   - `"drop-all-but-latest"`: every assistant message's thinking
+//     blocks EXCEPT the latest thinking-bearing one are removed.
+//     Non-thinking blocks in the same message are preserved.
+//
+// The pass returns `reasoningSummarized` and `reasoningDropped` on
+// `TrimResult` (per-block counts; the modes are exclusive, so one
+// is zero per call).
+
+describe("extractReasoningText", () => {
+	it("concatenates the `thinking` string of every type: 'thinking' block in the content array", () => {
+		const out = extractReasoningText([
+			{ type: "thinking", thinking: "step 1: " },
+			{ type: "text", text: "ignored" },
+			{ type: "thinking", thinking: "step 2" },
+		]);
+		assert.equal(out, "step 1: step 2");
+	});
+
+	it("returns an empty string when the content array has no thinking blocks", () => {
+		assert.equal(
+			extractReasoningText([
+				{ type: "text", text: "just text" },
+				{ type: "text", text: "more text" },
+			]),
+			"",
+		);
+	});
+
+	it("returns an empty string when the content is not an array", () => {
+		assert.equal(extractReasoningText("a string content"), "");
+		assert.equal(extractReasoningText({ a: 1 }), "");
+		assert.equal(extractReasoningText(null), "");
+		assert.equal(extractReasoningText(undefined), "");
+	});
+
+	it("skips thinking blocks whose `thinking` property is not a string", () => {
+		// Defensive: a malformed block does not poison the rest.
+		assert.equal(
+			extractReasoningText([
+				{ type: "thinking", thinking: 42 },
+				{ type: "thinking", thinking: "ok" },
+			]),
+			"ok",
+		);
+	});
+
+	it("ignores blocks whose `type` is not 'thinking'", () => {
+		assert.equal(
+			extractReasoningText([
+				{ type: "reasoning", thinking: "wrong-type-field" },
+				{ type: "text", text: "plain text" },
+			]),
+			"",
+		);
+	});
+});
+
+describe("hasReasoning", () => {
+	function buildMsg(content: unknown): TrimmableMessage {
+		return { role: "assistant", content } as TrimmableMessage;
+	}
+
+	it("returns true when content array contains at least one type: 'thinking' block", () => {
+		assert.equal(hasReasoning(buildMsg([{ type: "thinking", thinking: "x" }])), true);
+		assert.equal(
+			hasReasoning(buildMsg([{ type: "text", text: "hi" }, { type: "thinking", thinking: "y" }])),
+			true,
+		);
+	});
+
+	it("returns false when content array has no thinking blocks", () => {
+		assert.equal(hasReasoning(buildMsg([{ type: "text", text: "hi" }])), false);
+		assert.equal(hasReasoning(buildMsg([{ type: "toolCall", name: "x", arguments: {} }])), false);
+	});
+
+	it("returns false when content is not an array (string content)", () => {
+		assert.equal(hasReasoning(buildMsg("just a string")), false);
+	});
+
+	it("returns false for an empty content array", () => {
+		assert.equal(hasReasoning(buildMsg([])), false);
+	});
+});
+
+// ─── Reasoning-mode: per-mode coverage of `applyThreeTierTrim` ─────────
+//
+// A small trimmable fixture (well under 50k) keeps the test in the
+// verbatim tier, so the assertions isolate the reasoning-mode pass
+// from the three-tier trim's summarize/drop behavior. Each test
+// asserts both the content shape and the `reasoningSummarized` /
+// `reasoningDropped` diagnostic counters.
+
+describe("applyThreeTierTrim — reasoning-mode: 'keep'", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	function buildSessionWithThinking(): TrimmableMessage[] {
+		// Three assistant turns, all with thinking blocks. Plus a
+		// dispatch anchor to keep the structure honest.
+		return [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "earliest thoughts" },
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "middle thoughts" },
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+	}
+
+	it("preserves all thinking blocks unchanged (mode 'keep')", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "keep",
+		});
+		// Find the original thinking texts in the output. All three
+		// survive verbatim — no `[summa:` envelope, no block
+		// removal, no rewriting.
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		assert.ok(flat.includes("earliest thoughts"), "oldest turn's thinking block must survive");
+		assert.ok(flat.includes("middle thoughts"), "middle turn's thinking block must survive");
+		assert.ok(flat.includes("latest thoughts"), "latest turn's thinking block must survive");
+		// No summa envelope was injected.
+		assert.ok(!flat.includes("[summa:"), "no summa envelope on 'keep'");
+	});
+
+	it("does not invoke the summarizer in mode 'keep'", () => {
+		let called = 0;
+		const tracking = (text: string) => {
+			called += 1;
+			return `S:${text}`;
+		};
+		const messages = buildSessionWithThinking();
+		applyThreeTierTrim(messages, {
+			summarizer: tracking,
+			reasoningMode: "keep",
+		});
+		assert.equal(called, 0, "summarizer must not be invoked in mode 'keep' (no summarize path runs)");
+	});
+
+	it("'reasoningSummarized' and 'reasoningDropped' are zero in mode 'keep'", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "keep",
+		});
+		assert.equal(result.reasoningSummarized, 0);
+		assert.equal(result.reasoningDropped, 0);
+	});
+});
+
+describe("applyThreeTierTrim — reasoning-mode: 'summa-all-but-latest'", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	function buildSessionWithThinking(): TrimmableMessage[] {
+		return [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "earliest thoughts that are long enough to be token-relevant " },
+					{ type: "text", text: "answer 1" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "middle thoughts that are also long enough " },
+					{ type: "text", text: "answer 2" },
+				],
+			} as TrimmableMessage,
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "latest thoughts" },
+					{ type: "text", text: "answer 3" },
+				],
+			} as TrimmableMessage,
+		];
+	}
+
+	it("summarizes all but the latest assistant turn's thinking blocks (summa envelope present)", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "summa-all-but-latest",
+		});
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		// Summa envelope present (the rewritten thinking block in the
+		// older two turns carries the tag).
+		assert.ok(flat.includes("[summa:"), "the older turns' thinking blocks must carry the summa envelope");
+		// The latest turn's thinking block survives verbatim.
+		assert.ok(flat.includes("latest thoughts"), "the latest assistant turn's thinking block must survive verbatim");
+		// The older two turns' original thinking text is gone (replaced
+		// with the summary callback's output).
+		assert.ok(!flat.includes("earliest thoughts that are long enough"), "oldest turn's original thinking text must be replaced");
+		assert.ok(!flat.includes("middle thoughts that are also long enough"), "middle turn's original thinking text must be replaced");
+	});
+
+	it("increments `reasoningSummarized` per summarized thinking block; `reasoningDropped` is zero", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "summa-all-but-latest",
+		});
+		// Two thinking blocks in the older two turns → reasoningSummarized === 2.
+		assert.equal(result.reasoningSummarized, 2);
+		assert.equal(result.reasoningDropped, 0);
+	});
+
+	it("preserves the latest assistant turn's thinking block verbatim (no summa envelope on the latest)", () => {
+		// Build a session whose ONLY thinking block sits in the latest
+		// assistant turn. The mode would summarize zero blocks (the
+		// latest is preserved), and the latest's thinking text must
+		// survive verbatim.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [{ type: "text", text: "no thinking" }] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "the only thinking block in this session" },
+				{ type: "text", text: "answer" },
+			] } as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "summa-all-but-latest",
+		});
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		assert.ok(flat.includes("the only thinking block in this session"), "the only thinking block (also the latest) must survive verbatim");
+		assert.ok(!flat.includes("[summa:"), "no summa envelope when no thinking blocks are summarized");
+		assert.equal(result.reasoningSummarized, 0);
+		assert.equal(result.reasoningDropped, 0);
+	});
+
+	it("non-thinking blocks in the same message are preserved (summa pass only touches type: 'thinking' blocks)", () => {
+		// The middle turn carries a toolCall + a text + a thinking
+		// block. The text and toolCall must survive verbatim; only
+		// the thinking block is summarized.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [{ type: "text", text: "earliest answer" }] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "text", text: "MIDDLE TEXT" },
+				{ type: "thinking", thinking: "middle thinking to summarize" },
+				{ type: "toolCall", name: "noop", arguments: { x: 1 } },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "latest thinking" },
+				{ type: "text", text: "latest answer" },
+			] } as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "summa-all-but-latest",
+		});
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		// Text block survives verbatim.
+		assert.ok(flat.includes("MIDDLE TEXT"), "non-thinking text block in the same message must survive verbatim");
+		// ToolCall block survives verbatim (its name and arguments).
+		assert.ok(flat.includes("noop"), "non-thinking toolCall block in the same message must survive verbatim");
+		// The middle turn's thinking text is replaced with the
+		// summarizer's output (envelope present on this turn).
+		assert.ok(!flat.includes("middle thinking to summarize"), "middle turn's original thinking text must be replaced");
+		// Latest survives verbatim.
+		assert.ok(flat.includes("latest thinking"), "latest turn's thinking block must survive verbatim");
+		assert.equal(result.reasoningSummarized, 1);
+	});
+
+	it("default mode (no `reasoningMode` in options) is `summa-all-but-latest`", () => {
+		// Build a session with three thinking turns. Without
+		// `reasoningMode`, the policy defaults to
+		// `summa-all-but-latest`; the older two turns' thinking
+		// blocks are summarized, the latest survives.
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, { summarizer });
+		assert.equal(result.reasoningSummarized, 2);
+		assert.equal(result.reasoningDropped, 0);
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		assert.ok(flat.includes("latest thoughts"), "default mode must preserve the latest thinking block verbatim");
+		assert.ok(flat.includes("[summa:"), "default mode must summarize the older two thinking blocks");
+	});
+
+	it("DEFAULT_REASONING_MODE is the documented 'summa-all-but-latest'", () => {
+		assert.equal(DEFAULT_REASONING_MODE, "summa-all-but-latest");
+	});
+});
+
+describe("applyThreeTierTrim — reasoning-mode: 'drop-all-but-latest'", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	function buildSessionWithThinking(): TrimmableMessage[] {
+		return [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "earliest thinking block" },
+				{ type: "text", text: "answer 1" },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "middle thinking block" },
+				{ type: "text", text: "answer 2" },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "latest thinking block" },
+				{ type: "text", text: "answer 3" },
+			] } as TrimmableMessage,
+		];
+	}
+
+	it("removes all but the latest assistant turn's thinking blocks", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "drop-all-but-latest",
+		});
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		// The latest turn's thinking block survives verbatim.
+		assert.ok(flat.includes("latest thinking block"), "the latest assistant turn's thinking block must survive verbatim");
+		// The older two turns' thinking blocks are gone.
+		assert.ok(!flat.includes("earliest thinking block"), "oldest turn's thinking block must be removed");
+		assert.ok(!flat.includes("middle thinking block"), "middle turn's thinking block must be removed");
+		// No summa envelope (drop mode does not invoke the summarizer).
+		assert.ok(!flat.includes("[summa:"), "drop mode must not inject a summa envelope");
+	});
+
+	it("preserves non-thinking blocks in the same message (e.g. text, toolCall)", () => {
+		// Older turn carries a toolCall + text + thinking. The text
+		// and toolCall must survive; only the thinking block is
+		// dropped.
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [
+				{ type: "text", text: "OLD TEXT" },
+				{ type: "thinking", thinking: "old thinking to drop" },
+				{ type: "toolCall", name: "kept", arguments: { a: 1 } },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "latest thinking" },
+				{ type: "text", text: "latest answer" },
+			] } as TrimmableMessage,
+		];
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "drop-all-but-latest",
+		});
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		assert.ok(flat.includes("OLD TEXT"), "non-thinking text block in the same message must survive");
+		assert.ok(flat.includes("kept"), "non-thinking toolCall block in the same message must survive");
+		assert.ok(!flat.includes("old thinking to drop"), "thinking block in the same message must be dropped");
+		assert.ok(flat.includes("latest thinking"), "latest turn's thinking block must survive");
+	});
+
+	it("increments `reasoningDropped` per dropped thinking block; `reasoningSummarized` is zero", () => {
+		const messages = buildSessionWithThinking();
+		const result = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "drop-all-but-latest",
+		});
+		// Two thinking blocks dropped from the older two turns.
+		assert.equal(result.reasoningDropped, 2);
+		assert.equal(result.reasoningSummarized, 0);
+	});
+
+	it("does not invoke the summarizer in drop mode", () => {
+		let called = 0;
+		const tracking = (text: string) => {
+			called += 1;
+			return `S:${text}`;
+		};
+		const messages = buildSessionWithThinking();
+		applyThreeTierTrim(messages, {
+			summarizer: tracking,
+			reasoningMode: "drop-all-but-latest",
+		});
+		assert.equal(called, 0, "summarizer must not be invoked in drop mode (no summarize path runs)");
+	});
+});
+
+describe("applyThreeTierTrim — reasoning-mode: cross-mode invariant", () => {
+	// The "latest" assistant turn's thinking blocks are preserved in
+	// ALL three modes. This is the cross-mode invariant; the per-mode
+	// describes above are mode-specific and the cross-mode is asserted
+	// here as one block.
+
+	const summarizer = makeTrimmingSummarizer(5);
+
+	function buildSessionWithThinking(): TrimmableMessage[] {
+		return [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "earliest" },
+				{ type: "text", text: "a1" },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "middle" },
+				{ type: "text", text: "a2" },
+			] } as TrimmableMessage,
+			{ role: "assistant", content: [
+				{ type: "thinking", thinking: "latest thinking block to preserve" },
+				{ type: "text", text: "a3" },
+			] } as TrimmableMessage,
+		];
+	}
+
+	for (const mode of ["keep", "summa-all-but-latest", "drop-all-but-latest"] as const) {
+		it(`latest assistant turn's thinking block is preserved in mode '${mode}'`, () => {
+			const messages = buildSessionWithThinking();
+			const result = applyThreeTierTrim(messages, {
+				summarizer,
+				reasoningMode: mode,
+			});
+			const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+			assert.ok(
+				flat.includes("latest thinking block to preserve"),
+				`mode '${mode}' must preserve the latest assistant turn's thinking block verbatim`,
+			);
+		});
+	}
+
+	it("modes are exclusive: each call increments exactly one of (reasoningSummarized, reasoningDropped)", () => {
+		// The implementation is exclusive — the summa mode increments
+		// `reasoningSummarized` and the drop mode increments
+		// `reasoningDropped`; `keep` increments neither. The two
+		// counters cannot both be non-zero in a single call.
+		const messages = buildSessionWithThinking();
+		// Mode keep → both 0.
+		const rKeep = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "keep",
+		});
+		assert.equal(rKeep.reasoningSummarized, 0);
+		assert.equal(rKeep.reasoningDropped, 0);
+		// Mode summa → only summarized.
+		const rSumma = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "summa-all-but-latest",
+		});
+		assert.ok(rSumma.reasoningSummarized > 0);
+		assert.equal(rSumma.reasoningDropped, 0);
+		// Mode drop → only dropped.
+		const rDrop = applyThreeTierTrim(messages, {
+			summarizer,
+			reasoningMode: "drop-all-but-latest",
+		});
+		assert.equal(rDrop.reasoningSummarized, 0);
+		assert.ok(rDrop.reasoningDropped > 0);
 	});
 });
