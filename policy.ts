@@ -163,6 +163,15 @@ export type TrimOptions = {
 	 * message is a candidate for summarize or drop).
 	 */
 	recencyFloor?: number;
+	/**
+	 * Fingerprints of messages that were summarized in prior context
+	 * events. Messages whose fingerprint is in this set are skipped by
+	 * `findOldestSummarizable` (not re-summarized), unless the escape
+	 * clause fires (total still over verbatim cap and no non-summarized
+	 * candidates remain). The wiring layer builds this set from
+	 * persisted state (`pi.appendEntry`) and threads it here.
+	 */
+	alreadySummarizedHashes?: ReadonlySet<string>;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -177,6 +186,10 @@ export type TrimResult = {
 	 * informational only).
 	 */
 	totalTokens: number;
+	/** Fingerprints of messages summarized in this trim pass. The wiring
+	 *  layer persists these via `pi.appendEntry` so the next context
+	 *  event can skip them. */
+	summarizedFingerprints: string[];
 };
 
 // ─── Per-message token accounting (chars / 4) ──────────────────────────
@@ -227,6 +240,71 @@ export function extractText(content: unknown): string {
 		return JSON.stringify(content);
 	}
 	return String(content ?? "");
+}
+
+// ─── Already-summarized detection + fingerprinting ────────────────
+
+/**
+ * Pure predicate: does this message already carry a summa envelope?
+ * The envelope format is `[summa: ~N tokens originally → ~M tokens
+ * summary]` placed at the start of the first text block's `text`
+ * field. Detecting the leading `[summa: ~` lets the policy skip
+ * re-summarizing a message that was already summarized in a prior
+ * context event.
+ *
+ * Pure: no I/O, no `process.*`. Operates only on the message's
+ * content shape. Exported so the wiring layer can test or surface
+ * the predicate.
+ */
+export function isAlreadySummarized(msg: TrimmableMessage): boolean {
+	if (Array.isArray(msg.content)) {
+		for (const block of msg.content) {
+			if (block && typeof block === "object" && "type" in block && (block as { type: unknown }).type === "text") {
+				const text = (block as { text?: unknown }).text;
+				if (typeof text === "string" && text.startsWith("[summa: ~")) return true;
+				return false;
+			}
+		}
+		return false;
+	}
+	return false;
+}
+
+/**
+ * Pure extractor: produce a stable fingerprint for a message from
+ * the first 200 characters of its first text-block content. String
+ * content is used directly; array content walks to the first
+ * `{ type: "text" }` block and uses its `text` field. Empty / no
+ * text → empty string.
+ *
+ * The fingerprint is the dedup key the wiring layer persists via
+ * `pi.appendEntry` so the next context event can skip messages
+ * already summarized in a prior pass. The first 200 chars is a
+ * short, stable proxy: summa summary length is bounded by the
+ * configured word budget, so two distinct original messages can
+ * collide only if their first 200 chars match — which is the
+ * dedup fidelity the policy needs.
+ *
+ * Pure: no I/O, no `process.*`. Exported for the wiring layer and
+ * for tests.
+ */
+export function messageFingerprint(msg: TrimmableMessage): string {
+	let text: string | undefined;
+	if (typeof msg.content === "string") {
+		text = msg.content;
+	} else if (Array.isArray(msg.content)) {
+		for (const block of msg.content) {
+			if (block && typeof block === "object" && "type" in block && (block as { type: unknown }).type === "text") {
+				const t = (block as { text?: unknown }).text;
+				if (typeof t === "string") {
+					text = t;
+					break;
+				}
+			}
+		}
+	}
+	if (text === undefined) return "";
+	return text.slice(0, 200);
 }
 
 // ─── Protected-slot predicate ──────────────────────────────────────────
@@ -512,6 +590,7 @@ export function applyThreeTierTrim(
 	const preservedPatterns = options.preservedPatterns ?? [];
 	const dropFloorTokens = options.dropFloorTokens;
 	const recencyFloor = options.recencyFloor;
+	const alreadySummarizedHashes = options.alreadySummarizedHashes ?? new Set<string>();
 
 	// Compute the recency-protected slice once and thread it through
 	// every internal call. The slice is the operator's
@@ -564,6 +643,7 @@ export function applyThreeTierTrim(
 				protectDispatch,
 				preservedPatterns,
 				recencyProtectedIndices,
+				alreadySummarizedHashes,
 			);
 			return {
 				messages: result.messages,
@@ -576,6 +656,7 @@ export function applyThreeTierTrim(
 					preservedPatterns,
 					recencyProtectedIndices,
 				),
+				summarizedFingerprints: result.summarizedFingerprints,
 			};
 		}
 		// Re-check; we may have overshot (no trimmable turns left).
@@ -585,12 +666,13 @@ export function applyThreeTierTrim(
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+			const result = summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
 				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
+				summarizedFingerprints: result.summarizedFingerprints,
 			};
 		}
 		return {
@@ -598,18 +680,20 @@ export function applyThreeTierTrim(
 			summarized: 0,
 			droppedTurns,
 			totalTokens: total,
+			summarizedFingerprints: [],
 		};
 	}
 
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+		const result = summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
 			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
+			summarizedFingerprints: result.summarizedFingerprints,
 		};
 	}
 
@@ -619,6 +703,7 @@ export function applyThreeTierTrim(
 		summarized: 0,
 		droppedTurns: 0,
 		totalTokens: total,
+		summarizedFingerprints: [],
 	};
 }
 
@@ -814,6 +899,19 @@ function makeTurn(
  *
  * The loop iterates oldest-first and stops as soon as the total is
  * under the cap OR no trimmable message remains to summarize.
+ *
+ * Already-summarized detection: each iteration calls
+ * `findOldestSummarizable` with the skip flag ON. When the only
+ * remaining candidates are already-summarized messages and the
+ * total is still over the cap, the escape clause retries the
+ * find with the skip flag OFF — the already-summarized message
+ * gets a fresh summary rather than blocking progress.
+ *
+ * `summarizedFingerprints` is the dedup-key list the wiring layer
+ * persists. Each entry is the ORIGINAL message fingerprint
+ * (computed against the input array, before the content is
+ * rewritten with the summa envelope) — using the original
+ * fingerprint keeps the persisted key stable across re-summaries.
  */
 function summarizeOldestUntilUnder(
 	messages: ReadonlyArray<TrimmableMessage>,
@@ -824,9 +922,11 @@ function summarizeOldestUntilUnder(
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
-): { messages: TrimmableMessage[]; summarized: number } {
+	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
+): { messages: TrimmableMessage[]; summarized: number; summarizedFingerprints: string[] } {
 	const out = messages.map((m) => m);
 	let summarized = 0;
+	const summarizedFingerprints: string[] = [];
 	// Cursor: the next index we'll consider for summarization. Starts
 	// at 0 and is advanced past each summarized message so we never
 	// re-summarize the same message in the same pass (which would
@@ -835,9 +935,20 @@ function summarizeOldestUntilUnder(
 	let cursor = 0;
 	while (totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices) > cap) {
 		// Find the oldest non-protected trimmable message at or
-		// after the cursor.
-		const target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices);
-		if (target === -1) break; // Nothing left to summarize (degenerate: a single message is over cap).
+		// after the cursor. Skip already-summarized by default.
+		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true);
+		// Escape clause: when the only candidates are already-
+		// summarized messages and the total is still over the cap,
+		// retry with the skip flag lifted so an already-summarized
+		// message gets a fresh summary rather than blocking progress.
+		if (target === -1) {
+			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false);
+			if (target === -1) break;
+		}
+		// Capture the ORIGINAL fingerprint before the content is
+		// replaced with the summa envelope. Using the original keeps
+		// the persisted key stable across re-summaries.
+		summarizedFingerprints.push(messageFingerprint(messages[target]));
 		const msg = out[target];
 		const original = extractText(msg.content);
 		const originalTokens = approximateMessageTokens(msg);
@@ -863,7 +974,7 @@ function summarizeOldestUntilUnder(
 		// (it shouldn't — summa is lossy), bail rather than loop forever.
 		if (summaryTokens >= originalTokens) break;
 	}
-	return { messages: out, summarized };
+	return { messages: out, summarized, summarizedFingerprints };
 }
 
 /**
@@ -871,6 +982,14 @@ function summarizeOldestUntilUnder(
  * array. A user message with `userTurnAge === 0` (the dispatch) is
  * protected; a `customType` in `protectedCustomTypes` is also protected.
  * Returns -1 if no candidate is found.
+ *
+ * When `skipAlreadySummarized` is `true` (default), messages that
+ * already carry a summa envelope (`isAlreadySummarized`) or whose
+ * fingerprint is in `alreadySummarizedHashes` are also skipped. The
+ * `false` form is the escape clause: callers retry with the skip
+ * lifted when the only remaining trimmable candidates are
+ * already-summarized messages and the total is still over the
+ * verbatim cap.
  */
 function findOldestSummarizable(
 	messages: ReadonlyArray<TrimmableMessage>,
@@ -879,9 +998,15 @@ function findOldestSummarizable(
 	preservedPatterns: ReadonlyArray<string> = [],
 	startFrom = 0,
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
+	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
+	skipAlreadySummarized: boolean = true,
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
 		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
+		if (skipAlreadySummarized) {
+			if (isAlreadySummarized(messages[i])) continue;
+			if (alreadySummarizedHashes.has(messageFingerprint(messages[i]))) continue;
+		}
 		return i;
 	}
 	return -1;
