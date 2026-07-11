@@ -275,6 +275,36 @@ export function extractText(content: unknown): string {
 	return String(content ?? "");
 }
 
+/**
+ * Extract only the prose from a message's content for the summarizer
+ * callback. Unlike `extractText` (which JSON.stringify-falls-back on
+ * every non-text block and is used for token accounting), this
+ * helper returns only the concatenation of `text`-typed content
+ * blocks. Tool-call and tool-result blocks are skipped entirely —
+ * feeding the raw tool-call JSON into summa's TextRank corrupts
+ * the resulting summary.
+ *
+ * Pure: content in, string out. No I/O, no `process.*`. Used only
+ * by the summarize path; `approximateMessageTokens` continues to
+ * call the full-text `extractText` so budget math is unchanged.
+ */
+function extractProseText(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (Array.isArray(content)) {
+		let out = "";
+		for (const block of content) {
+			if (block && typeof block === "object" && "text" in block && typeof (block as { text: unknown }).text === "string") {
+				out += (block as { text: string }).text;
+			}
+			// Non-text blocks (toolCall, toolResult, …) are skipped,
+			// not JSON.stringified. They are structural — feeding
+			// them to summa would embed the raw JSON in the summary.
+		}
+		return out;
+	}
+	return "";
+}
+
 // ─── Already-summarized detection + fingerprinting ────────────────
 
 /**
@@ -1008,7 +1038,7 @@ async function summarizeOldestUntilUnder(
 		const fingerprint = messageFingerprint(messages[target]);
 		summarizedFingerprints.push(fingerprint);
 		const msg = out[target];
-		const original = extractText(msg.content);
+		const original = extractProseText(msg.content);
 		const originalTokens = approximateMessageTokens(msg);
 		// Defensive bound: if the message is too small to benefit
 		// from summarization (summaWords ≥ originalTokens), bail
