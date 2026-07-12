@@ -2194,3 +2194,223 @@ describe("background-mode integration — asyncMode: true", () => {
 		);
 	});
 });
+
+// ─── AC-4 — reasoning-block cap end-to-end ────────────────────────────
+//
+// The wiring applies `applyReasoningBlockCap` in the context
+// handler before `applyThreeTierTrim` (the cap runs on `base`
+// before pinned injection). The three tests below cover the
+// end-to-end cap behavior through the production wiring:
+//
+//   (a) cap = 1 (the default): a stream with multiple thinking
+//       blocks → only the LAST thinking block survives into the
+//       three-tier trim. The post-cap mass reaches `applyThreeTierTrim`,
+//       so a session that would have landed in tier 2 with the
+//       full thinking-block mass might land in a different tier
+//       after the cap (the budget accounts for the post-cap mass).
+//   (b) No thinking blocks + any cap value: no-regression — the
+//       existing three-tier trim behaves identically. The cap pass
+//       is a no-op on a stream with no thinking blocks.
+//   (c) cap = -1 (passthrough): the full message stream reaches
+//       `applyThreeTierTrim` unchanged. No thinking block is
+//       dropped. The cap is a transparent passthrough.
+//
+// The cap is global (no `ctx.model` branching per the binding
+// decisions) and runs on every context event.
+
+describe("context handler — reasoning-block cap (AC-4)", () => {
+	let sReasoningBlockCap: string | undefined;
+	let sConfigPath: string | undefined;
+
+	beforeEach(() => {
+		sReasoningBlockCap = process.env[CONFIG_ENV.reasoningBlockCap];
+		sConfigPath = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	});
+
+	afterEach(() => {
+		if (sReasoningBlockCap === undefined) delete process.env[CONFIG_ENV.reasoningBlockCap];
+		else process.env[CONFIG_ENV.reasoningBlockCap] = sReasoningBlockCap;
+		if (sConfigPath === undefined) delete process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+		else process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = sConfigPath;
+		// Restore the module-level config-path posture.
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+	});
+
+	/** Build a thinking-block content array. Each thinking block's
+	 *  body is sized to be roughly N tokens (chars = N * 4) so the
+	 *  per-block token count is predictable for budget assertions. */
+	function thinkingBlocks(count: number, tokensEach: number): Array<Record<string, unknown>> {
+		const blocks: Array<Record<string, unknown>> = [];
+		for (let i = 0; i < count; i++) {
+			blocks.push({
+				type: "thinking",
+				thinking: pad(`think-${i + 1}_`, tokensEach),
+			});
+		}
+		return blocks;
+	}
+
+	/** Count the thinking blocks across the messages in the output. */
+	function countThinkingBlocksIn(messages: ReadonlyArray<Record<string, unknown>>): number {
+		let n = 0;
+		for (const m of messages) {
+			const c = m.content;
+			if (Array.isArray(c)) {
+				for (const block of c) {
+					if (block && typeof block === "object" && (block as { type?: string }).type === "thinking") {
+						n += 1;
+					}
+				}
+			}
+		}
+		return n;
+	}
+
+	// ── (a) cap = 1: only the last thinking block survives into the three-tier trim ──
+
+	it("cap = 1 (default): only the last thinking block survives into the three-tier trim", async () => {
+		// Build a stream with 4 thinking blocks spread across 2
+		// assistant messages. With cap = 1, only the LAST thinking
+		// block (the last block of the last message) survives.
+		// The post-cap mass reaches `applyThreeTierTrim`; the
+		// session is otherwise small (verbatim tier) so the trim
+		// does not fire and the cap's effect is the only transform.
+		process.env[CONFIG_ENV.reasoningBlockCap] = "1";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				// Two thinking blocks on the first assistant.
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+				// Two thinking blocks on the second assistant (the
+				// last block of the stream is the second of these).
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// (i) Only ONE thinking block survives across the whole
+		// returned message stream.
+		const thinkingInResult = countThinkingBlocksIn(result.messages);
+		assert.equal(thinkingInResult, 1, "exactly one thinking block survives into the three-tier trim when cap=1");
+		// (ii) The surviving block is the LAST one in the stream
+		// (the second thinking block of the second assistant).
+		// The cap is a count from the latest; with 4 total blocks
+		// and cap=1, the last one is the only one kept.
+		const survivingThinking = result.messages
+			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; thinking?: string }>) : []))
+			.find((b) => b.type === "thinking");
+		assert.ok(survivingThinking, "the surviving thinking block must be present");
+		assert.equal((survivingThinking as { thinking: string }).thinking, "think-2_          ".padEnd(40, " "), "the surviving block is the last in the stream (think-2 of the second assistant)");
+	});
+
+	// ── (b) no thinking blocks + any cap: no-regression ──
+
+	it("no thinking blocks + any cap value: no regression — the three-tier trim behaves as before", async () => {
+		// A small verbatim-tier session (no thinking blocks at all).
+		// The cap pass is a no-op; the existing three-tier trim
+		// returns the messages unchanged (verbatim tier). The test
+		// exercises cap values that would otherwise drop thinking
+		// blocks: cap = 0 (drop all) and cap = 1 (keep the last).
+		// The wiring's no-regression invariant: a session with no
+		// thinking blocks behaves identically regardless of the
+		// cap value.
+		for (const cap of ["0", "1", "3"]) {
+			process.env[CONFIG_ENV.reasoningBlockCap] = cap;
+			process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+			const pi = await loadExtension();
+			const event = {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg("hi"),
+				],
+			};
+			const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+			// The dispatch + assistant pass through verbatim
+			// (verbatim tier, no thinking blocks to drop). The
+			// pinned synthetic is prepended (the module-level
+			// before hook sets the personality env). The result
+			// has 3 messages: pinned + dispatch + assistant.
+			assert.equal(result.messages.length, 3, `verbatim tier with cap=${cap}: pinned + dispatch + assistant`);
+			// The dispatch is preserved.
+			const dispatch = result.messages.find(
+				(m) => m.role === "user" && m.content === "dispatch",
+			);
+			assert.ok(dispatch, `verbatim tier with cap=${cap}: dispatch preserved`);
+			// The assistant is preserved.
+			const assistant = result.messages.find(
+				(m) => m.role === "assistant" && m.content === "hi",
+			);
+			assert.ok(assistant, `verbatim tier with cap=${cap}: assistant preserved`);
+		}
+	});
+
+	// ── (c) cap = -1 (passthrough): the full stream reaches the three-tier trim ──
+
+	it("cap = -1 (passthrough): the full message stream reaches `applyThreeTierTrim` unchanged", async () => {
+		// Build a stream with 4 thinking blocks. cap = -1 is a pure
+		// passthrough inside `applyReasoningBlockCap`; the full
+		// stream reaches `applyThreeTierTrim` with all 4 blocks
+		// intact. The session is small enough to land in tier 1
+		// (verbatim) so the trim does not rewrite the messages.
+		// The assertion: every input thinking block survives into
+		// the output (the cap is transparent).
+		process.env[CONFIG_ENV.reasoningBlockCap] = "-1";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// All 4 thinking blocks survive the passthrough.
+		assert.equal(countThinkingBlocksIn(result.messages), 4, "cap=-1 is a passthrough: every thinking block survives");
+	});
+
+	// ── Bonus: cap runs before the three-tier trim — the post-cap mass reaches the budget ──
+
+	it("cap runs BEFORE the three-tier trim — the budget accounts for the post-cap mass (cap = 0 → all thinking blocks dropped before the budget is read)", async () => {
+		// Build a stream with 4 large thinking blocks (~15k tokens
+		// each) plus a small assistant turn. With cap = 0, every
+		// thinking block is dropped BEFORE the three-tier budget
+		// is computed. The post-cap trimmable mass is just the
+		// small assistant turn — well under the 50k verbatim cap
+		// — so the session lands in tier 1 (verbatim) instead of
+		// tier 2 (where the full ~60k thinking-block mass would
+		// have pushed the budget). The cap's "run before the
+		// three-tier trim" ordering is the structural fact under
+		// test: the budget sees the post-cap mass.
+		process.env[CONFIG_ENV.reasoningBlockCap] = "0";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				// Two thinking blocks × 15k tokens = 30k.
+				{ role: "assistant", content: thinkingBlocks(2, 15_000) },
+				// Two more thinking blocks × 15k tokens = 30k.
+				{ role: "assistant", content: thinkingBlocks(2, 15_000) },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// (i) Every thinking block is dropped (cap = 0).
+		assert.equal(countThinkingBlocksIn(result.messages), 0, "cap=0 drops every thinking block across the stream");
+		// (ii) The session lands in the verbatim tier (no
+		// summarize / drop) because the post-cap trimmable mass
+		// is zero — the budget sees the post-cap mass, not the
+		// pre-cap mass. The result has 3 messages: pinned +
+		// dispatch + (the two assistant messages with empty
+		// content arrays, since the cap emptied them).
+		// The behavioral proof: a tier-2 session that would
+		// have summarized the 30k thinking-block content lands
+		// in tier 1 with cap=0 because the cap empties the
+		// content arrays before the budget is read.
+		const summaBlocks = result.messages
+			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; text?: string }>) : []))
+			.filter((b) => typeof b.text === "string" && b.text.startsWith("[summa:"));
+		assert.equal(summaBlocks.length, 0, "no summa envelope — the session is in tier 1 (post-cap mass is zero, well under the 50k verbatim cap)");
+	});
+});

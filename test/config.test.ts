@@ -1162,3 +1162,238 @@ describe("DEFAULT_ASYNC_MODE", () => {
 		assert.equal(DEFAULT_ASYNC_MODE, true);
 	});
 });
+
+// ─── reasoningBlockCap (the count-based reasoning trim) ───────────────
+//
+// `reasoningBlockCap` is the operator-configurable knob that controls
+// how many `type:"thinking"` content blocks the wiring layer keeps
+// per message stream (counted from the latest). Integer semantics:
+// `-1` = send all (passthrough), `0` = send none, any positive
+// integer is the count of blocks to keep. The knob is exposed in
+// BOTH channels (env `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` and
+// the `reasoningBlockCap` JSON key) per the tandem principle;
+// precedence is env > file > compile-time default (`1`).
+//
+// The new validator `isValidBlockCap` is file-private — the public
+// surface tests assert against is `parseConfigFile` and
+// `resolveConfig` (the contract surface the wiring reads). Badly-
+// typed values in either channel fall through to the next precedence
+// layer (the existing `parseConfigFile` rule — never throw).
+
+describe("reasoningBlockCap — file channel (parseConfigFile)", () => {
+	it("file parse: -1 (passthrough sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: -1 }).reasoningBlockCap, -1);
+	});
+
+	it("file parse: 0 (send-none sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: 0 }).reasoningBlockCap, 0);
+	});
+
+	it("file parse: 1 (the default) is accepted", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: 1 }).reasoningBlockCap, 1);
+	});
+
+	it("file parse: a positive integer is accepted", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: 3 }).reasoningBlockCap, 3);
+		assert.equal(parseConfigFile({ reasoningBlockCap: 100 }).reasoningBlockCap, 100);
+	});
+
+	it("file parse: value < -1 is treated as absent", () => {
+		// -2 and below fail `isValidBlockCap`'s `v >= -1` check
+		// and are treated as absent (the resolver falls through
+		// to the env / default layer).
+		assert.equal(parseConfigFile({ reasoningBlockCap: -2 }).reasoningBlockCap, undefined);
+		assert.equal(parseConfigFile({ reasoningBlockCap: -100 }).reasoningBlockCap, undefined);
+	});
+
+	it("file parse: a non-integer (float) is treated as absent", () => {
+		// `isValidBlockCap` requires `Number.isInteger`; floats
+		// fail that check (1.5 is the canonical "non-integer"
+		// case) and are treated as absent.
+		assert.equal(parseConfigFile({ reasoningBlockCap: 1.5 }).reasoningBlockCap, undefined);
+		assert.equal(parseConfigFile({ reasoningBlockCap: 0.5 }).reasoningBlockCap, undefined);
+		assert.equal(parseConfigFile({ reasoningBlockCap: -0.5 }).reasoningBlockCap, undefined);
+	});
+
+	it("file parse: non-numeric (string, boolean, null, object) is treated as absent", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: "1" }).reasoningBlockCap, undefined, "string '1' is rejected (the JSON channel does not coerce)");
+		assert.equal(parseConfigFile({ reasoningBlockCap: true }).reasoningBlockCap, undefined, "boolean true is rejected");
+		assert.equal(parseConfigFile({ reasoningBlockCap: null }).reasoningBlockCap, undefined, "null is rejected");
+		assert.equal(parseConfigFile({ reasoningBlockCap: { a: 1 } }).reasoningBlockCap, undefined, "object is rejected");
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: Number.NaN }).reasoningBlockCap, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ reasoningBlockCap: Number.POSITIVE_INFINITY }).reasoningBlockCap, undefined);
+		assert.equal(parseConfigFile({ reasoningBlockCap: Number.NEGATIVE_INFINITY }).reasoningBlockCap, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).reasoningBlockCap, undefined);
+	});
+});
+
+describe("reasoningBlockCap — resolveConfig (precedence)", () => {
+	// The wiring layer's contract is `cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT`
+	// — the resolver returns `undefined` when neither channel sets
+	// a value, and the wiring layer applies the compile-time
+	// default. The tests below assert the resolver's behavior; the
+	// wiring layer's default-applies behavior is covered in
+	// `integration.test.ts` (the end-to-end context-handler test).
+
+	it("env > file: env wins when both channels set a value", () => {
+		const cfg = resolveConfig({
+			file: { reasoningBlockCap: 3 },
+			env: { [ENV.reasoningBlockCap]: "5" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, 5, "env value 5 wins over file value 3");
+	});
+
+	it("env wins with -1 (passthrough sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { reasoningBlockCap: 1 },
+			env: { [ENV.reasoningBlockCap]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, -1, "env -1 wins over file 1 (passthrough sentinel is honored)");
+	});
+
+	it("env wins with 0 (send-none sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { reasoningBlockCap: 1 },
+			env: { [ENV.reasoningBlockCap]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, 0, "env 0 wins over file 1 (send-none sentinel is honored)");
+	});
+
+	it("file-only: env unset, file sets a value → file value returned", () => {
+		const cfg = resolveConfig({
+			file: { reasoningBlockCap: 7 },
+		});
+		assert.equal(cfg.reasoningBlockCap, 7, "file-only returns the file value");
+	});
+
+	it("nothing configured: both unset → resolver returns undefined (wiring applies the compile-time default)", () => {
+		// The resolver does NOT apply a default itself — the
+		// wiring layer (index.ts) is what reads
+		// `REASONING_BLOCK_CAP_DEFAULT` when the resolver returns
+		// undefined. The two-layer contract is intentional: the
+		// resolver is the "configured value" surface, the wiring
+		// is the "apply the default" surface.
+		const cfg = resolveConfig({});
+		assert.equal(cfg.reasoningBlockCap, undefined, "no value configured → undefined (wiring layer applies the default)");
+	});
+
+	it("empty-string env falls back to file value", () => {
+		const cfg = resolveConfig({
+			file: { reasoningBlockCap: 3 },
+			env: { [ENV.reasoningBlockCap]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, 3, "empty-string env is treated as no override; file value wins");
+	});
+
+	it("badly-typed env (non-integer string) falls back to file value", () => {
+		// The env parser is strict: a non-numeric string ("abc")
+		// returns undefined from `parseBlockCapEnv`; a non-integer
+		// numeric string ("1.5") likewise returns undefined
+		// (Number('1.5') === 1.5, which fails Number.isInteger).
+		// The fallback chain: env (undefined) → file value.
+		const cfgAbc = resolveConfig({
+			file: { reasoningBlockCap: 3 },
+			env: { [ENV.reasoningBlockCap]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfgAbc.reasoningBlockCap, 3, "env 'abc' falls back to file value");
+		const cfgFloat = resolveConfig({
+			file: { reasoningBlockCap: 3 },
+			env: { [ENV.reasoningBlockCap]: "1.5" } as EnvRecord,
+		});
+		assert.equal(cfgFloat.reasoningBlockCap, 3, "env '1.5' (non-integer) falls back to file value");
+	});
+
+	it("badly-typed file value falls back to env (then to undefined)", () => {
+		// The contract: callers should pipe the raw JSON through
+		// `parseConfigFile` first to get a clean `ParsedConfigFile`,
+		// then pass the parsed result to `resolveConfig`. The
+		// resolver does NOT re-validate its `file` parameter —
+		// validation lives in `parseConfigFile`. The two-step
+		// pipeline is the public surface: parse → resolve.
+		const parsed = parseConfigFile({ reasoningBlockCap: "1" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.reasoningBlockCap]: "5" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, 5, "parseConfigFile drops the bad file value; env value wins");
+	});
+
+	it("badly-typed in BOTH channels → resolver returns undefined", () => {
+		// The two-step pipeline: parseConfigFile drops the bad
+		// file value, then resolveConfig's env parser drops the
+		// bad env string. The resolver returns undefined when
+		// neither channel yields a valid value.
+		const parsed = parseConfigFile({ reasoningBlockCap: "1" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.reasoningBlockCap]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, undefined, "both channels badly-typed → undefined (wiring default applies)");
+	});
+
+	it("env value < -1 falls back to file value (or undefined)", () => {
+		// `parseBlockCapEnv` rejects values less than -1 (the
+		// passthrough sentinel is the lower bound). An env of
+		// "-2" returns undefined; the file value (or default)
+		// applies.
+		const cfgFile = resolveConfig({
+			file: { reasoningBlockCap: 3 },
+			env: { [ENV.reasoningBlockCap]: "-2" } as EnvRecord,
+		});
+		assert.equal(cfgFile.reasoningBlockCap, 3, "env -2 falls back to file value");
+		const cfgUnset = resolveConfig({
+			env: { [ENV.reasoningBlockCap]: "-100" } as EnvRecord,
+		});
+		assert.equal(cfgUnset.reasoningBlockCap, undefined, "env -100, no file → undefined");
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric integer string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningBlockCap]: "10" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, 10);
+		assert.equal(typeof cfg.reasoningBlockCap, "number");
+	});
+
+	it("env parse: the -1 sentinel is preserved as a number, not coerced to 0", () => {
+		// -1 is the passthrough sentinel. The env parser must
+		// preserve it as the integer -1 (not coerce to 0 or any
+		// other value).
+		const cfg = resolveConfig({
+			env: { [ENV.reasoningBlockCap]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.reasoningBlockCap, -1, "env -1 is preserved as the passthrough sentinel");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.reasoningBlockCap is the documented namespace", () => {
+		assert.equal(ENV.reasoningBlockCap, "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP");
+	});
+});
+
+describe("reasoningBlockCap — file parse: all-or-nothing per field", () => {
+	// The existing "badly-typed values are treated as absent" rule
+	// applies per-field, not per-document. A well-typed
+	// `reasoningBlockCap` does NOT depend on the other fields'
+	// shape (and vice versa).
+	it("file parse: one well-typed field does not poison a neighboring badly-typed field", () => {
+		const f = parseConfigFile({
+			reasoningBlockCap: 3,
+			tier1MaxTokens: "75000" as unknown as number, // badly-typed
+		});
+		assert.equal(f.reasoningBlockCap, 3, "well-typed reasoningBlockCap survives a neighboring bad value");
+		assert.equal(f.tier1MaxTokens, undefined, "the badly-typed neighboring field is dropped");
+	});
+});
