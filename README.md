@@ -77,6 +77,23 @@ When a **hard-block** threshold is configured (default: off) AND the run length 
 
 The guard detects **behavioral** loops via tool-call signatures. **Reasoning-only** loops (the model re-reasoning without a tool call) are out of scope — a no-tool-call turn yields a distinct fingerprint and resets the run naturally, no special case required.
 
+## Reasoning block cap
+
+Some reasoning-capable models surface a `type:"thinking"` content block on assistant messages — the model's intermediate "chain of thought" that the provider may or may not bill or pass through. The cap is a count-based gate on those blocks: keep the LAST N reasoning blocks (counted from the latest) and drop the rest before the three-tier trim runs.
+
+The cap is a count of blocks, not a measurement of tokens. The trim budget accounts for the post-cap mass, so dropping reasoning blocks at the cap shrinks the budget the three-tier trim needs to satisfy.
+
+| Cap value | Effect |
+|-----------|--------|
+| `-1` (default) | Passthrough — keep every reasoning block. The default is passthrough so existing operators see no behavior change when upgrading; opt in to a cap by setting the env var or JSON key. |
+| `0` | Send no reasoning blocks. |
+| `1` | Keep only the last reasoning block; drop all earlier ones. |
+| any positive integer | Keep the last N reasoning blocks. |
+
+The cap runs unconditionally on every context event (no per-model branching). The wiring layer applies the cap to the `base` message stream before pinned injection, so the pinned synthetic is never at risk of being dropped.
+
+Reasoning blocks are content blocks of shape `{ type: "thinking"; thinking: string }` on assistant messages. The default is passthrough; set the env var or JSON key to `0` (send none) or a positive integer to opt in to a cap.
+
 ## Config
 
 The trim policy's three tier caps live as compile-time constants in `policy.ts` and are also exposed as operator-configurable knobs through the two config channels described below. The compile-time values are the defaults when neither channel sets a value:
@@ -112,11 +129,12 @@ Create `~/.pi/agent/context-trimmer.json`:
   "summaWords": 60,                                                 // falls back to SUMMA_WORDS
   "loopGuard": true,                                                // true (default) | false
   "loopGuardThreshold": 3,                                          // falls back to 3 (consecutive identical tool-call turns)
-  "loopGuardHardBlock": 10                                          // falls back to off; positive int enables hard-block
+  "loopGuardHardBlock": 10,                                         // falls back to off; positive int enables hard-block
+  "reasoningBlockCap": -1                                           // -1 passthrough (default), 0 send none, N keep last N
 }
 ```
 
-All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. `loopGuard` accepts `true` (default — ON for every session) or `false` to opt out; the previous `"auto"` sentinel is no longer accepted (a `"auto"` value in the file is treated as absent and the resolver falls through to the default `true`). The three tier-threshold fields (`tier1MaxTokens`, `tier2MaxTokens`, `summaWords`) follow the same env-over-file-over-default precedence the other fields already document, with the compile-time constants in `policy.ts` as the final default. Each threshold value must be a positive finite number — non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent (the resolver falls back to the other channel / defaults), matching the existing "badly-typed values are treated as absent" rule. The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent.
+All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. `loopGuard` accepts `true` (default — ON for every session) or `false` to opt out; the previous `"auto"` sentinel is no longer accepted (a `"auto"` value in the file is treated as absent and the resolver falls through to the default `true`). The three tier-threshold fields (`tier1MaxTokens`, `tier2MaxTokens`, `summaWords`) follow the same env-over-file-over-default precedence the other fields already document, with the compile-time constants in `policy.ts` as the final default. Each threshold value must be a positive finite number — non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent (the resolver falls back to the other channel / defaults), matching the existing "badly-typed values are treated as absent" rule. `reasoningBlockCap` is an integer in `[-1, ∞)`: `-1` is the passthrough sentinel (the default — every block survives), `0` means "send no reasoning blocks", and any positive integer is the count of blocks to keep from the latest. Non-integer, less than `-1`, `NaN`, and `Infinity` are all treated as absent; the resolver falls through to the env / default layer (`-1`). The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent.
 
 `preservedPaths` is an optional list of patterns whose matching tool-result messages are protected from summary and drop and whose tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match — it matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match; the `~/` form is expanded to your home directory (e.g. `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`). When `preservedPaths` is unset, no paths are preserved; when set, the patterns above are protected from the trim budget.
 
@@ -133,6 +151,7 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD` | `1` forces the loop guard ON, `0` forces OFF. Unset/other (including the previous `"auto"` sentinel) → falls back to the file, then the default `true` (ON for every session, independent of `pi-subagents` presence). |
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD` | Positive integer; the soft-nudge threshold (consecutive identical tool-call turns before the wiring layer injects a nudge). Unset/empty/non-numeric/zero/negative → falls back to the file, then `3`. |
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK` | Positive integer; the hard-block threshold (consecutive identical tool-call turns before the wiring layer strips the tool calls and forces a text-only continuation). Unset → falls back to the file, then off. Values below the soft-nudge threshold are clamped up to the soft-nudge threshold so the hard-block cannot fire before the soft-nudge. |
+| `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` | Integer in `[-1, ∞)`. The count of `type:"thinking"` content blocks (counted from the latest) to keep per message stream. `-1` is the passthrough (every block survives), `0` sends none, any positive integer is the count. The cap runs before the three-tier trim, so the budget sees the post-cap mass. Unset/empty/non-integer/less than `-1`/non-numeric → falls back to the file, then the default `-1` (passthrough — existing operators see no behavior change when upgrading). |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
 When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
@@ -147,7 +166,7 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (267 tests, ~1s on a modern laptop):
+Run the test suite (377 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency

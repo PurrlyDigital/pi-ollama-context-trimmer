@@ -10,13 +10,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
+	countReasoningBlocks,
+	extractReasoningText,
 	extractText,
 	fingerprintToolCall,
 	fingerprintAssistantTurn,
 	detectConsecutiveIdenticalToolCalls,
 	computeFlatInputTokenSignal,
+	hasReasoning,
+	REASONING_BLOCK_CAP_DEFAULT,
 	shouldHardBlock,
 	FLAT_INPUT_TOKEN_TOLERANCE,
 	LOOP_GUARD_NUDGE_TEXT,
@@ -92,6 +97,27 @@ function assistantWithMixedBlock(
 			{ type: "text", text: prose },
 			{ type: "toolCall", name, arguments: args },
 		],
+	};
+}
+
+/** Build an assistant-turn fixture carrying N thinking blocks. */
+function assistantWithThinking(blocks: string[]): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: blocks.map((t) => ({ type: "thinking", thinking: t })),
+	};
+}
+
+/** Build an assistant-turn fixture carrying a mix of thinking and text blocks. */
+function assistantWithThinkingAndText(thinking: string[], text: string): TrimmableMessage {
+	const content: unknown[] = [];
+	// Interleave: thinking first, then text. The block order is the
+	// message's source order; the cap reverse-walks this list.
+	for (const t of thinking) content.push({ type: "thinking", thinking: t });
+	content.push({ type: "text", text });
+	return {
+		role: "assistant",
+		content: content as Array<{ type: string; [k: string]: unknown }>,
 	};
 }
 
@@ -2234,5 +2260,304 @@ describe("applyThreeTierTrim — summarize tier: prose-only input (AC-1)", () =>
 			tokens > Math.ceil(prose.length / 4),
 			`approximateMessageTokens must include the tool-call JSON in its count (got ${tokens})`,
 		);
+	});
+});
+
+// ─── Reasoning-block cap (AC-4) ─────────────────────────────────────
+//
+// The reasoning-block cap is a pure-function transform on the
+// message array. It keeps the LAST N `type:"thinking"` content
+// blocks across the stream (counted from the latest end) and drops
+// the rest by REMOVING thinking blocks from their parent messages.
+// Non-thinking content blocks in the same message are preserved
+// verbatim. The cap is a count, not a token budget.
+//
+// Cap semantics (mirrors the policy.ts comment block):
+//   cap === -1  → passthrough, return the input unchanged
+//   cap ===  0  → drop every thinking block from every message
+//   cap  >  0   → keep the last `cap` thinking blocks, drop the rest
+//
+// The tests below cover the policy-layer cap surface:
+//   - The four semantic regions (-1, 0, 1, N>1).
+//   - The "no thinking blocks present" no-regression invariant.
+//   - The "thinking + text in the same message" mixed-block case
+//     (text survives; only thinking is subject to the cap).
+//   - A purity check: the new exports must not pull in process.* or
+//     node:fs (the no-process.no-I/O contract is part of the
+//     existing purity surface; the test reads each export's
+//     function source and asserts no forbidden token is present).
+//   - The supporting helpers (extractReasoningText, hasReasoning,
+//     countReasoningBlocks) get their own describe blocks for
+//     parity with the file's test-per-function shape.
+
+describe("REASONING_BLOCK_CAP_DEFAULT", () => {
+	it("is the documented compile-time default (-1 — passthrough, so existing operators see no behavior change)", async () => {
+		assert.equal(REASONING_BLOCK_CAP_DEFAULT, -1);
+	});
+});
+
+describe("extractReasoningText", () => {
+	it("returns the concatenated thinking strings from a message with multiple thinking blocks", async () => {
+		const msg: TrimmableMessage = assistantWithThinking(["first ", "second ", "third"]);
+		assert.equal(extractReasoningText(msg.content), "first second third");
+	});
+
+	it("returns an empty string when there are no thinking blocks", async () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "no thinking here" }],
+		};
+		assert.equal(extractReasoningText(msg.content), "");
+	});
+
+	it("returns an empty string for a non-array content (string content, object content)", async () => {
+		assert.equal(extractReasoningText("plain string"), "");
+		assert.equal(extractReasoningText({ a: 1 }), "");
+	});
+});
+
+describe("hasReasoning", () => {
+	it("returns true when a message has at least one thinking block", async () => {
+		const msg: TrimmableMessage = assistantWithThinking(["anything"]);
+		assert.equal(hasReasoning(msg), true);
+	});
+
+	it("returns false when a message has no thinking blocks (only text / toolCall / etc.)", async () => {
+		const msg: TrimmableMessage = {
+			role: "assistant",
+			content: [{ type: "text", text: "no reasoning here" }],
+		};
+		assert.equal(hasReasoning(msg), false);
+	});
+
+	it("returns false for a non-array content (string content, object content)", async () => {
+		assert.equal(hasReasoning({ role: "assistant", content: "string content" }), false);
+		assert.equal(hasReasoning({ role: "assistant", content: { a: 1 } }), false);
+	});
+});
+
+describe("countReasoningBlocks", () => {
+	it("counts thinking blocks across the whole stream", async () => {
+		const messages: TrimmableMessage[] = [
+			assistantWithThinking(["a", "b"]),
+			assistantWithThinking(["c"]),
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "no thinking" }],
+			},
+			assistantWithThinking(["d", "e", "f"]),
+		];
+		assert.equal(countReasoningBlocks(messages), 6);
+	});
+
+	it("returns 0 when no message carries a thinking block", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("hello"),
+		];
+		assert.equal(countReasoningBlocks(messages), 0);
+	});
+
+	it("returns 0 for an empty input", async () => {
+		assert.equal(countReasoningBlocks([]), 0);
+	});
+});
+
+describe("applyReasoningBlockCap", () => {
+	// ── cap === -1 (passthrough) ──────────────────────────────────
+
+	it("cap === -1: returns the input unchanged (passthrough)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantWithThinking(["think-1", "think-2"]),
+			assistantWithThinking(["think-3", "think-4"]),
+		];
+		const out = applyReasoningBlockCap(messages, -1);
+		// Identity-by-content check: every message is in the same
+		// position with the same content. Passthrough is a shallow
+		// slice (the policy returns messages.slice(), not a deep
+		// clone) — verify the array elements match by reference.
+		assert.equal(out.length, messages.length);
+		for (let i = 0; i < out.length; i++) {
+			assert.equal(out[i], messages[i]);
+		}
+	});
+
+	// ── cap === 0 (drop all) ──────────────────────────────────────
+
+	it("cap === 0: drops every thinking block from every message; non-thinking content blocks preserved", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: "preamble" },
+					{ type: "thinking", thinking: "think-1" },
+				],
+			},
+			assistantWithThinking(["think-2", "think-3"]),
+		];
+		const out = applyReasoningBlockCap(messages, 0);
+		// Same length, same message order.
+		assert.equal(out.length, messages.length);
+		// Message 0 (the dispatch) is unchanged.
+		assert.equal(out[0], messages[0]);
+		// Message 1: the text block survives, the thinking block
+		// is removed. The result has one content block (text).
+		const m1 = out[1];
+		assert.ok(Array.isArray(m1.content));
+		assert.equal((m1.content as unknown[]).length, 1);
+		assert.equal(
+			(m1.content as Array<{ type: string; text?: string }>)[0].type,
+			"text",
+		);
+		assert.equal(
+			(m1.content as Array<{ type: string; text?: string }>)[0].text,
+			"preamble",
+		);
+		// Message 2 was a thinking-only message; dropping every
+		// thinking block leaves an empty content array. The
+		// message is preserved (not removed) — the index space is
+		// stable so the wiring layer's downstream consumers see
+		// the same message order.
+		const m2 = out[2];
+		assert.ok(Array.isArray(m2.content));
+		assert.equal((m2.content as unknown[]).length, 0);
+		// The non-thinking content blocks were never at risk: the
+		// cap targets type:"thinking" exclusively.
+		assert.equal(countReasoningBlocks(out), 0, "no thinking blocks survive cap=0");
+	});
+
+	// ── cap === 1 (keep last) ─────────────────────────────────────
+
+	it("cap === 1: only the last thinking block across the stream survives; all earlier ones dropped", async () => {
+		// 4 thinking blocks across 2 messages. With cap=1, the
+		// latest block (think-4) survives; think-1, think-2,
+		// think-3 are dropped.
+		const messages: TrimmableMessage[] = [
+			assistantWithThinking(["think-1", "think-2"]),
+			assistantWithThinking(["think-3", "think-4"]),
+		];
+		const out = applyReasoningBlockCap(messages, 1);
+		// Total thinking-block count after cap: 1.
+		assert.equal(countReasoningBlocks(out), 1);
+		// The surviving block is the LAST one in the stream (the
+		// last block of the last message). find the surviving
+		// block by its text content.
+		const survivor = out
+			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; thinking?: string }>) : []))
+			.find((b) => b.type === "thinking");
+		assert.ok(survivor, "exactly one thinking block survives cap=1");
+		assert.equal(survivor.thinking, "think-4");
+	});
+
+	// ── cap === 3 (count cap) ─────────────────────────────────────
+
+	it("cap === 3: the last 3 thinking blocks survive; the rest dropped", async () => {
+		const messages: TrimmableMessage[] = [
+			assistantWithThinking(["think-1", "think-2", "think-3"]),
+			assistantWithThinking(["think-4", "think-5"]),
+		];
+		const out = applyReasoningBlockCap(messages, 3);
+		// Total thinking-block count after cap: 3.
+		assert.equal(countReasoningBlocks(out), 3);
+		// The surviving blocks are the LAST 3 in the stream:
+		// think-3 (last of message 0), think-4, think-5 (message 1).
+		// The cap reverse-walks: latest-first.
+		const survivors = out
+			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; thinking?: string }>) : []))
+			.filter((b) => b.type === "thinking")
+			.map((b) => b.thinking);
+		assert.deepEqual(survivors, ["think-3", "think-4", "think-5"]);
+	});
+
+	// ── no-regression: messages without thinking blocks ──────────
+
+	it("returns messages unchanged when no message carries a thinking block (any cap value)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("hello"),
+			{ role: "toolResult", content: "ok" },
+		];
+		// Try every meaningful cap value; the no-regression
+		// invariant holds for all of them.
+		for (const cap of [-1, 0, 1, 3]) {
+			const out = applyReasoningBlockCap(messages, cap);
+			// Same length, same positions, same content. The
+			// cap pass is a no-op when the stream has no
+			// thinking blocks.
+			assert.equal(out.length, messages.length, `length preserved at cap=${cap}`);
+			for (let i = 0; i < out.length; i++) {
+				assert.equal(out[i], messages[i], `message ${i} preserved at cap=${cap}`);
+			}
+		}
+	});
+
+	// ── mixed blocks: thinking + text in the same message ────────
+
+	it("preserves text blocks; only thinking blocks subject to the cap", async () => {
+		// A single message with 3 thinking blocks followed by a
+		// text block. With cap=1, only the LAST thinking block
+		// (think-3) survives; the text block is untouched.
+		const messages: TrimmableMessage[] = [
+			assistantWithThinkingAndText(["think-1", "think-2", "think-3"], "answer text"),
+		];
+		const out = applyReasoningBlockCap(messages, 1);
+		const m0 = out[0];
+		assert.ok(Array.isArray(m0.content));
+		// The text block is preserved.
+		const textBlock = (m0.content as Array<{ type: string; text?: string }>).find((b) => b.type === "text");
+		assert.ok(textBlock, "the text block must survive the cap (only thinking blocks are subject to it)");
+		assert.equal(textBlock.text, "answer text");
+		// Exactly one thinking block survives.
+		const thinkingBlocks = (m0.content as Array<{ type: string; thinking?: string }>).filter((b) => b.type === "thinking");
+		assert.equal(thinkingBlocks.length, 1);
+		assert.equal(thinkingBlocks[0].thinking, "think-3");
+	});
+
+	// ── cap > total: no over-drop (cap is a count, not a floor) ──
+
+	it("cap > total thinking blocks: every block survives (no over-drop)", async () => {
+		const messages: TrimmableMessage[] = [
+			assistantWithThinking(["think-1", "think-2"]),
+		];
+		const out = applyReasoningBlockCap(messages, 10);
+		assert.equal(countReasoningBlocks(out), 2);
+		const survivors = (out[0].content as Array<{ type: string; thinking?: string }>).map((b) => b.thinking);
+		assert.deepEqual(survivors, ["think-1", "think-2"]);
+	});
+
+	// ── immutability: the input array is not mutated ──────────────
+
+	it("does not mutate the input messages array", async () => {
+		const messages: TrimmableMessage[] = [
+			assistantWithThinking(["think-1", "think-2", "think-3"]),
+			assistantWithThinking(["think-4"]),
+		];
+		// Snapshot the input's content arrays by JSON so we can
+		// verify the cap did not mutate them.
+		const snapshot = JSON.stringify(messages);
+		applyReasoningBlockCap(messages, 1);
+		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated by the cap");
+	});
+
+	// ── purity: the new exports do not pull in process.* or I/O ──
+
+	it("purity: applyReasoningBlockCap source has no process.*, node:fs, node:os, or other I/O", async () => {
+		// A structural test for the purity contract (the policy
+		// module is a pure module — no process.*, no Node I/O).
+		// Read the function's source via `toString()` and assert
+		// no forbidden token is present. The function source
+		// captures the function body verbatim; if the body
+		// references `process.env` or imports `node:fs` directly,
+		// this assertion fails. (An import at the top of
+		// policy.ts would be a separate concern; this test is
+		// scoped to the function body.)
+		const src = applyReasoningBlockCap.toString();
+		assert.ok(!src.includes("process."), "applyReasoningBlockCap must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "applyReasoningBlockCap must not import node:fs");
+		assert.ok(!src.includes("node:os"), "applyReasoningBlockCap must not import node:os");
+		assert.ok(!src.includes("fetch("), "applyReasoningBlockCap must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "applyReasoningBlockCap must not perform filesystem I/O");
 	});
 });

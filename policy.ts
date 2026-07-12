@@ -1133,6 +1133,216 @@ function findOldestSummarizable(
 	return -1;
 }
 
+// ─── Reasoning-block cap (count-based reasoning trim) ─────────────
+//
+// A count-based cap on `type: "thinking"` content blocks. The cap
+// keeps the LAST N reasoning blocks across the message stream
+// (latest message first; within each message, content blocks
+// scanned in reverse), and drops the rest by removing the
+// thinking blocks from their parent messages. Non-thinking content
+// blocks in the same message are preserved. The unit is a count
+// of blocks, not a measurement of tokens.
+//
+// Block shape (verified at `index.ts:680`):
+//   { type: "thinking"; thinking: string }
+//
+// Cap semantics:
+//   cap === -1  → passthrough, return the input unchanged
+//   cap ===  0  → drop every thinking block from every message
+//   cap  >  0   → keep the last `cap` thinking blocks, drop the rest
+//
+// Pure: no `process.*`, no Node I/O. Operates only on the message
+// array. Used by the wiring layer (Unit 3) at the context handler
+// before `applyThreeTierTrim` so the three-tier budget sees the
+// post-cap message mass.
+
+/**
+ * Compile-time default for the reasoning-block count cap. The
+ * wiring layer reads this when neither the env var nor the JSON
+ * key (Unit 2) sets a value. `-1` is the passthrough sentinel —
+ * "send every reasoning block through" — so existing operators
+ * see no behavior change when upgrading. To opt in to the cap,
+ * set the env var or JSON key to `0` (send none) or a positive
+ * integer (keep the last N).
+ */
+export const REASONING_BLOCK_CAP_DEFAULT = -1;
+
+/**
+ * Pure extractor: concatenate the `thinking` strings from every
+ * `type: "thinking"` content block on a single message. Order
+ * follows the block order in the message. Non-thinking blocks
+ * (text, toolCall, toolResult, …) are skipped. Non-array content
+ * (string, object) yields `""`. Returns `""` for an empty array.
+ *
+ * Used by the wiring layer to surface the full reasoning text of
+ * a message for inspection, log, or display; the count cap itself
+ * only needs the block identities, not the text.
+ */
+export function extractReasoningText(content: unknown): string {
+	if (!Array.isArray(content)) return "";
+	let out = "";
+	for (const block of content) {
+		if (
+			block &&
+			typeof block === "object" &&
+			(block as { type?: unknown }).type === "thinking" &&
+			typeof (block as { thinking?: unknown }).thinking === "string"
+		) {
+			out += (block as { thinking: string }).thinking;
+		}
+	}
+	return out;
+}
+
+/**
+ * Pure predicate: does this message contain at least one
+ * `type: "thinking"` content block? Used to short-circuit the cap
+ * pass when a message stream has no reasoning blocks at all (the
+ * common case in non-reasoning sessions).
+ */
+export function hasReasoning(msg: TrimmableMessage): boolean {
+	const content = msg.content;
+	if (!Array.isArray(content)) return false;
+	for (const block of content) {
+		if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Count the total number of `type: "thinking"` content blocks
+ * across the message stream. Walks every message in order; per
+ * message, walks every content block. Used to surface the
+ * reasoning-block count to the wiring layer for diagnostics and
+ * to gate the cap pass (if the total is ≤ the cap, no work is
+ * needed).
+ */
+export function countReasoningBlocks(messages: ReadonlyArray<TrimmableMessage>): number {
+	let n = 0;
+	for (const msg of messages) {
+		const content = msg.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+				n += 1;
+			}
+		}
+	}
+	return n;
+}
+
+/**
+ * Apply the reasoning-block count cap. The cap is a count of
+ * reasoning blocks (NOT tokens) to keep, measured from the
+ * LATEST end of the stream. The transform:
+ *
+ *   1. Walks the message stream in REVERSE (latest message first).
+ *   2. For each message, walks the content blocks in REVERSE.
+ *   3. Collects every `type: "thinking"` block encountered, in
+ *      "latest-first" order.
+ *   4. Keeps the first `cap` collected (the latest `cap` thinking
+ *      blocks across the whole stream) and drops the rest by
+ *      REMOVING the thinking block from its parent message
+ *      (non-thinking content blocks in the same message are
+ *      preserved verbatim).
+ *   5. Returns a fresh messages array; the input is not mutated.
+ *
+ * Cap semantics:
+ *   cap === -1  → return the input unchanged (passthrough).
+ *   cap ===  0  → drop every thinking block from every message.
+ *   cap  >  0   → keep the last `cap` thinking blocks, drop the rest.
+ *
+ * Edge cases:
+ *   - Messages with non-array content (string, object) have no
+ *     thinking blocks and pass through untouched.
+ *   - Messages with array content but no thinking blocks have
+ *     their content array preserved verbatim.
+ *   - When a message has its content array rewritten (some
+ *     thinking blocks dropped, others kept), the rewrite is a
+ *     fresh array — the input message is not mutated.
+ *   - Messages whose content array becomes empty after dropping
+ *     thinking blocks are rewritten with `content: []` (NOT
+ *     removed) so the message order and the wiring layer's
+ *     downstream consumers see a stable index space.
+ *
+ * Pure: no I/O, no `process.*`. Operates only on the message
+ * array shape. Called by the wiring layer (Unit 3) at the
+ * context handler before `applyThreeTierTrim`.
+ */
+export function applyReasoningBlockCap(
+	messages: ReadonlyArray<TrimmableMessage>,
+	cap: number,
+): TrimmableMessage[] {
+	if (cap === -1) return messages.slice();
+	const out: TrimmableMessage[] = new Array(messages.length);
+	for (let i = 0; i < messages.length; i++) {
+		out[i] = messages[i];
+	}
+	if (cap === 0) {
+		// Drop every thinking block from every message.
+		for (let i = 0; i < out.length; i++) {
+			const msg = out[i];
+			const content = msg.content;
+			if (!Array.isArray(content)) continue;
+			const filtered = content.filter(
+				(block) => !(block && typeof block === "object" && (block as { type?: unknown }).type === "thinking"),
+			);
+			if (filtered.length !== content.length) {
+				out[i] = { ...msg, content: filtered };
+			}
+		}
+		return out;
+	}
+	// cap > 0: walk in reverse, keep the first `cap` thinking blocks
+	// (the latest ones), drop the rest. We do this in a single
+	// reverse pass that records which (messageIndex, blockIndex)
+	// pairs to KEEP; everything else in the thinking-block set is
+	// dropped.
+	const keepSet = new Set<string>();
+	let seen = 0;
+	for (let mi = out.length - 1; mi >= 0 && seen < cap; mi--) {
+		const msg = out[mi];
+		const content = msg.content;
+		if (!Array.isArray(content)) continue;
+		for (let bi = content.length - 1; bi >= 0 && seen < cap; bi--) {
+			const block = content[bi];
+			if (block && typeof block === "object" && (block as { type?: unknown }).type === "thinking") {
+				keepSet.add(`${mi}:${bi}`);
+				seen += 1;
+			}
+		}
+	}
+	if (seen === 0) return out;
+	// Apply the keep set: every thinking block NOT in the keep set
+	// is dropped. Non-thinking blocks are always preserved.
+	let touchedAny = false;
+	for (let mi = 0; mi < out.length; mi++) {
+		const msg = out[mi];
+		const content = msg.content;
+		if (!Array.isArray(content)) continue;
+		let touched = false;
+		const filtered: unknown[] = [];
+		for (let bi = 0; bi < content.length; bi++) {
+			const block = content[bi];
+			const isThinking =
+				block && typeof block === "object" && (block as { type?: unknown }).type === "thinking";
+			if (isThinking && !keepSet.has(`${mi}:${bi}`)) {
+				touched = true;
+				continue;
+			}
+			filtered.push(content[bi]);
+		}
+		if (touched) {
+			out[mi] = { ...msg, content: filtered };
+			touchedAny = true;
+		}
+	}
+	if (!touchedAny) return out;
+	return out;
+}
+
 // ─── Loop guard (defense-in-depth for model-caused loops) ──────────
 //
 // Detects repeated identical tool-call sequences in the assistant
