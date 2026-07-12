@@ -92,6 +92,14 @@ export interface ContextTrimmerConfig {
 	 *  pin is also skipped (an explicit no-op for clarity, identical
 	 *  to leaving it unset). */
 	readonly pinSubagent?: boolean;
+	/** Reasoning-block count cap. The wiring layer (in the context
+	 *  handler) keeps the last N `type:"thinking"` content blocks per
+	 *  message stream and drops the rest before the three-tier trim
+	 *  runs. Integer semantics: `-1` = send all (passthrough),
+	 *  `0` = send none, any positive integer = send that many
+	 *  (counted from the latest). Overrides the policy default when
+	 *  set. */
+	readonly reasoningBlockCap?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -125,6 +133,7 @@ export const ENV = {
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
 	asyncMode: "PI_CONTEXT_TRIMMER_ASYNC_MODE",
 	pinSubagent: "PI_CONTEXT_TRIMMER_PIN_SUBAGENT",
+	reasoningBlockCap: "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -147,6 +156,7 @@ export interface ParsedConfigFile {
 	loopGuardHardBlock?: number;
 	asyncMode?: boolean;
 	pinSubagent?: boolean;
+	reasoningBlockCap?: number;
 }
 
 /**
@@ -201,6 +211,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (ps === true || ps === false) {
 		out.pinSubagent = ps;
 	}
+	if (isValidBlockCap(o.reasoningBlockCap)) {
+		out.reasoningBlockCap = o.reasoningBlockCap;
+	}
 	return out;
 }
 
@@ -254,6 +267,8 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.loopGuardThreshold]) ?? file.loopGuardThreshold;
 	const loopGuardHardBlock =
 		parseNumberEnv(env[ENV.loopGuardHardBlock]) ?? file.loopGuardHardBlock;
+	const reasoningBlockCap =
+		parseBlockCapEnv(env[ENV.reasoningBlockCap]) ?? file.reasoningBlockCap;
 
 	let asyncMode: boolean;
 	const envAm = env[ENV.asyncMode];
@@ -305,6 +320,7 @@ export function resolveConfig(opts: {
 		loopGuardHardBlock,
 		asyncMode,
 		pinSubagent,
+		reasoningBlockCap,
 	};
 }
 
@@ -335,6 +351,18 @@ function isPositiveNumber(v: unknown): v is number {
  *  precedence layer. */
 function isDropFloorPercent(v: unknown): v is number {
 	return typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 100;
+}
+
+/** Type guard: a value is an integer in [-1, ∞). Used to validate the
+ *  reasoning-block count cap; `-1` is the passthrough sentinel, `0`
+ *  means "send none", and any positive integer is the count of blocks
+ *  to keep from the latest. Non-numeric, non-integer, less than `-1`,
+ *  `NaN`, and `Infinity` are all treated as absent so the resolver
+ *  falls through to the next precedence layer. This is broader than
+ *  `isPositiveNumber` (which rejects `0` and negatives) on purpose —
+ *  the cap knob's three meaningful states are `-1`, `0`, and `1+`. */
+function isValidBlockCap(v: unknown): v is number {
+	return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v) && v >= -1;
 }
 
 /** Parse a comma-separated env value into a trimmed, non-empty list.
@@ -368,4 +396,18 @@ function parsePercentEnv(s: string | undefined): number | undefined {
 	if (trimmed === undefined) return undefined;
 	const n = Number(trimmed);
 	return isDropFloorPercent(n) ? n : undefined;
+}
+
+/** Parse an env-var value as an integer in [-1, ∞). The empty string
+ *  (and all-whitespace) returns `undefined` so the caller can fall
+ *  through to the next precedence layer; non-numeric, non-integer,
+ *  less than `-1`, `NaN`, and `Infinity` likewise return `undefined`.
+ *  Mirrors `parseNumberEnv` but uses `isValidBlockCap` so it accepts
+ *  the `-1` (passthrough) and `0` (send none) sentinels that the cap
+ *  knob's semantics require. */
+function parseBlockCapEnv(s: string | undefined): number | undefined {
+	const trimmed = nonEmpty(s);
+	if (trimmed === undefined) return undefined;
+	const n = Number(trimmed);
+	return isValidBlockCap(n) ? n : undefined;
 }
