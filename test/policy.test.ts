@@ -2291,8 +2291,8 @@ describe("applyThreeTierTrim — summarize tier: prose-only input (AC-1)", () =>
 //     parity with the file's test-per-function shape.
 
 describe("REASONING_BLOCK_CAP_DEFAULT", () => {
-	it("is the documented compile-time default (1 — the last reasoning block)", async () => {
-		assert.equal(REASONING_BLOCK_CAP_DEFAULT, 1);
+	it("is the documented compile-time default (-1 — passthrough, so existing operators see no behavior change)", async () => {
+		assert.equal(REASONING_BLOCK_CAP_DEFAULT, -1);
 	});
 });
 
@@ -2428,9 +2428,9 @@ describe("applyReasoningBlockCap", () => {
 		assert.equal(countReasoningBlocks(out), 0, "no thinking blocks survive cap=0");
 	});
 
-	// ── cap === 1 (default) ───────────────────────────────────────
+	// ── cap === 1 (keep last) ─────────────────────────────────────
 
-	it("cap === 1 (default): only the last thinking block across the stream survives; all earlier ones dropped", async () => {
+	it("cap === 1: only the last thinking block across the stream survives; all earlier ones dropped", async () => {
 		// 4 thinking blocks across 2 messages. With cap=1, the
 		// latest block (think-4) survives; think-1, think-2,
 		// think-3 are dropped.

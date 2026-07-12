@@ -1159,10 +1159,13 @@ function findOldestSummarizable(
 /**
  * Compile-time default for the reasoning-block count cap. The
  * wiring layer reads this when neither the env var nor the JSON
- * key (Unit 2) sets a value. `1` matches the operator's stated
- * default: "send the last reasoning block".
+ * key (Unit 2) sets a value. `-1` is the passthrough sentinel —
+ * "send every reasoning block through" — so existing operators
+ * see no behavior change when upgrading. To opt in to the cap,
+ * set the env var or JSON key to `0` (send none) or a positive
+ * integer (keep the last N).
  */
-export const REASONING_BLOCK_CAP_DEFAULT = 1;
+export const REASONING_BLOCK_CAP_DEFAULT = -1;
 
 /**
  * Pure extractor: concatenate the `thinking` strings from every

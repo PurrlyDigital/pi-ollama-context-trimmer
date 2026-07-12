@@ -2202,18 +2202,21 @@ describe("background-mode integration — asyncMode: true", () => {
 // before pinned injection). The three tests below cover the
 // end-to-end cap behavior through the production wiring:
 //
-//   (a) cap = 1 (the default): a stream with multiple thinking
-//       blocks → only the LAST thinking block survives into the
-//       three-tier trim. The post-cap mass reaches `applyThreeTierTrim`,
+//   (a) cap = 1: a stream with multiple thinking blocks → only
+//       the LAST thinking block survives into the three-tier
+//       trim. The post-cap mass reaches `applyThreeTierTrim`,
 //       so a session that would have landed in tier 2 with the
 //       full thinking-block mass might land in a different tier
 //       after the cap (the budget accounts for the post-cap mass).
 //   (b) No thinking blocks + any cap value: no-regression — the
 //       existing three-tier trim behaves identically. The cap pass
 //       is a no-op on a stream with no thinking blocks.
-//   (c) cap = -1 (passthrough): the full message stream reaches
-//       `applyThreeTierTrim` unchanged. No thinking block is
-//       dropped. The cap is a transparent passthrough.
+//   (c) cap = -1 (the compile-time default): the full message
+//       stream reaches `applyThreeTierTrim` unchanged. No thinking
+//       block is dropped. The cap is a transparent passthrough.
+//       This case also covers the default-off posture: existing
+//       operators see no behavior change when upgrading because
+//       the compile-time default is passthrough.
 //
 // The cap is global (no `ctx.model` branching per the binding
 // decisions) and runs on every context event.
@@ -2268,7 +2271,7 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 
 	// ── (a) cap = 1: only the last thinking block survives into the three-tier trim ──
 
-	it("cap = 1 (default): only the last thinking block survives into the three-tier trim", async () => {
+	it("cap = 1: only the last thinking block survives into the three-tier trim", async () => {
 		// Build a stream with 4 thinking blocks spread across 2
 		// assistant messages. With cap = 1, only the LAST thinking
 		// block (the last block of the last message) survives.
@@ -2368,6 +2371,34 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// All 4 thinking blocks survive the passthrough.
 		assert.equal(countThinkingBlocksIn(result.messages), 4, "cap=-1 is a passthrough: every thinking block survives");
+	});
+
+	// ── (d) default applies: neither env nor JSON sets the knob → compile-time default (-1) is passthrough ──
+
+	it("default applies: with neither env nor JSON set, the compile-time default (-1) keeps every thinking block (existing operators see no behavior change)", async () => {
+		// The compile-time default in `policy.ts` is now `-1`
+		// (passthrough) — flipped from `1` so existing operators
+		// are unaffected when upgrading. With neither the env
+		// var nor the JSON file setting a value, the wiring
+		// layer's `cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT`
+		// resolves to `-1` and every thinking block survives.
+		// This is the load-bearing default-applies test: a stream
+		// with multiple thinking blocks, neither channel
+		// configured, the post-cap mass reaches the three-tier
+		// trim with all blocks intact.
+		delete process.env[CONFIG_ENV.reasoningBlockCap];
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// All 4 thinking blocks survive the default-passthrough.
+		assert.equal(countThinkingBlocksIn(result.messages), 4, "default (-1 passthrough) keeps every thinking block when neither channel is configured");
 	});
 
 	// ── Bonus: cap runs before the three-tier trim — the post-cap mass reaches the budget ──

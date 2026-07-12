@@ -488,12 +488,13 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// already resolved at handler entry via `resolveConfig`
 		// (env > JSON > compile-time default precedence in
 		// `config.ts`). When the resolver returns `undefined` the
-		// compile-time default `REASONING_BLOCK_CAP_DEFAULT = 1`
-		// (the last reasoning block) applies. `cap === -1` is a
-		// pure passthrough inside the policy (no overhead beyond
-		// the call). The cap runs on `base` (the stream before
-		// pinned injection) so the pinned synthetic is never at
-		// risk of being dropped.
+		// compile-time default `REASONING_BLOCK_CAP_DEFAULT = -1`
+		// (passthrough — every reasoning block survives) applies,
+		// so existing operators see no behavior change when
+		// upgrading. `cap === -1` is a pure passthrough inside the
+		// policy (no overhead beyond the call). The cap runs on
+		// `base` (the stream before pinned injection) so the
+		// pinned synthetic is never at risk of being dropped.
 		const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
 		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(base, reasoningBlockCap);
 		const withPinned: TrimmableMessage[] = pinned
