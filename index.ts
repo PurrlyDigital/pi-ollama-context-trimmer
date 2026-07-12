@@ -55,6 +55,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	computeFlatInputTokenSignal,
@@ -63,6 +64,7 @@ import {
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
 	messageFingerprint,
+	REASONING_BLOCK_CAP_DEFAULT,
 	SUMMARIZE_TIER_MAX_TOKENS,
 	shouldHardBlock,
 	type TrimmableMessage,
@@ -476,9 +478,27 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			}
 			protectedTypes.add(PRESERVED_CUSTOM_TYPE);
 		}
+		// Apply the reasoning-block-count cap to the base message
+		// stream BEFORE the three-tier trim. The cap keeps the
+		// last N `type:"thinking"` content blocks across the
+		// stream and drops the rest; the three-tier budget then
+		// accounts against the post-cap mass so dropped reasoning
+		// blocks do not inflate the budget. The cap is global
+		// (no `ctx.model` branching); `cfg.reasoningBlockCap` is
+		// already resolved at handler entry via `resolveConfig`
+		// (env > JSON > compile-time default precedence in
+		// `config.ts`). When the resolver returns `undefined` the
+		// compile-time default `REASONING_BLOCK_CAP_DEFAULT = 1`
+		// (the last reasoning block) applies. `cap === -1` is a
+		// pure passthrough inside the policy (no overhead beyond
+		// the call). The cap runs on `base` (the stream before
+		// pinned injection) so the pinned synthetic is never at
+		// risk of being dropped.
+		const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
+		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(base, reasoningBlockCap);
 		const withPinned: TrimmableMessage[] = pinned
-			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...base]
-			: base;
+			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...cappedBase]
+			: cappedBase;
 		// Run the three-tier trim. Production uses defaultSummaSummarizer
 		// (a Python `summa` subprocess). The pinned synthetic (when
 		// present) and any preserved-path message are excluded from
