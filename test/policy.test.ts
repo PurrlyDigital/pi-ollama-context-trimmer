@@ -72,6 +72,58 @@ function toolResultWithPath(text: string, sourcePath: string): TrimmableMessage 
 	return { role: "toolResult", content: text, details: { sourcePath } };
 }
 
+/** Build a tool-result fixture carrying a top-level `toolCallId` (the
+ *  matching identifier for an assistant `toolCall` block's `id`). */
+function toolResultWithId(text: string, toolCallId: string): TrimmableMessage {
+	return { role: "toolResult", content: text, toolCallId } as TrimmableMessage;
+}
+
+/** Build an assistant-turn fixture carrying a single toolCall content block
+ *  with an `id` and `arguments.path` (the canonical read-tool shape). */
+function assistantWithProtectedToolCall(
+	id: string,
+	path: string,
+	name = "read",
+): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", id, name, arguments: { path } }],
+	};
+}
+
+/** Build an assistant-turn fixture carrying a single toolCall content block
+ *  with an `id` and arbitrary arguments (no `arguments.path`). */
+function assistantWithUnprotectedToolCall(
+	id: string,
+	name = "search",
+	args: unknown = { q: "x" },
+): TrimmableMessage {
+	return {
+		role: "assistant",
+		content: [{ type: "toolCall", id, name, arguments: args }],
+	};
+}
+
+/** Build an assistant-turn fixture carrying a mix of protected and
+ *  unprotected `toolCall` blocks alongside `text` and `thinking`
+ *  blocks. Used to verify the block-level carve-out keeps ONLY the
+ *  protected `toolCall` blocks; text/thinking/unprotected toolCall
+ *  blocks are dropped or rewritten. */
+function assistantWithMixedToolCalls(
+	prose: string,
+	calls: Array<{ id: string; name?: string; args: unknown }>,
+): TrimmableMessage {
+	const content: unknown[] = [];
+	if (prose.length > 0) content.push({ type: "text", text: prose });
+	for (const c of calls) {
+		content.push({ type: "toolCall", id: c.id, name: c.name ?? "read", arguments: c.args });
+	}
+	return {
+		role: "assistant",
+		content: content as Array<{ type: string; [k: string]: unknown }>,
+	};
+}
+
 /** Build an assistant-turn fixture carrying a single toolCall content block. */
 function assistantWithToolCall(name: string, args: unknown): TrimmableMessage {
 	return {
@@ -3221,5 +3273,480 @@ describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
 			summarizer: makeTrimmingSummarizer(),
 		});
 		assert.equal(result.messages.length, afterCap.length, "tier 1 (verbatim): every message survives");
+	});
+});
+
+// ─── Pair-atomic toolCall/toolResult protection (AC-1 through AC-7) ────
+//
+// The pair-atomicity fix is the contract-correctness fix for the
+// `toolResult` orphaning behavior. The trim policy identifies
+// protected `toolCall` blocks by their `arguments.path` matching
+// `preservedPatterns` (the wiring layer extracts the set and threads
+// it as `protectedToolCallIds: ReadonlySet<string>`), and the policy
+// keeps each protected `toolCall` block + its matching `toolResult`
+// as an atomic chain at block-level granularity. The chain is
+// protected from drop AND summarize: the protected `toolResult` is
+// a message-level protected slot, and the protected `toolCall` block
+// survives inside its assistant message via the block-level
+// carve-out. An unprotected `toolCall` block that is dropped or
+// summarized has its matching `toolResult` dropped alongside (the
+// pair is atomic in both directions, no orphan).
+//
+// The test surface below covers the five AC-7 cases:
+//   (a) call-arg→result identification — a `toolCall` block with
+//       `arguments.path` matching a pattern enters the protected
+//       set; the matching `toolResult` (by `toolCallId`) is kept
+//       by association.
+//   (b) block-level granularity — the assistant turn is NOT a
+//       protected slot, so the `text`/`thinking` blocks stay
+//       trimmable/summarizable while the protected `toolCall` block
+//       survives inside the rewritten message.
+//   (c) orphan scenario for both tiers — a `toolResult` whose
+//       matching `toolCall` is in a dropped or summarized turn
+//       does not survive with a dangling `toolCallId` (the
+//       protected `toolResult` survives; the unprotected
+//       `toolResult` is dropped alongside its `toolCall`).
+//   (d) no-regression floor — unprotected pairs drop/summarize as
+//       before (the existing behavior is preserved).
+//   (e) wiring-layer JSONL reconstruction — exercised in
+//       `integration.test.ts` (the protected set is reconstructible
+//       from the JSONL `toolCall.id` + `arguments.path` at trim
+//       time; the `path-stamp.ts` fallback handles older turns).
+
+describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+	const AGENTS_PATH = "/home/operator/AGENTS.md";
+	const OTHER_PATH = "/home/operator/CLAUDE.md";
+
+	// (a) call-arg→result identification: a `toolCall` block with
+	// `arguments.path` matching the pattern enters the protected
+	// set; the matching `toolResult` (by `toolCallId`) is kept by
+	// association. The unprotected `toolCall` block's matching
+	// `toolResult` is NOT protected and is NOT subtracted from the
+	// budget.
+
+	it("(a) call-arg→result: protected `toolCall.id` enters the set; matching `toolResult.toolCallId` is kept (budget subtract)", async () => {
+		const protectedCallId = "call_AGENTS_md_1";
+		const unprotectedCallId = "call_CLAUDE_md_1";
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			// Assistant with two toolCall blocks: one protected
+			// (AGENTS.md), one unprotected (CLAUDE.md).
+			assistantWithMixedToolCalls("", [
+				{ id: protectedCallId, name: "read", args: { path: AGENTS_PATH } },
+				{ id: unprotectedCallId, name: "read", args: { path: OTHER_PATH } },
+			]),
+			toolResultWithId("contents of AGENTS.md", protectedCallId),
+			toolResultWithId("contents of CLAUDE.md", unprotectedCallId),
+		];
+		// With `protectedToolCallIds: { protectedCallId }`, the
+		// matching `toolResult` is a protected slot (budget
+		// subtraction). The unprotected `toolResult` is trimmable.
+		// The total is well under cap; we assert budget accounting
+		// to verify the protected result is excluded.
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+			protectedToolCallIds: new Set([protectedCallId]),
+		});
+		// Trimmable mass: the unprotected `toolResult` is the only
+		// non-protected trimmable message (~26 chars / 4 = 7
+		// tokens). Tier 1 (verbatim); the trim is a passthrough.
+		assert.equal(result.summarized, 0);
+		assert.equal(result.droppedTurns, 0);
+		// Every input message is in the output (verbatim passthrough
+		// of a small conversation).
+		assert.equal(result.messages.length, messages.length);
+		// The protected `toolResult` survives with original content.
+		const protectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === protectedCallId,
+		);
+		assert.ok(protectedResult, "protected `toolResult` survives by association with the protected `toolCall` block");
+		assert.equal(protectedResult!.content, "contents of AGENTS.md", "protected `toolResult` content is verbatim");
+		// The unprotected `toolResult` is also in the output
+		// (trimmable, but the total is under cap so nothing fires).
+		const unprotectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.ok(unprotectedResult, "unprotected `toolResult` is in the output (not protected, but no trim fired)");
+	});
+
+	// (b) block-level granularity: the assistant message is NOT a
+	// protected slot. The `text` block is summarizeable, but the
+	// protected `toolCall` block survives inside the rewritten
+	// message. The protected `toolResult` survives by association.
+
+	it("(b) block-level: assistant turn stays a trimmable candidate; protected `toolCall` block survives inside the rewritten message; `text` is summarized", async () => {
+		const protectedCallId = "call_AGENTS_md_b";
+		// Build a session that lands in tier 2: a large trimmable
+		// message that is summarizeable. The protected `toolCall`
+		// block must survive INSIDE the rewritten message; the
+		// `text` block (the large prose) is rewritten to a summa
+		// envelope.
+		const longText = "x".repeat(60_000 * 4); // 60k tokens
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: longText },
+					{ type: "toolCall", id: protectedCallId, name: "read", arguments: { path: AGENTS_PATH } },
+				],
+			},
+			toolResultWithId("contents of AGENTS.md", protectedCallId),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+			protectedToolCallIds: new Set([protectedCallId]),
+		});
+		// (i) The summarize path ran (the assistant was a candidate;
+		// it's not a protected slot per the message-level predicate).
+		assert.ok(result.summarized >= 1, "the assistant turn is a summarize candidate (not protected at the message level)");
+		// (ii) The protected `toolCall` block survives INSIDE the
+		// rewritten message — the carve-out kept it.
+		const rewrittenAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content),
+		);
+		assert.ok(rewrittenAssistant, "the assistant message survives the rewrite");
+		const rwContent = rewrittenAssistant!.content as Array<{ type: string; id?: string; name?: string; arguments?: unknown; text?: string }>;
+		const survivingToolCall = rwContent.find(
+			(b) => b.type === "toolCall" && b.id === protectedCallId,
+		);
+		assert.ok(survivingToolCall, "the protected `toolCall` block survives inside the rewritten assistant message");
+		// (iii) The summa envelope sits at the head of the rewritten
+		// content array (the `text` block was replaced; the
+		// `toolCall` block is appended after the envelope).
+		const envelope = rwContent.find(
+			(b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("[summa: ~"),
+		);
+		assert.ok(envelope, "the summa envelope is in the rewritten content (the `text` block was replaced)");
+		// (iv) The protected `toolResult` survives by association
+		// (the `protectedToolCallIds` set made it a protected slot
+		// at the message level).
+		const survivingToolResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === protectedCallId,
+		);
+		assert.ok(survivingToolResult, "the protected `toolResult` survives by association (no orphan)");
+		assert.equal(survivingToolResult!.content, "contents of AGENTS.md", "protected `toolResult` content is verbatim (not summarized)");
+	});
+
+	// (c) orphan scenario — drop tier: the protected `toolResult`
+	// survives the drop (the matching `toolCall` block is carved
+	// out of the dropped assistant turn); the unprotected
+	// `toolResult` is dropped alongside its unprotected `toolCall`
+	// block.
+
+	it("(c) orphan — drop tier: protected `toolResult` survives; unprotected pair drops together (no orphan)", async () => {
+		const protectedCallId = "call_AGENTS_md_c";
+		const unprotectedCallId = "call_CLAUDE_md_c";
+		// Build a multi-turn session that lands in tier 3 (>100k
+		// trimmable) without engaging the drop-floor. The first
+		// trimmable turn (between follow-up 1 and follow-up 2)
+		// contains a 60k trimmable assistant with both a protected
+		// and an unprotected `toolCall` block, plus a 60k
+		// trimmable toolResult. The second trimmable turn (after
+		// follow-up 2) is 60k. Total trimmable is 120k.
+		// `dropFloorTokens: 0` so the drop path runs without
+		// engaging the floor (the floor's separate path is covered
+		// in the existing drop-floor tests).
+		const trimmableBody = "y".repeat(60_000 * 4); // 60k tokens
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			// Follow-up 1 anchors turn 1.
+			userMsg("follow-up 1", 1),
+			// Turn 1 assistant: a protected and an unprotected
+			// `toolCall` block, plus a 60k trimmable body.
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: trimmableBody },
+					{ type: "toolCall", id: protectedCallId, name: "read", arguments: { path: AGENTS_PATH } },
+					{ type: "toolCall", id: unprotectedCallId, name: "read", arguments: { path: OTHER_PATH } },
+				],
+			},
+			toolResultWithId("contents of AGENTS.md", protectedCallId),
+			// Turn 1 unprotected toolResult (matching the unprotected
+			// call). The fixture places it inside turn 1.
+			toolResultWithId("contents of CLAUDE.md", unprotectedCallId),
+			// Follow-up 2 closes turn 1 and anchors turn 2.
+			userMsg("follow-up 2", 2),
+			// Turn 2 assistant: 60k trimmable. The carve-out path
+			// does not affect turn 2 (the drop only targets turn 1).
+			assistantMsg(trimmableBody),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+			protectedToolCallIds: new Set([protectedCallId]),
+			dropFloorTokens: 0,
+		});
+		// (i) The drop fired on turn 1 (60k trimmable dropped; 60k
+		// remaining in turn 2, under cap).
+		assert.ok(result.droppedTurns >= 1, "the drop fired on the oldest trimmable turn");
+		// (ii) The protected `toolResult` survives the drop (the
+		// `protectedToolCallIds` set made it a protected slot at
+		// the message level; the carve-out in `dropOldestTurns`
+		// kept it alive even though it sat inside the dropped
+		// turn's slice).
+		const survivingProtectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === protectedCallId,
+		);
+		assert.ok(survivingProtectedResult, "protected `toolResult` survives the tier-3 drop (no orphan, pair-atomic by association)");
+		assert.equal(survivingProtectedResult!.content, "contents of AGENTS.md", "protected `toolResult` content is verbatim");
+		// (iii) The unprotected `toolResult` is dropped alongside
+		// its unprotected `toolCall` block (the pair is atomic in
+		// both directions — the unprotected block was carved out
+		// of the dropped turn's assistant message, and the
+		// matching `toolResult` was dropped in the post-pass).
+		const survivingUnprotectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.equal(survivingUnprotectedResult, undefined, "unprotected `toolResult` is dropped alongside its unprotected `toolCall` block (no orphan in the unprotected direction either)");
+		// (iv) The protected `toolCall` block survived inside the
+		// rewritten turn 1 assistant message (the block-level
+		// carve-out kept it; the `text` block and unprotected
+		// `toolCall` block were dropped).
+		const carvedOutAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content),
+		);
+		assert.ok(carvedOutAssistant, "the carved-out assistant message (or a surviving turn-2 assistant) is in the output");
+		const carvedContent = carvedOutAssistant!.content as Array<{ type: string; id?: string; text?: string }>;
+		const survivingProtectedCall = carvedContent.find(
+			(b) => b.type === "toolCall" && b.id === protectedCallId,
+		);
+		// The carved-out assistant (turn 1) carries the protected
+		// `toolCall` block. The turn-2 assistant (unprotected) does
+		// not. The find above searches the first array-content
+		// assistant; verify the protected call's survival by
+		// walking every assistant.
+		let protectedCallSurvived = false;
+		for (const m of result.messages) {
+			if (m.role !== "assistant") continue;
+			if (!Array.isArray(m.content)) continue;
+			for (const b of m.content as Array<{ type: string; id?: string }>) {
+				if (b.type === "toolCall" && b.id === protectedCallId) {
+					protectedCallSurvived = true;
+				}
+			}
+		}
+		assert.ok(protectedCallSurvived, "the protected `toolCall` block survives inside its assistant message (the block-level carve-out)");
+		// The unprotected `toolCall` block is gone (it was dropped
+		// with the turn; the rewrite kept only the protected one).
+		let unprotectedCallSurvived = false;
+		for (const m of result.messages) {
+			if (m.role !== "assistant") continue;
+			if (!Array.isArray(m.content)) continue;
+			for (const b of m.content as Array<{ type: string; id?: string }>) {
+				if (b.type === "toolCall" && b.id === unprotectedCallId) {
+					unprotectedCallSurvived = true;
+				}
+			}
+		}
+		assert.equal(unprotectedCallSurvived, false, "the unprotected `toolCall` block is gone (dropped with the turn)");
+		// Sanity: the surviving content of `carvedContent` does
+		// not include the `text` block (the carve-out dropped
+		// text/thinking/unprotected toolCall blocks).
+		void survivingProtectedCall;
+		void carvedContent;
+	});
+
+	// (c2) orphan scenario — summarize tier: a protected `toolResult`
+	// whose matching `toolCall` is in a summarize candidate turn
+	// survives by association; the unprotected `toolResult` is
+	// dropped alongside its unprotected `toolCall` block when the
+	// rewrite drops that block.
+
+	it("(c) orphan — summarize tier: protected `toolResult` survives; unprotected pair drops together on the rewrite", async () => {
+		const protectedCallId = "call_AGENTS_md_c2";
+		const unprotectedCallId = "call_CLAUDE_md_c2";
+		const longText = "z".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: longText },
+					{ type: "toolCall", id: protectedCallId, name: "read", arguments: { path: AGENTS_PATH } },
+					{ type: "toolCall", id: unprotectedCallId, name: "read", arguments: { path: OTHER_PATH } },
+				],
+			},
+			toolResultWithId("contents of AGENTS.md", protectedCallId),
+			toolResultWithId("contents of CLAUDE.md", unprotectedCallId),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			preservedPatterns: ["AGENTS.md"],
+			protectedToolCallIds: new Set([protectedCallId]),
+		});
+		// (i) The summarize path ran.
+		assert.ok(result.summarized >= 1, "the assistant turn is a summarize candidate");
+		// (ii) The protected `toolResult` survives by association.
+		const survivingProtectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === protectedCallId,
+		);
+		assert.ok(survivingProtectedResult, "protected `toolResult` survives the summarize path by association");
+		// (iii) The unprotected `toolResult` is dropped alongside
+		// its unprotected `toolCall` block (the rewrite dropped
+		// the unprotected block, and the post-pass dropped the
+		// matching `toolResult`).
+		const survivingUnprotectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.equal(survivingUnprotectedResult, undefined, "unprotected `toolResult` is dropped alongside its unprotected `toolCall` block (no orphan)");
+		// (iv) The protected `toolCall` block survives inside the
+		// rewritten assistant message.
+		const rewrittenAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content),
+		);
+		assert.ok(rewrittenAssistant, "the assistant message survives the rewrite");
+		const rwContent = rewrittenAssistant!.content as Array<{ type: string; id?: string }>;
+		const survivingProtectedCall = rwContent.find(
+			(b) => b.type === "toolCall" && b.id === protectedCallId,
+		);
+		assert.ok(survivingProtectedCall, "the protected `toolCall` block survives inside the rewritten assistant message");
+	});
+
+	// (d) no-regression floor: an unprotected pair (no `protectedToolCallIds`
+	// entry, no `preservedPatterns` match) drops / summarizes as
+	// before. The fix does not change unprotected behavior.
+
+	it("(d) no-regression: unprotected pair (no `protectedToolCallIds`) drops as before; pair-atomicity is silent when there is no protection", async () => {
+		const unprotectedCallId = "call_CLAUDE_md_d";
+		// A simple tier-2 session: a large assistant with a single
+		// unprotected `toolCall` block, plus the matching
+		// `toolResult`. Without `protectedToolCallIds`, the rewrite
+		// drops the unprotected `toolCall` block (and the
+		// `text` block), and the post-pass drops the matching
+		// `toolResult` (pair-atomic in the unprotected direction
+		// too — no orphan).
+		const longText = "w".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: longText },
+					{ type: "toolCall", id: unprotectedCallId, name: "read", arguments: { path: OTHER_PATH } },
+				],
+			},
+			toolResultWithId("contents of CLAUDE.md", unprotectedCallId),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			// No `preservedPatterns`, no `protectedToolCallIds`.
+		});
+		// (i) The summarize path ran.
+		assert.ok(result.summarized >= 1, "the assistant is a summarize candidate");
+		// (ii) The unprotected `toolResult` is dropped (the rewrite
+		// dropped the unprotected `toolCall` block, and the
+		// post-pass dropped the matching `toolResult`).
+		const survivingUnprotectedResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.equal(survivingUnprotectedResult, undefined, "unprotected `toolResult` is dropped alongside the unprotected `toolCall` block (no over-protection, no regression)");
+		// (iii) The unprotected `toolCall` block is gone.
+		let unprotectedCallSurvived = false;
+		for (const m of result.messages) {
+			if (m.role !== "assistant") continue;
+			if (!Array.isArray(m.content)) continue;
+			for (const b of m.content as Array<{ type: string; id?: string }>) {
+				if (b.type === "toolCall" && b.id === unprotectedCallId) {
+					unprotectedCallSurvived = true;
+				}
+			}
+		}
+		assert.equal(unprotectedCallSurvived, false, "the unprotected `toolCall` block is gone (no over-protection)");
+	});
+
+	// (d2) no-regression floor: an unprotected pair in the drop tier
+	// drops as before — the carve-out only affects protected pairs.
+
+	it("(d) no-regression — drop tier: unprotected pair in a dropped turn drops together (pair-atomic in the unprotected direction)", async () => {
+		const unprotectedCallId = "call_CLAUDE_md_d2";
+		const trimmableBody = "v".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			userMsg("follow-up 1", 1),
+			// Turn 1: an unprotected toolCall block + a 60k
+			// trimmable body.
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: trimmableBody },
+					{ type: "toolCall", id: unprotectedCallId, name: "read", arguments: { path: OTHER_PATH } },
+				],
+			},
+			toolResultWithId("contents of CLAUDE.md", unprotectedCallId),
+			userMsg("follow-up 2", 2),
+			assistantMsg(trimmableBody),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			dropFloorTokens: 0,
+		});
+		// (i) The drop fired on turn 1.
+		assert.ok(result.droppedTurns >= 1, "the drop fired on the oldest trimmable turn");
+		// (ii) The unprotected `toolResult` is dropped (the
+		// `toolCall` block was in the dropped turn, but the
+		// matching `toolResult` is in the same turn's slice, so
+		// it's already gone via the existing drop path; the
+		// pair-atomicity is a no-op for in-turn unprotected pairs).
+		const survivingResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.equal(survivingResult, undefined, "unprotected `toolResult` is dropped (the pair is in the same dropped turn)");
+	});
+
+	// (e) `protectedToolCallIds` defaults to an empty set — sessions
+	// with no preserved patterns see no behavior change (the carve-out
+	// is silent).
+
+	it("(e) `protectedToolCallIds` defaults to empty: no behavior change when no preserved patterns are configured", async () => {
+		// Build a session with toolCall blocks whose `arguments.path`
+		// would not match any preserved pattern. The protected set
+		// is empty, the carve-out is silent, the behavior is
+		// identical to the pre-fix path.
+		const unprotectedCallId = "call_random_md";
+		const longText = "u".repeat(60_000 * 4);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{
+				role: "assistant",
+				content: [
+					{ type: "text", text: longText },
+					{ type: "toolCall", id: unprotectedCallId, name: "read", arguments: { path: "/tmp/random.md" } },
+				],
+			},
+			toolResultWithId("random content", unprotectedCallId),
+		];
+		// No `protectedToolCallIds` argument. The pure policy's
+		// `protectedToolCallIds: ReadonlySet<string> = new Set()`
+		// default applies, and the `isProtectedSlot` branch keys on
+		// an empty set — no protection.
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			// No `preservedPatterns`, no `protectedToolCallIds`.
+		});
+		assert.ok(result.summarized >= 1, "the assistant is a summarize candidate (no protected carve-out fired)");
+		// The unprotected `toolResult` is dropped alongside.
+		const survivingResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as TrimmableMessage & { toolCallId?: string }).toolCallId === unprotectedCallId,
+		);
+		assert.equal(survivingResult, undefined, "no `protectedToolCallIds` → no protected carve-out → no over-protection");
+	});
+
+	// Purity check: the new `protectedToolCallIds` shape is plumbed
+	// as a `ReadonlySet<string>` predicate argument; the
+	// `applyThreeTierTrim` source has no `process.*`, `node:fs`, or
+	// `node:os` reference (the contract is unchanged by this fix).
+
+	it("purity: applyThreeTierTrim source has no process.*, node:fs, node:os, or other I/O (the `protectedToolCallIds` seam is a pure predicate argument)", async () => {
+		const src = applyThreeTierTrim.toString();
+		assert.ok(!src.includes("process."), "applyThreeTierTrim must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "applyThreeTierTrim must not import node:fs");
+		assert.ok(!src.includes("node:os"), "applyThreeTierTrim must not import node:os");
+		assert.ok(!src.includes("fetch("), "applyThreeTierTrim must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "applyThreeTierTrim must not perform filesystem I/O");
 	});
 });

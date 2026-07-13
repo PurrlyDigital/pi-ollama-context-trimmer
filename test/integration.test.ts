@@ -1070,6 +1070,142 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 	// trimmable turn rather than sit inside it).
 });
 
+// ─── AC-7 (e) — Wiring-layer JSONL pair-state reconstruction ───────────
+//
+// End-to-end coverage of the pair-atomic protection at the wiring
+// layer. The wiring extracts the protected-toolCall-id set from each
+// assistant message's `toolCall` blocks' `arguments.path` (matched
+// against `preservedPatterns` via the pure `isPathPreserved`
+// predicate), threads the set into the pure policy as
+// `protectedToolCallIds: ReadonlySet<string>`, and the policy keeps
+// each protected `toolCall` block + matching `toolResult` as an
+// atomic chain at block-level granularity.
+//
+// The test builds a session that lands in tier 2 (>50k trimmable):
+// a large assistant turn carrying a `toolCall` block whose
+// `arguments.path` matches `AGENTS.md` and a matching `toolResult`
+// whose top-level `toolCallId` matches the `id` of the protected
+// `toolCall` block. The trim summarize-rewrites the assistant's
+// `text` block; the protected `toolCall` block survives inside the
+// rewritten message; the matching `toolResult` survives by
+// association (kept alive by the `protectedToolCallIds` set in
+// `isProtectedSlot`).
+//
+// JSONL-reconstructible: the protected set is computed at trim time
+// from the assistant message's `toolCall` blocks (the `id` and
+// `arguments.path` fields are present in the source JSONL), with the
+// `path-stamp.ts` / `details.sourcePath` seam as the resume-compat
+// fallback for older turns where the call argument is not directly
+// inspectable.
+
+describe("AC-7 (e) — wiring-layer JSONL pair-state reconstruction", () => {
+	let sPreservedPaths: string | undefined;
+	beforeEach(() => {
+		sPreservedPaths = process.env[CONFIG_ENV.preservedPaths];
+	});
+	afterEach(() => {
+		if (sPreservedPaths === undefined) delete process.env[CONFIG_ENV.preservedPaths];
+		else process.env[CONFIG_ENV.preservedPaths] = sPreservedPaths;
+	});
+
+	function readFileResultWithCallId(text: string, toolCallId: string): Record<string, unknown> {
+		return { role: "toolResult", content: text, toolCallId };
+	}
+
+	function assistantWithProtectedReadCall(id: string, path: string, prose: string): Record<string, unknown> {
+		return {
+			role: "assistant",
+			content: [
+				{ type: "text", text: prose },
+				{ type: "toolCall", id, name: "read", arguments: { path } },
+			],
+		};
+	}
+
+	it("extracts the protected-toolCall-id set from assistant `toolCall` blocks' `arguments.path` and keeps the matching `toolResult` by association (tier-2 rewrite)", async () => {
+		// The protected set is computed at trim time from the source
+		// assistant message's `toolCall` block `arguments.path` —
+		// no separate persistence sidecar, no operator opt-in
+		// beyond the existing `preservedPatterns` knob. The
+		// `path-stamp.ts` / `details.sourcePath` seam stays as the
+		// resume-compatibility fallback for older turns.
+		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md";
+		// Force the verbatim cap down so the test lands in tier 2
+		// (the trimmable `text` block + the protected `toolCall`
+		// block's JSON-stringified content push the session over
+		// the cap and the summarize path fires). Without this
+		// override the trimmable mass is well under the default
+		// 50k verbatim cap and the test would land in tier 1
+		// (no rewrite), defeating the assertion.
+		process.env[CONFIG_ENV.tier1MaxTokens] = "5000";
+		const pi = await loadExtension();
+		const protectedCallId = "call_AGENTS_md_integration";
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~115k chars ≈ 29k tokens
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				// The protected `toolCall` block: `arguments.path`
+				// matches the `AGENTS.md` fuzzy pattern. The wiring
+				// extracts the `id` into the protected set at trim
+				// time. The block's `id` is `call_AGENTS_md_integration`.
+				assistantWithProtectedReadCall(protectedCallId, join(fixtureDir, "AGENTS.md"), trimmableBody),
+				// The matching `toolResult`: top-level `toolCallId`
+				// matches the protected `id`. The wiring does NOT
+				// stamp `details.sourcePath` here (the AC re-scope
+				// demoted sourcePath to a fallback; the primary
+				// identification is the call-arg path). The
+				// protected-toolCall-id set keys the
+				// `isProtectedSlot` branch on the `toolCallId`.
+				readFileResultWithCallId("AGENTS.md body content", protectedCallId),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// (i) The protected `toolResult` survives by association
+		// (no `details.sourcePath`, no `PRESERVED_CUSTOM_TYPE` —
+		// the protection rides on the call-arg→result identification
+		// seam). The `toolResult` is in the output and its content
+		// is the original (no summa envelope).
+		const protectedToolResult = result.messages.find(
+			(m) => m.role === "toolResult" && (m as { toolCallId?: string }).toolCallId === protectedCallId,
+		);
+		assert.ok(protectedToolResult, "protected `toolResult` survives by association with the protected `toolCall.id` (call-arg→result identification, no `details.sourcePath` required)");
+		const protectedContent = typeof protectedToolResult.content === "string"
+			? protectedToolResult.content
+			: JSON.stringify(protectedToolResult.content);
+		assert.ok(protectedContent.includes("AGENTS.md body content"), "protected `toolResult` content is verbatim (no summa envelope)");
+		assert.ok(!protectedContent.includes("[summa:"), "protected `toolResult` is not summarized");
+		// (ii) The trim fired on the assistant turn (the `text`
+		// block was rewritten to a summa envelope). The protected
+		// `toolCall` block survived inside the rewritten message.
+		const rewrittenAssistant = result.messages.find(
+			(m) => m.role === "assistant" && Array.isArray(m.content),
+		);
+		assert.ok(rewrittenAssistant, "the assistant message is in the output (rewritten by the summarize path)");
+		const rwContent = rewrittenAssistant.content as Array<{ type: string; id?: string; text?: string }>;
+		const survivingCall = rwContent.find(
+			(b) => b.type === "toolCall" && b.id === protectedCallId,
+		);
+		assert.ok(survivingCall, "the protected `toolCall` block survived inside the rewritten assistant message (block-level carve-out)");
+		const envelope = rwContent.find(
+			(b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("[summa: ~"),
+		);
+		assert.ok(envelope, "the `text` block was rewritten to a summa envelope (the requesting turn's prose is summarizeable; block-level granularity is preserved)");
+		// (iii) No `PRESERVED_CUSTOM_TYPE` stamp is applied to the
+		// `toolResult` — the call-arg→result identification rides
+		// on `isProtectedSlot`'s `protectedToolCallIds` branch,
+		// not on the existing `protectedCustomTypes` channel. The
+		// `toolResult` is a protected slot via the new branch, not
+		// via the legacy `PRESERVED_CUSTOM_TYPE` stamp.
+		assert.equal(
+			(protectedToolResult as { customType?: string }).customType,
+			undefined,
+			"the `toolResult` is NOT stamped with `PRESERVED_CUSTOM_TYPE` — the protection rides on the call-arg→result branch, not the legacy sourcePath stamp",
+		);
+		delete process.env[CONFIG_ENV.tier1MaxTokens];
+	});
+});
+
 // ─── AC-3 — Reported-signal done-bar (two-session transcript) ──────────
 //
 // The originally-reported signal is the LLM's "I thought I had X but

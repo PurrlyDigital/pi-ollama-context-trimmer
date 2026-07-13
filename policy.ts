@@ -184,6 +184,38 @@ export type TrimOptions = {
 	 * persisted state (`pi.appendEntry`) and threads it here.
 	 */
 	alreadySummarizedHashes?: ReadonlySet<string>;
+	/**
+	 * Tool-call IDs whose assistant `toolCall` blocks are protected
+	 * from drop AND summarize. The set is computed by the wiring
+	 * layer at view time by walking every assistant message's
+	 * `toolCall` content blocks and matching `arguments.path`
+	 * against `preservedPatterns` (via the existing pure
+	 * `isPathPreserved`). The set threads through every internal
+	 * call as an additive OR with the existing protected-slot
+	 * channels:
+	 *
+	 *   - A `toolResult` whose `toolCallId` is in this set is a
+	 *     protected message-level slot (per AC-2, AC-6). It is
+	 *     excluded from the budget, never summarized, and never
+	 *     dropped — including the carve-out of the dropped-turn
+	 *     slice in `dropOldestTurns`.
+	 *   - When an assistant turn falls in a dropped turn's range
+	 *     (AC-3) OR is rewritten by `summarizeOldestUntilUnder`
+	 *     (AC-4), the protected `toolCall` blocks (those whose
+	 *     `id` is in this set) survive INSIDE the turn while
+	 *     `text`/`thinking` and unprotected `toolCall` blocks are
+	 *     dropped / rewritten. The pair is atomic in both
+	 *     directions: an unprotected `toolCall` block that is
+	 *     dropped/summarized has its matching `toolResult` dropped
+	 *     with it (no orphan).
+	 *
+	 * Defaults to an empty set so the predicate shape is uniform
+	 * across every internal call site. The wiring layer is the
+	 * sole source of the set; `policy.ts` never reads
+	 * `arguments.path` directly (the purity contract keeps all
+	 * argument extraction in `index.ts`).
+	 */
+	protectedToolCallIds?: ReadonlySet<string>;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -452,6 +484,58 @@ function extractSourcePath(msg: TrimmableMessage): string | undefined {
 	return typeof sourcePath === "string" ? sourcePath : undefined;
 }
 
+/**
+ * Pure helper for the block-level carve-out in `dropOldestTurns`.
+ * Given an assistant message and the protected-toolCall-id set,
+ * returns a rewritten message that carries ONLY the protected
+ * `toolCall` blocks (the message's `text`, `thinking`, and
+ * unprotected `toolCall` blocks are removed). The dropped
+ * `toolCall` block IDs are pushed into `droppedToolCallIds` so the
+ * post-pass `toolResult` drop in `dropOldestTurns` can carry out
+ * the pair-atomic drop in both directions.
+ *
+ * Returns `null` when the rewritten message would carry no
+ * content (no protected `toolCall` blocks and no other kept
+ * blocks), signaling to the caller that the message should be
+ * dropped from the output entirely.
+ *
+ * Pure: operates on the message and the predicate arguments; no
+ * `process.*`, no Node I/O. The content array is walked in
+ * source order; the rewritten content is a fresh array.
+ */
+function carveProtectedToolCallBlocks(
+	msg: TrimmableMessage,
+	protectedToolCallIds: ReadonlySet<string>,
+	droppedToolCallIds: Set<string>,
+): TrimmableMessage | null {
+	const content = msg.content;
+	if (!Array.isArray(content)) return null;
+	const kept: unknown[] = [];
+	for (const block of content) {
+		if (block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall") {
+			const id = (block as { id?: unknown }).id;
+			if (typeof id === "string" && id.length > 0) {
+				if (protectedToolCallIds.has(id)) {
+					kept.push(block);
+				} else {
+					droppedToolCallIds.add(id);
+				}
+			} else {
+				// `toolCall` block without an `id` is unidentifiable;
+				// drop it (no pair to associate) and skip without
+				// pushing a synthetic id into `droppedToolCallIds`
+				// (an empty/non-string id is not a usable key).
+			}
+			continue;
+		}
+		// Non-`toolCall` blocks (text, thinking, …) are dropped
+		// along with the rest of the turn's content. The block-
+		// level carve-out keeps ONLY protected `toolCall` blocks.
+	}
+	if (kept.length === 0) return null;
+	return { ...msg, content: kept };
+}
+
 // ─── Recency-floor helper (recency channel) ─────────────────────
 
 /**
@@ -484,12 +568,13 @@ export function computeRecencyProtectedIndices(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
 ): ReadonlySet<number> {
 	const out = new Set<number>();
 	if (recencyFloorTokens === undefined || recencyFloorTokens <= 0) return out;
 	let acc = 0;
 	for (let i = messages.length - 1; i >= 0; i--) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, new Set(), protectedToolCallIds)) continue;
 		const tokens = approximateMessageTokens(messages[i]);
 		out.add(i);
 		acc += tokens;
@@ -508,6 +593,7 @@ export function isProtectedSlot(
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
 ): boolean {
 	// Agent-def / pinned-tier synthetic.
 	if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
@@ -526,6 +612,27 @@ export function isProtectedSlot(
 	// above; the OR is additive.
 	if (recencyProtectedIndices.has(index)) {
 		return true;
+	}
+	// Pair-atomic toolCall/toolResult protection: a `toolResult`
+	// whose top-level `toolCallId` is in the protected-toolCall-id
+	// set is protected by association with the assistant `toolCall`
+	// block that requested it. The protected set is computed by the
+	// wiring layer from the `toolCall` block's `arguments.path`
+	// matching `preservedPatterns`; the result-side `details.sourcePath`
+	// is the resume-compat fallback. The set is the source of truth
+	// for which `toolResult` messages are protected, and it keeps
+	// the message-level carve-out working for the dropped-turn and
+	// recency paths. Independent of the channels above; the OR is
+	// additive. Note: an ASSISTANT message whose `toolCall` block is
+	// protected does NOT return true here — block-level protection
+	// is the load-bearing seam, not message-level protection; the
+	// assistant turn stays a summarize/drop candidate and the
+	// protected `toolCall` block survives inside the rewrite.
+	if (msg.role === "toolResult") {
+		const toolCallId = (msg as { toolCallId?: unknown }).toolCallId;
+		if (typeof toolCallId === "string" && toolCallId.length > 0 && protectedToolCallIds.has(toolCallId)) {
+			return true;
+		}
 	}
 	// Dispatch task: the first user message. Only applies when dispatch
 	// protection is enabled (i.e. pi-subagents is installed).
@@ -557,10 +664,11 @@ export function totalTrimmableTokens(
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
 		total += approximateMessageTokens(messages[i]);
 	}
 	return total;
@@ -615,6 +723,7 @@ export async function applyThreeTierTrim(
 	const recencyFloor = options.recencyFloor;
 	const alreadySummarizedHashes = options.alreadySummarizedHashes ?? new Set<string>();
 	const backgroundSummarize = options.backgroundSummarize ?? false;
+	const protectedToolCallIds = options.protectedToolCallIds ?? new Set<string>();
 
 	// Compute the recency-protected slice once and thread it through
 	// every internal call. The slice is the operator's
@@ -630,10 +739,11 @@ export async function applyThreeTierTrim(
 		protectedCustomTypes,
 		protectDispatch,
 		preservedPatterns,
+		protectedToolCallIds,
 	);
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
 	// The "turn" is bounded by user messages: a turn is everything from
@@ -641,7 +751,7 @@ export async function applyThreeTierTrim(
 	// including) the next user message. We carve whole turns from the
 	// oldest end.
 	if (total > summarizeMax) {
-		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
+		const { messages: dropped, droppedTurns, shouldFallThrough, droppedToolCallIds } = dropOldestTurns(
 			messages,
 			summarizeMax,
 			protectedCustomTypes,
@@ -649,6 +759,7 @@ export async function applyThreeTierTrim(
 			preservedPatterns,
 			dropFloorTokens,
 			recencyProtectedIndices,
+			protectedToolCallIds,
 		);
 		// Drop-floor fall-through: when the next-oldest turn would
 		// push the trimmable total below `dropFloorTokens`, stop
@@ -669,6 +780,8 @@ export async function applyThreeTierTrim(
 				recencyProtectedIndices,
 				alreadySummarizedHashes,
 				backgroundSummarize,
+				protectedToolCallIds,
+				droppedToolCallIds,
 			);
 			return {
 				messages: result.messages,
@@ -680,6 +793,7 @@ export async function applyThreeTierTrim(
 					protectDispatch,
 					preservedPatterns,
 					recencyProtectedIndices,
+					protectedToolCallIds,
 				),
 				summarizedFingerprints: result.summarizedFingerprints,
 				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
@@ -687,18 +801,18 @@ export async function applyThreeTierTrim(
 			};
 		}
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices);
+		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds);
 		// If still over summarizeMax (a single trimmable turn is larger
 		// than the tier ceiling), summarize that turn's oldest messages
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = await summarizeOldestUntilUnder(dropped, summarizeMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
+			const result = await summarizeOldestUntilUnder(dropped, summarizeMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize, protectedToolCallIds, droppedToolCallIds);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
+				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds),
 				summarizedFingerprints: result.summarizedFingerprints,
 				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
 				pendingSummaries: result.pendingSummaries,
@@ -717,12 +831,12 @@ export async function applyThreeTierTrim(
 	// Tier 2: summarize oldest non-protected trimmable messages until
 	// total ≤ verbatimMax.
 	if (total > verbatimMax) {
-		const result = await summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
+		const result = await summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize, protectedToolCallIds);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices),
+			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds),
 			summarizedFingerprints: result.summarizedFingerprints,
 			backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
 			pendingSummaries: result.pendingSummaries,
@@ -762,7 +876,8 @@ function dropOldestTurns(
 	preservedPatterns: ReadonlyArray<string>,
 	dropFloorTokens: number | undefined = undefined,
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
-): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean } {
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
+): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
 	// First pass: identify the trimmable turns and their token mass.
 	// A trimmable turn starts immediately after a non-dispatch user
 	// message and runs to either the next non-dispatch user message
@@ -786,20 +901,20 @@ function dropOldestTurns(
 		if (isTurnAnchor) {
 			// Close any open trimmable turn at the previous boundary.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
 			}
 			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
 				turnStart = -1;
 			}
 		}
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
@@ -828,10 +943,10 @@ function dropOldestTurns(
 		// Count trimmable messages in the post-dispatch tail.
 		let trimmableCount = 0;
 		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) trimmableCount++;
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
@@ -882,6 +997,17 @@ function dropOldestTurns(
 	if (dropSet.size > 0) {
 		out.push({ role: "user", content: PRUNE_REMINDER_TEXT });
 	}
+	// Pair-atomic: when an assistant message sits inside a dropped
+	// turn, walk its `toolCall` blocks. Protected `toolCall` blocks
+	// (those whose `id` is in `protectedToolCallIds`) are retained
+	// inside the rewritten message — the message is NOT dropped
+	// wholesale, it is rewritten via `carveProtectedToolCallBlocks`
+	// to carry only the protected `toolCall` blocks. Unprotected
+	// `toolCall` blocks are dropped; their IDs are collected in
+	// `droppedToolCallIds` so the matching `toolResult` messages
+	// (which may sit in a later turn) are also dropped — the pair
+	// is atomic in both directions.
+	const droppedToolCallIds = new Set<string>();
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
 		// If this message is inside a dropped turn, skip it UNLESS
@@ -894,10 +1020,53 @@ function dropOldestTurns(
 				break;
 			}
 		}
-		if (inDroppedTurn && !isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
+		if (inDroppedTurn) {
+			// Pair-atomic carve-out: an assistant message inside a
+			// dropped turn is rewritten to keep only its protected
+			// `toolCall` blocks. If the assistant has no protected
+			// `toolCall` blocks (and the message is not itself a
+			// protected slot), the message is dropped — and any
+			// unprotected `toolCall` block IDs it carried are
+			// added to `droppedToolCallIds` for the post-pass
+			// toolResult drop.
+			if (isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) {
+				out.push(msg);
+				continue;
+			}
+			if (msg.role === "assistant") {
+				const kept = carveProtectedToolCallBlocks(msg, protectedToolCallIds, droppedToolCallIds);
+				if (kept !== null) {
+					out.push(kept);
+				}
+				continue;
+			}
+			// Non-assistant, non-protected, inside a dropped turn:
+			// dropped with the turn. This includes `toolResult`
+			// messages whose `toolCallId` is in `protectedToolCallIds`
+			// are NOT in this branch — the protected check above
+			// caught them. Unprotected `toolResult` messages inside
+			// a dropped turn are dropped alongside (their matching
+			// `toolCall` block was in the same dropped turn or
+			// already collected via the assistant carve-out pass).
+			continue;
+		}
+		// Outside a dropped turn: pair-atomic toolResult drop for
+		// unprotected `toolCall` blocks that were dropped from a
+		// dropped turn earlier in the array. The matching
+		// `toolResult` here is dropped alongside (no orphan).
+		if (msg.role === "toolResult") {
+			const toolCallId = (msg as { toolCallId?: unknown }).toolCallId;
+			if (
+				typeof toolCallId === "string" &&
+				toolCallId.length > 0 &&
+				droppedToolCallIds.has(toolCallId)
+			) {
+				continue;
+			}
+		}
 		out.push(msg);
 	}
-	return { messages: out, droppedTurns: dropSet.size, shouldFallThrough };
+	return { messages: out, droppedTurns: dropSet.size, shouldFallThrough, droppedToolCallIds };
 }
 
 /**
@@ -912,10 +1081,11 @@ function makeTurn(
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string>,
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
 		tokens += approximateMessageTokens(messages[i]);
 	}
 	return { start, end, tokens };
@@ -968,6 +1138,8 @@ async function summarizeOldestUntilUnder(
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
 	backgroundSummarize: boolean = false,
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	droppedToolCallIdsFromDropPass: ReadonlySet<string> = new Set(),
 ): Promise<{
 	messages: TrimmableMessage[];
 	summarized: number;
@@ -998,6 +1170,15 @@ async function summarizeOldestUntilUnder(
 		originalMessage: TrimmableMessage;
 		promise: Promise<string>;
 	}> = [];
+	// Pair-atomic: track `toolCall` block IDs that were dropped
+	// during the summarize rewrite (unprotected `toolCall` blocks
+	// inside an assistant message that was summarized). After the
+	// loop, drop any `toolResult` whose `toolCallId` is in this set
+	// so no `toolResult` survives with a dangling `toolCallId`. The
+	// set is also merged with `droppedToolCallIdsFromDropPass` (the
+	// unprotected IDs collected by `dropOldestTurns`) so a follow-up
+	// summarize-fallback pass also drops those `toolResult`s.
+	const droppedToolCallIds = new Set<string>(droppedToolCallIdsFromDropPass);
 	// Cursor: the next index we'll consider for summarization. Starts
 	// at 0 and is advanced past each summarized message so we never
 	// re-summarize the same message in the same pass (which would
@@ -1015,21 +1196,22 @@ async function summarizeOldestUntilUnder(
 		protectDispatch,
 		preservedPatterns,
 		recencyProtectedIndices,
+		protectedToolCallIds,
 	);
 	while (
 		(backgroundSummarize
 			? estimatedTotal > cap
-			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices) > cap)
+			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds) > cap)
 	) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor. Skip already-summarized by default.
-		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true);
+		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true, protectedToolCallIds);
 		// Escape clause: when the only candidates are already-
 		// summarized messages and the total is still over the cap,
 		// retry with the skip flag lifted so an already-summarized
 		// message gets a fresh summary rather than blocking progress.
 		if (target === -1) {
-			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false);
+			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false, protectedToolCallIds);
 			if (target === -1) break;
 		}
 		// Capture the ORIGINAL fingerprint before the content is
@@ -1071,24 +1253,108 @@ async function summarizeOldestUntilUnder(
 			}
 			const summaryText = summary.length > 0 ? summary : original;
 			const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText });
-			// Replace content with the summa envelope.
+			// Build the rewrite. For an assistant message whose
+			// content is a `toolCall`-bearing array, the rewrite is
+			// block-level: protected `toolCall` blocks survive
+			// inside the rewritten message, unprotected `toolCall`
+			// blocks are dropped (their IDs collected in
+			// `droppedToolCallIds` for the post-pass `toolResult`
+			// drop), and `text`/`thinking` blocks are replaced with
+			// the summa envelope. The non-array path is the
+			// existing wholesale replace (string content or
+			// toolResult/object content).
 			const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
-			out[target] = {
-				...msg,
-				content: [{ type: "text", text: `${tag}\n${summaryText}` }],
-			};
+			if (msg.role === "assistant" && Array.isArray(msg.content)) {
+				const sourceContent = msg.content as Array<{ type: string; [k: string]: unknown }>;
+				const rewrittenContent: unknown[] = [];
+				for (const block of sourceContent) {
+					if (block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall") {
+						const id = (block as { id?: unknown }).id;
+						if (typeof id === "string" && id.length > 0 && protectedToolCallIds.has(id)) {
+							rewrittenContent.push(block);
+						} else if (typeof id === "string" && id.length > 0) {
+							// Unprotected `toolCall` block — drop
+							// and add to `droppedToolCallIds` so the
+							// matching `toolResult` is dropped too.
+							droppedToolCallIds.add(id);
+						}
+						// toolCall block without a usable id is dropped
+						// without being added to `droppedToolCallIds`.
+						continue;
+					}
+					// Non-`toolCall` blocks (text, thinking) are
+					// dropped; the summa envelope below carries the
+					// rewritten prose. Block-level protection is
+					// exclusively for `toolCall` blocks; text and
+					// thinking blocks on the requesting turn are
+					// summarizeable.
+				}
+				// The summa envelope text-block sits at the head of
+				// the rewritten content array so the policy's
+				// `isAlreadySummarized` check still fires on
+				// subsequent passes.
+				rewrittenContent.unshift({ type: "text", text: `${tag}\n${summaryText}` });
+				out[target] = { ...msg, content: rewrittenContent };
+			} else {
+				// Existing wholesale replace path: non-array
+				// content (string, object) or non-assistant roles.
+				out[target] = {
+					...msg,
+					content: [{ type: "text", text: `${tag}\n${summaryText}` }],
+				};
+			}
 			summarized += 1;
 			// Advance the cursor past this message so we don't re-pick it.
 			cursor = target + 1;
 			// Defensive bound: if the summarizer returned a longer
 			// string (it shouldn't — summa is lossy), bail rather
-			// than loop forever.
+			// than loop forever. The bound fires AFTER `summarized`
+			// is incremented so a pathological no-progress
+			// summarizer is observably bounded (one rewrite fires,
+			// then the loop exits cleanly with `summarized === 1`).
 			if (summaryTokens >= originalTokens) break;
 			continue;
 		}
 		summarized += 1;
 		// Advance the cursor past this message so we don't re-pick it.
 		cursor = target + 1;
+	}
+	// Pair-atomic post-pass: drop any `toolResult` whose
+	// `toolCallId` is in `droppedToolCallIds` (collected during the
+	// rewrite AND forwarded from the tier-3 drop pass). The
+	// `toolResult` may sit in a later turn — the loop above only
+	// rewrites the assistant message that carried the dropped
+	// `toolCall` block, so the post-pass walks the output and
+	// drops the matching `toolResult` to keep the pair atomic in
+	// both directions.
+	if (droppedToolCallIds.size > 0) {
+		const finalOut: TrimmableMessage[] = [];
+		for (const m of out) {
+			if (m.role === "toolResult") {
+				const toolCallId = (m as { toolCallId?: unknown }).toolCallId;
+				if (
+					typeof toolCallId === "string" &&
+					toolCallId.length > 0 &&
+					droppedToolCallIds.has(toolCallId) &&
+					!protectedToolCallIds.has(toolCallId)
+				) {
+					continue;
+				}
+			}
+			finalOut.push(m);
+		}
+		// Background mode never mutates the message array in the
+		// loop; the post-pass post-processes the finalOut (not the
+		// original `out`) so the post-pass drop is consistent with
+		// the sync-mode behavior. The wiring layer's
+		// `result.messages` is what consumers see; we hand the
+		// cleaned array out instead of the rewritten-in-place `out`.
+		return {
+			messages: finalOut,
+			summarized,
+			summarizedFingerprints,
+			...(pendingSummaries.length > 0 ? { pendingSummaries } : {}),
+		};
 	}
 	return {
 		messages: out,
@@ -1121,9 +1387,10 @@ function findOldestSummarizable(
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
 	skipAlreadySummarized: boolean = true,
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
 		if (skipAlreadySummarized) {
 			if (isAlreadySummarized(messages[i])) continue;
 			if (alreadySummarizedHashes.has(messageFingerprint(messages[i]))) continue;

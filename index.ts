@@ -175,6 +175,71 @@ function readConfigFile(path: string | undefined): ReturnType<typeof parseConfig
 	}
 }
 
+/**
+ * Pure-evaluating (no I/O, no `process.*`) protected-toolCall-id
+ * extractor. Walks every assistant message's content blocks; for
+ * every `type: "toolCall"` block whose `arguments` carries a `path`
+ * field, runs the existing pure `isPathPreserved` predicate against
+ * the (already `~/`-expanded) `preservedPatterns`. When the path
+ * matches, the block's `id` is added to the returned set.
+ *
+ * The set is the call-arg→result identification source the
+ * re-scoped bundle names. The wiring layer is the sole source of
+ * the set — the pure `policy.ts` module never reads
+ * `arguments.path` directly (purity contract). The protected
+ * `toolResult` messages whose `toolCallId` is in the set are kept
+ * by association via the `isProtectedSlot` branch added in
+ * `policy.ts`. The matching `toolCall` block survives inside its
+ * assistant message via the block-level carve-out in
+ * `dropOldestTurns` and `summarizeOldestUntilUnder`. The
+ * `path-stamp.ts` `details.sourcePath` seam remains the
+ * resume-compatibility fallback (an older `toolResult` whose
+ * matching `toolCall` was in a prior turn and was re-derivable via
+ * the persisted stamp).
+ *
+ * Returns an empty set when `preservedPatterns` is empty, when no
+ * `toolCall` block matches, or when the input is empty. The set
+ * is a `Set<string>` (not `ReadonlySet<string>`) because the
+ * caller may want to inspect it; the policy's `TrimOptions` field
+ * accepts `ReadonlySet<string>` so the same set threads through.
+ */
+function extractProtectedToolCallIds(
+	base: ReadonlyArray<TrimmableMessage>,
+	preservedPatterns: ReadonlyArray<string>,
+): Set<string> {
+	const out = new Set<string>();
+	if (preservedPatterns.length === 0) return out;
+	for (const m of base) {
+		if (m.role !== "assistant") continue;
+		const content = m.content;
+		if (!Array.isArray(content)) continue;
+		for (const block of content) {
+			if (!block || typeof block !== "object") continue;
+			const obj = block as { type?: unknown; id?: unknown; arguments?: unknown };
+			if (obj.type !== "toolCall") continue;
+			// Extract the path named in the call's `arguments.path`
+			// (the canonical shape per the Gate 4 evidence: the
+			// `read` tool's argument is `{ path: <sourcePath> }`).
+			// Other argument shapes (e.g. `get_file`, shell `cat`)
+			// would carry an equivalent field; the operator's
+			// `preservedPatterns` matches against whatever path
+			// the call's arguments name. The path field is read
+			// defensively so an arbitrary `arguments` shape does
+			// not crash the wiring.
+			const args = obj.arguments;
+			if (!args || typeof args !== "object") continue;
+			const pathField = (args as Record<string, unknown>).path;
+			if (typeof pathField !== "string" || pathField.length === 0) continue;
+			if (!isPathPreserved(pathField, preservedPatterns)) continue;
+			const id = obj.id;
+			if (typeof id === "string" && id.length > 0) {
+				out.add(id);
+			}
+		}
+	}
+	return out;
+}
+
 // ─── Default async summarizer (summa subprocess, non-blocking) ────────
 
 const execFileAsync = promisify(execFile);
@@ -510,6 +575,27 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			}
 			protectedTypes.add(PRESERVED_CUSTOM_TYPE);
 		}
+		// Pair-atomic toolCall/toolResult protection: extract the
+		// protected-toolCall-id set from the assistant messages'
+		// `toolCall` blocks. The set is computed by matching each
+		// block's `arguments.path` against the (already `~/`-expanded)
+		// `preservedPatterns`; matching blocks contribute their `id`
+		// to the set. The set threads into the pure policy as
+		// `protectedToolCallIds: ReadonlySet<string>` and drives:
+		//   (a) the additive-OR `isProtectedSlot` branch for the
+		//       matching `toolResult` messages (kept by association,
+		//       excluded from the budget, never dropped/summarized),
+		//   (b) the block-level carve-out in `dropOldestTurns` and
+		//       `summarizeOldestUntilUnder` (the protected
+		//       `toolCall` block survives inside the rewritten
+		//       assistant message; `text`/`thinking` and unprotected
+		//       `toolCall` blocks are dropped/summarized).
+		// Computed BEFORE the pre-budget collapse passes and the
+		// reasoning-block cap so the set reflects the assistant
+		// messages as the model emitted them (the cap / pre-budget
+		// passes may drop assistant message content, but the
+		// set is already computed against the source stream).
+		const protectedToolCallIds = extractProtectedToolCallIds(base, expandedPreservedPatterns);
 		// Apply the reasoning-block-count cap to the base message
 		// stream BEFORE the three-tier trim. The cap keeps the
 		// last N `type:"thinking"` content blocks across the
@@ -644,6 +730,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
 			alreadySummarizedHashes: summarizedFingerprints,
+			protectedToolCallIds,
 		});
 		if (!backgroundMode && ctx?.hasUI) {
 			ctx.ui.setStatus("context-trimmer", undefined);
