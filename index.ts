@@ -647,6 +647,25 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				}
 			}
 		}
+		// Persisted drop marker: when the tier-3 drop path fired
+		// (any non-zero `droppedTurns`), write a
+		// `context-trimmer-dropped` entry carrying the count and a
+		// timestamp. The marker is diagnostic only — it is not
+		// used for policy decisions. The pure `policy.ts` module
+		// only carries the `droppedTurns` counter; the wiring
+		// layer is responsible for persistence. The try/catch
+		// degrades silently when `pi.appendEntry` is unavailable
+		// (tests, minimal mocks).
+		if (result.droppedTurns > 0) {
+			const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
+			if (typeof appendEntry === "function") {
+				try {
+					appendEntry("context-trimmer-dropped", { droppedTurns: result.droppedTurns, timestamp: Date.now() });
+				} catch {
+					// Best-effort: degrade silently
+				}
+			}
+		}
 		// Loop-guard integration. Runs AFTER the trim (operates on
 		// the trimmed view the LLM is about to see) and BEFORE the
 		// handler returns. Re-injection on every qualifying turn is

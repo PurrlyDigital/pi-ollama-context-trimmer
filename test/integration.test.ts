@@ -2445,3 +2445,79 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		assert.equal(summaBlocks.length, 0, "no summa envelope — the session is in tier 1 (post-cap mass is zero, well under the 50k verbatim cap)");
 	});
 });
+
+// ─── Persistence seam — appendEntry records drop state ───────────────
+//
+// The wiring layer persists a `context-trimmer-dropped` entry when
+// the tier-3 drop path fires (any non-zero `droppedTurns`). The
+// marker carries the count and a timestamp. It is diagnostic only;
+// the pure policy module only carries the `droppedTurns` counter,
+// and the wiring layer is responsible for persistence.
+
+describe("persistence seam — appendEntry records drop state", () => {
+	it("records a context-trimmer-dropped entry with droppedTurns and timestamp after a tier-3 drop", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Build a session that lands in tier 3 (trimmable total
+		// > 100k) with multiple trimmable turns so the drop loop
+		// fires (not the drop-floor fall-through). The wiring
+		// stamps `userTurnAge` on every message; with multiple
+		// follow-up user messages, the policy sees multiple
+		// trimmable turns and drops the oldest.
+		//
+		// Shape: dispatch + 2 follow-up user messages, each with
+		// a 40k / 80k trimmable assistant turn. Total trimmable
+		// = 120k. dropFloor = 50% of tier2 = 50k. cap = 100k.
+		// Drop loop: remaining=120, t1=40. 120-40=80 >= 50.
+		// Drop t1. remaining=80. 80 <= 100. Break. droppedTurns=1.
+		// Surviving trimmable: 80k, under cap. No re-check.
+		// No summarization fires.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody40k = longSentence.repeat(550);
+		const trimmableBody80k = longSentence.repeat(1100);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				userMsg("follow-up 1"),
+				assistantMsg(trimmableBody40k),
+				userMsg("follow-up 2"),
+				assistantMsg(trimmableBody80k),
+			],
+		};
+		const before = Date.now();
+		await fireContextWithCtx(pi, event);
+		const after = Date.now();
+		const appendEntries = pi.__getAppendEntries();
+		const dropped = appendEntries.filter((e) => e.customType === "context-trimmer-dropped");
+		assert.ok(dropped.length >= 1, "at least one appendEntry call must carry the context-trimmer-dropped customType after a tier-3 drop");
+		for (const e of dropped) {
+			const data = e.data as { droppedTurns?: unknown; timestamp?: unknown } | undefined;
+			assert.ok(data && typeof data === "object", "dropped entry must carry a data object");
+			assert.equal(typeof data.droppedTurns, "number", "dropped entry's data.droppedTurns must be a number");
+			assert.ok((data.droppedTurns as number) >= 1, "dropped entry's data.droppedTurns must be >= 1 after a tier-3 drop");
+			assert.equal(typeof data.timestamp, "number", "dropped entry's data.timestamp must be a number");
+			const ts = data.timestamp as number;
+			assert.ok(ts >= before && ts <= after, "dropped entry's timestamp must be within the test's wall-clock window");
+		}
+	});
+
+	it("does NOT record a context-trimmer-dropped entry when no drop fires (tier-1 / tier-2 path)", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Build a session that lands in tier 2 (trimmable total
+		// between 50k and 100k). Two trimmable assistant messages
+		// of ~30k tokens each = ~60k trimmable total. The policy
+		// enters the summarize path; no drop fires.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+			],
+		};
+		await fireContextWithCtx(pi, event);
+		const appendEntries = pi.__getAppendEntries();
+		const dropped = appendEntries.filter((e) => e.customType === "context-trimmer-dropped");
+		assert.equal(dropped.length, 0, "no context-trimmer-dropped entry on the tier-2 path (no drop fired)");
+	});
+});
