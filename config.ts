@@ -57,6 +57,20 @@ export interface ContextTrimmerConfig {
 	/** Optional per-summary word cap passed to summa. Overrides the
 	 *  policy default when set. */
 	readonly summaWords?: number;
+	/** Optional token-estimator divisor (chars per token). Overrides
+	 *  the policy's compile-time default `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`
+	 *  when set. Resolved through the env channel
+	 *  (`PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR`) or the JSON
+	 *  `tokenEstimatorDivisor` key, with the same env > JSON > undefined
+	 *  precedence as the other knobs. Badly-typed values (non-numeric,
+	 *  zero, negative, `NaN`, `Infinity`) are treated as absent by
+	 *  `isPositiveNumber` so the resolver falls through to the next
+	 *  precedence layer; the policy applies
+	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT` at the call site when both
+	 *  channels are absent. Positive integer; the wiring layer coerces
+	 *  with `Math.trunc` (summaWords precedent) if the consumer needs
+	 *  an integer. */
+	readonly tokenEstimatorDivisor?: number;
 	/** Optional drop-tier floor as a percentage (0, 100] of the
 	 *  trimmable budget. Overrides the policy default when set. */
 	readonly dropFloorPercent?: number;
@@ -142,6 +156,7 @@ export const ENV = {
 	preservedPaths: "PI_CONTEXT_TRIMMER_PRESERVED_PATHS",
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
 	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
+	tokenEstimatorDivisor: "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR",
 	summaWords: "PI_CONTEXT_TRIMMER_SUMMA_WORDS",
 	dropFloorPercent: "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT",
 	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
@@ -166,6 +181,14 @@ export interface ParsedConfigFile {
 	preservedPaths?: readonly string[];
 	tier1MaxTokens?: number;
 	tier2MaxTokens?: number;
+	/** Optional token-estimator divisor (chars per token). Resolved
+	 *  through the same env > JSON > undefined precedence as
+	 *  `ContextTrimmerConfig`; `isPositiveNumber` validation in
+	 *  `parseConfigFile` treats non-numeric, zero, negative, `NaN`,
+	 *  and `Infinity` as absent. The policy's
+	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
+	 *  default when neither channel sets a value. */
+	tokenEstimatorDivisor?: number;
 	summaWords?: number;
 	dropFloorPercent?: number;
 	recencyFloor?: number;
@@ -203,6 +226,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.tier2MaxTokens)) {
 		out.tier2MaxTokens = o.tier2MaxTokens;
+	}
+	if (isPositiveNumber(o.tokenEstimatorDivisor)) {
+		out.tokenEstimatorDivisor = o.tokenEstimatorDivisor;
 	}
 	if (isPositiveNumber(o.summaWords)) {
 		out.summaWords = o.summaWords;
@@ -266,6 +292,8 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.tier1MaxTokens]) ?? file.tier1MaxTokens;
 	const tier2MaxTokens =
 		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
+	const tokenEstimatorDivisor =
+		parseNumberEnv(env[ENV.tokenEstimatorDivisor]) ?? file.tokenEstimatorDivisor;
 	const summaWords =
 		parseNumberEnv(env[ENV.summaWords]) ?? file.summaWords;
 	const dropFloorPercent =
@@ -336,6 +364,7 @@ export function resolveConfig(opts: {
 		preservedPaths,
 		tier1MaxTokens,
 		tier2MaxTokens,
+		tokenEstimatorDivisor,
 		summaWords,
 		dropFloorPercent,
 		recencyFloor,

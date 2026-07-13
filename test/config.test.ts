@@ -1637,3 +1637,200 @@ describe("intercomKeepLast — resolveConfig (precedence)", () => {
 		assert.equal(parsedInteger.intercomKeepLast, 5, "integer file value survives the parse");
 	});
 });
+// ─── tokenEstimatorDivisor (the operator-configurable chars-per-token) ─
+//
+// `tokenEstimatorDivisor` is the operator-configurable knob that
+// controls the chars-per-token constant the policy uses for every
+// per-message token estimate (the trimmable mass, the protected mass,
+// the system-prompt mass, the `[summa: …]` envelope tag). The knob
+// is exposed in BOTH channels (env
+// `PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR` and the
+// `tokenEstimatorDivisor` JSON key) per the tandem principle;
+// precedence is env > JSON > undefined. The wiring layer coerces
+// with `Math.trunc` to an integer (summaWords precedent) when
+// passing the value to the pure policy. The policy's
+// `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
+// fallback when neither channel sets a value.
+//
+// The validator `isPositiveNumber` (the existing predicate for the
+// numeric threshold fields) applies: non-numeric, zero, negative,
+// `NaN`, and `Infinity` are all treated as absent so the resolver
+// falls through to the next precedence layer. There is no "default"
+// for the resolver — the wiring layer applies the compile-time
+// default when the resolver returns undefined.
+
+describe("tokenEstimatorDivisor — file channel (parseConfigFile)", () => {
+	it("file parse: well-typed positive number is extracted", () => {
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: 3 }).tokenEstimatorDivisor, 3);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: 4 }).tokenEstimatorDivisor, 4);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: 1 }).tokenEstimatorDivisor, 1);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: 100 }).tokenEstimatorDivisor, 100);
+	});
+
+	it("file parse: non-numeric value (string) is treated as absent", () => {
+		// The file channel does NOT coerce strings to numbers; the
+		// `isPositiveNumber` predicate accepts only `typeof === "number"`.
+		// Operators who want a string-valued JSON entry must use a
+		// numeric JSON literal, not a quoted string.
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: "3" }).tokenEstimatorDivisor, undefined);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: "4" }).tokenEstimatorDivisor, undefined);
+	});
+
+	it("file parse: zero is treated as absent (not a valid divisor; chars/0 is undefined)", () => {
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: 0 }).tokenEstimatorDivisor, undefined);
+	});
+
+	it("file parse: negative number is treated as absent", () => {
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: -1 }).tokenEstimatorDivisor, undefined);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: -100 }).tokenEstimatorDivisor, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: Number.NaN }).tokenEstimatorDivisor, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: Number.POSITIVE_INFINITY }).tokenEstimatorDivisor, undefined);
+		assert.equal(parseConfigFile({ tokenEstimatorDivisor: Number.NEGATIVE_INFINITY }).tokenEstimatorDivisor, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).tokenEstimatorDivisor, undefined);
+	});
+});
+
+describe("tokenEstimatorDivisor — resolveConfig (precedence)", () => {
+	// The wiring layer's contract is
+	// `cfg.tokenEstimatorDivisor !== undefined ? Math.trunc(cfg.tokenEstimatorDivisor) : TOKEN_ESTIMATOR_DIVISOR_DEFAULT`
+	// — the resolver returns `undefined` when neither channel sets a
+	// value, and the wiring layer applies the compile-time default.
+	// The tests below assert the resolver's behavior; the wiring
+	// layer's default-applies behavior is covered in
+	// `integration.test.ts` (the end-to-end context-handler test).
+
+	it("env > file: env wins when both channels set a value", () => {
+		const cfg = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+			env: { [ENV.tokenEstimatorDivisor]: "3" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 3, "env value 3 wins over file value 4 (the tandem rule)");
+	});
+
+	it("env wins: env 4 forces the legacy chars/4 default over file 3", () => {
+		const cfg = resolveConfig({
+			file: { tokenEstimatorDivisor: 3 },
+			env: { [ENV.tokenEstimatorDivisor]: "4" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "env value 4 wins over file value 3 (the legacy chars/4 default is reachable via env)");
+	});
+
+	it("file-only: env unset, file sets a value → file value returned", () => {
+		const cfg = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "file-only returns the file value");
+	});
+
+	it("nothing configured: both unset → resolver returns undefined (wiring applies the compile-time default)", () => {
+		// The resolver does NOT apply a default itself — the
+		// wiring layer (index.ts) is what reads
+		// `TOKEN_ESTIMATOR_DIVISOR_DEFAULT` when the resolver
+		// returns undefined. The two-layer contract is intentional:
+		// the resolver is the "configured value" surface, the
+		// wiring is the "apply the default" surface.
+		const cfg = resolveConfig({});
+		assert.equal(cfg.tokenEstimatorDivisor, undefined, "no value configured → undefined (wiring layer applies the compile-time default)");
+	});
+
+	it("empty-string env falls back to file value", () => {
+		const cfg = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+			env: { [ENV.tokenEstimatorDivisor]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "empty-string env is treated as no override; file value wins");
+	});
+
+	it("non-numeric env falls back to file value", () => {
+		// The env parser is strict: a non-numeric string ("abc")
+		// returns undefined from `parseNumberEnv`; the fallback
+		// chain (env undefined → file value) returns the file
+		// value. The `parseNumberEnv` shape matches every other
+		// numeric knob in the file (tier1MaxTokens, tier2MaxTokens,
+		// summaWords, recencyFloor, loopGuardThreshold, etc.).
+		const cfg = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+			env: { [ENV.tokenEstimatorDivisor]: "not-a-number" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "env 'not-a-number' falls back to file value");
+	});
+
+	it("badly-typed env (zero, negative) falls back to file value", () => {
+		// The env parser applies the same `isPositiveNumber`
+		// predicate the file parser uses: zero, negative, NaN,
+		// and Infinity are all rejected and treated as absent.
+		const cfgZero = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+			env: { [ENV.tokenEstimatorDivisor]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.tokenEstimatorDivisor, 4, "env '0' falls back to file value");
+		const cfgNeg = resolveConfig({
+			file: { tokenEstimatorDivisor: 4 },
+			env: { [ENV.tokenEstimatorDivisor]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.tokenEstimatorDivisor, 4, "env '-1' falls back to file value");
+	});
+
+	it("badly-typed file value falls back to env (then to undefined)", () => {
+		// The two-step pipeline: parseConfigFile drops the bad
+		// file value, then resolveConfig's env parser picks up
+		// the env value. The resolver returns the env value
+		// when the file channel is absent and env is set.
+		const parsed = parseConfigFile({ tokenEstimatorDivisor: "3" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.tokenEstimatorDivisor]: "4" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "parseConfigFile drops the bad file value; env value wins");
+	});
+
+	it("badly-typed in BOTH channels → resolver returns undefined", () => {
+		// The two-step pipeline: parseConfigFile drops the bad
+		// file value, then resolveConfig's env parser drops the
+		// bad env string. The resolver returns undefined when
+		// neither channel yields a valid value.
+		const parsed = parseConfigFile({ tokenEstimatorDivisor: "3" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.tokenEstimatorDivisor]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, undefined, "both channels badly-typed → undefined (wiring default applies)");
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.tokenEstimatorDivisor]: "4" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 4, "env '4' is coerced to the number 4");
+		assert.equal(typeof cfg.tokenEstimatorDivisor, "number", "the parsed value is a number, not a string");
+	});
+
+	it("env parse: large positive integer is preserved", () => {
+		// The validator's only constraint is `v > 0`; large
+		// positive integers are accepted. Operators with an
+		// unusually sparse token ratio (chars/10, e.g.) can
+		// reach it through the env channel.
+		const cfg = resolveConfig({
+			env: { [ENV.tokenEstimatorDivisor]: "10" } as EnvRecord,
+		});
+		assert.equal(cfg.tokenEstimatorDivisor, 10);
+		assert.equal(typeof cfg.tokenEstimatorDivisor, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.tokenEstimatorDivisor is the documented namespace", () => {
+		assert.equal(ENV.tokenEstimatorDivisor, "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR");
+	});
+});

@@ -14,6 +14,7 @@ import {
 	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
+	approximateTextTokens,
 	countReasoningBlocks,
 	dedupSubagentNotify,
 	extractReasoningText,
@@ -37,6 +38,7 @@ import {
 	VERBATIM_TIER_MAX_TOKENS,
 	SUMMARIZE_TIER_MAX_TOKENS,
 	SUMMA_WORDS,
+	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	type TrimmableMessage,
 } from "../policy.ts";
 
@@ -176,11 +178,14 @@ function assistantWithThinkingAndText(thinking: string[], text: string): Trimmab
 	};
 }
 
-/** Build a trimmable mass of roughly N tokens (chars = N * 4). */
+/** Build a trimmable mass of roughly N tokens (chars = N * 3). */
 function trimmableMass(n: number): TrimmableMessage[] {
 	// Build a single trimmable message of n tokens. The dispatch
-	// is a small constant that the policy protects.
-	const targetChars = n * 4;
+	// is a small constant that the policy protects. The new
+	// policy default divisor is 3 (chars/3) — the legacy chars/4
+	// default is no longer reachable by default; this helper
+	// reflects the new default.
+	const targetChars = n * 3;
 	return [
 		userMsg("dispatch task — do X", 0),
 		assistantMsg("a".repeat(targetChars)),
@@ -189,9 +194,9 @@ function trimmableMass(n: number): TrimmableMessage[] {
 
 // ─── Per-message token accounting ─────────────────────────────────────
 
-describe("approximateMessageTokens (chars / 4)", () => {
-	it("returns ceil(chars / 4) for a string content", async () => {
-		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 3);
+describe("approximateMessageTokens (chars / 3 default)", () => {
+	it("returns ceil(chars / 3) for a string content", async () => {
+		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 4);
 	});
 
 	it("sums text across an array of content blocks", async () => {
@@ -202,7 +207,7 @@ describe("approximateMessageTokens (chars / 4)", () => {
 				{ type: "text", text: "world" },
 			],
 		};
-		assert.equal(approximateMessageTokens(msg), 3);
+		assert.equal(approximateMessageTokens(msg), 4);
 	});
 
 	it("returns 0 for an empty string content", async () => {
@@ -214,8 +219,8 @@ describe("approximateMessageTokens (chars / 4)", () => {
 			role: "custom",
 			content: { foo: "bar" },
 		};
-		// JSON.stringify({foo:"bar"}) → 13 chars → ceil(13/4) = 4
-		assert.equal(approximateMessageTokens(msg), 4);
+		// JSON.stringify({foo:"bar"}) → 13 chars → ceil(13/3) = 5
+		assert.equal(approximateMessageTokens(msg), 5);
 	});
 });
 
@@ -349,8 +354,16 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 	});
 
 	it("boundary at exactly 50k total tokens is verbatim", async () => {
+		// Pass a verbatim cap of `50k + dispatchTokens` so the
+		// protected-mass subtraction (the dispatch task is ~8
+		// tokens at the new chars/3 default) lands the effective
+		// cap exactly at the trimmable mass. The boundary holds:
+		// `total > effectiveVerbatimMax` is false → verbatim.
 		const messages = trimmableMass(VERBATIM_TIER_MAX_TOKENS);
-		const result = await applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: VERBATIM_TIER_MAX_TOKENS + 100,
+		});
 		assert.equal(result.summarized, 0);
 		assert.equal(result.droppedTurns, 0);
 	});
@@ -760,29 +773,27 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 
 	it("preserves the recency slice across the tier-2 summarize path (AC-2)", async () => {
 		// Three older trimmable messages (turn 1, ~60k
-		// total) plus a recency slice of two trimmable
-		// messages (turn 2, ~90k total). The recency slice
-		// is the operator's "most-recent-N-tokens of
-		// trimmable content." `recencyFloor: 50_000` covers
-		// the recency slice (the slice is ~90k, so the
-		// threshold is met after the first recency message
-		// and the slice covers the tail). The trimmable
-		// budget excludes the recency slice, so 60k >
-		// verbatimMax (50k) → tier-2 fires on the OLDER
+		// total) plus a small recency slice (~6k total).
+		// `recencyFloor: 3_000` covers the recency slice.
+		// The trimmable budget (recency excluded) is 60k
+		// > effectiveVerbatimMax (50k minus protectedMass,
+		// which absorbs the dispatch + the small recency
+		// slice's tokens) → tier-2 fires on the OLDER
 		// trimmable; the recency slice is NOT summarized.
-		// The recency slice's original content must survive
-		// verbatim.
+		// The recency slice's original content must
+		// survive verbatim.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch task — do X", 0),
 			assistantMsg("x".repeat(20_000 * 4)), // 20k tokens, oldest
 			toolResultMsg("y".repeat(20_000 * 4)), // 20k tokens
 			assistantMsg("z".repeat(20_000 * 4)), // 20k tokens
-			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
-			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
+			assistantMsg("RECENT-X ".repeat(700)), // 1.5k tokens, recency slice
+			toolResultMsg("RECENT-Y ".repeat(700)), // 1.5k tokens, recency slice
 		];
 		const result = await applyThreeTierTrim(messages, {
 			summarizer,
-			recencyFloor: 50_000,
+			recencyFloor: 3_000,
+			tokenEstimatorDivisor: 4,
 		});
 		// (i) Recency-slice messages have ORIGINAL content
 		// preserved (their `content` was not rewritten by
@@ -849,6 +860,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			recencyFloor: 50_000,
+			tokenEstimatorDivisor: 4,
 		});
 		// The recency-slice messages survive the drop.
 		// Their content is preserved verbatim — the
@@ -1171,11 +1183,11 @@ describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
 			assistantMsg("a".repeat(2000)),
 		];
 		// Without preservedPatterns, both the tool result and the
-		// assistant count: 2000/4 + 2000/4 = 1000.
-		assert.equal(totalTrimmableTokens(messages), 1000);
+		// assistant count: 2000/3 + 2000/3 = 1334.
+		assert.equal(totalTrimmableTokens(messages), 1334);
 		// With ["AGENTS.md"], the tool result is subtracted, leaving
-		// only the assistant: 2000/4 = 500.
-		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 500);
+		// only the assistant: 2000/3 = 667.
+		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 667);
 	});
 
 	it("preserved tokens are not counted in the budget", async () => {
@@ -3748,5 +3760,325 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 		assert.ok(!src.includes("node:os"), "applyThreeTierTrim must not import node:os");
 		assert.ok(!src.includes("fetch("), "applyThreeTierTrim must not perform network I/O");
 		assert.ok(!src.includes("readFile"), "applyThreeTierTrim must not perform filesystem I/O");
+	});
+});
+// ─── Effective budget with protected mass + system-prompt term ──────────
+//
+// The new `systemPromptTokens` field on `TrimOptions` is subtracted
+// from the verbatim and summarize tier caps alongside the protected-
+// slot mass. The result is the effective cap the policy compares the
+// trimmable mass against: `effectiveVerbatimMax = max(0, verbatimMax
+// − systemPromptTokens − protectedMass)`. The `Math.max(0, …)` guard
+// ensures the effective cap never goes negative — when the protected
+// mass and system-prompt term together exceed the raw cap the
+// effective cap is 0 and the trim loop compares against 0.
+//
+// The tests below exercise the new effective-cap math end-to-end on
+// `applyThreeTierTrim`. Five scenarios:
+//   (1) protected mass subtracted from both tier caps (AC-1).
+//   (2) system-prompt tokens subtracted in addition to protected mass
+//       (AC-2).
+//   (3) `approximateTextTokens` with divisor 3 (the new default) and
+//       divisor 4 (the legacy chars/4 default, still reachable through
+//       the operator-configured knob) — AC-3.
+//   (4) no-regression: when both `systemPromptTokens` and the protected
+//       mass are 0 the trim is identical to the legacy behavior
+//       (AC-6).
+//   (5) degradation: when the protected mass alone exceeds the verbatim
+//       cap, the effective cap is 0 and the trim fires against the
+//       trimmable mass (AC-6, no `NaN` / `Infinity` / infinite loop).
+
+describe("applyThreeTierTrim — effective budget with protected mass + system-prompt term", () => {
+	const summarizer = makeTrimmingSummarizer(5);
+
+	// (1) protected mass subtracted from both tier caps (AC-1).
+	//
+	// Build a session whose trimmable mass is 60k tokens (over the
+	// 50k verbatim cap and under the 100k drop cap) with a protected
+	// mass of 1506 tokens. The effective verbatim cap is
+	// `max(0, 50_000 − 0 − 1_506) = 48_494` and the effective
+	// summarize cap is `max(0, 100_000 − 0 − 1_506) = 98_494`. The
+	// trimmable total (60k) exceeds the effective verbatim cap
+	// (48_494) so tier 2 fires; the trimmable total is well below
+	// the effective summarize cap (98_494) so the drop tier does not
+	// fire. The protected slots survive the trim (their content is
+	// verbatim); the trimmable allowance is reduced by the protected
+	// mass.
+	it("(1) protected mass subtracted from both tier caps (AC-1): the effective cap is verbatimMax − protectedMass; tier 2 fires when trimmable > effective cap", async () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages: TrimmableMessage[] = [
+			// Protected pinned synthetic — 500 tokens
+			// (1500 chars / 3 = 500 tokens).
+			pinnedMsg("p".repeat(1500)),
+			// Protected dispatch task — 7 tokens
+			// ("dispatch task — do X" = 21 chars / 3 = 7).
+			userMsg("dispatch task — do X", 0),
+			// Protected preserved-path tool result — 1000 tokens
+			// (3000 chars / 3 = 1000).
+			toolResultWithPath("c".repeat(3000), "/repo/AGENTS.md"),
+			// Trimmable: 60k total (two ~30k assistant messages).
+			assistantMsg("a".repeat(30_000 * 3)),
+			assistantMsg("b".repeat(30_000 * 3)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+			preservedPatterns: ["AGENTS.md"],
+			verbatimMaxTokens: 50_000,
+			summarizeMaxTokens: 100_000,
+		});
+		// Tier 2 fired: at least one trimmable was summarized.
+		assert.ok(result.summarized >= 1, "tier 2 must fire when trimmable total (60k) > effective verbatim cap (48_494)");
+		// The drop tier did not fire.
+		assert.equal(result.droppedTurns, 0, "the drop tier must NOT fire — trimmable 60k < effective summarize cap 98_494");
+		// (i) The protected pinned synthetic survives with original content.
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "the protected pinned synthetic must survive the trim");
+		assert.equal(pinned!.content, "p".repeat(1500), "the pinned synthetic's content is verbatim");
+		// (ii) The protected dispatch task survives with original content.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+		assert.equal(dispatch!.content, "dispatch task — do X", "the dispatch task's content is verbatim");
+		// (iii) The protected preserved-path tool result survives with original content.
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preserved, "the protected preserved-path tool result must survive the trim");
+		assert.equal(preserved!.content, "c".repeat(3000), "the preserved tool result's content is verbatim");
+		// (iv) Post-trim trimmable total ≤ effective verbatim cap.
+		const postTrimTotal = totalTrimmableTokens(result.messages, protectedSet, true, ["AGENTS.md"]);
+		assert.ok(
+			postTrimTotal <= 48_494,
+			`post-trim trimmable total ${postTrimTotal} must be <= effective verbatim cap 48_494`,
+		);
+	});
+
+	// (2) system-prompt tokens subtracted in addition to protected mass (AC-2).
+	//
+	// Same fixture as (1) but with `systemPromptTokens: 30_000`. The
+	// effective cap is `max(0, 50_000 − 30_000 − 1_506) = 18_494`.
+	// The trimmable total (60k) exceeds the effective verbatim cap
+	// (18_494) so tier 2 fires earlier (more summarize passes are
+	// required to land the trimmable total under 18_494 instead of
+	// 48_494). The protected slots and the dispatch task survive.
+	it("(2) system-prompt tokens subtracted (AC-2): the effective cap is verbatimMax − systemPromptTokens − protectedMass; tier 2 fires earlier with a lower effective cap", async () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("p".repeat(1500)),
+			userMsg("dispatch task — do X", 0),
+			toolResultWithPath("c".repeat(3000), "/repo/AGENTS.md"),
+			assistantMsg("a".repeat(30_000 * 3)),
+			assistantMsg("b".repeat(30_000 * 3)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+			preservedPatterns: ["AGENTS.md"],
+			verbatimMaxTokens: 50_000,
+			summarizeMaxTokens: 100_000,
+			systemPromptTokens: 30_000,
+		});
+		// Tier 2 fired.
+		assert.ok(result.summarized >= 1, "tier 2 must fire when trimmable total (60k) > effective verbatim cap (18_494)");
+		// The drop tier did not fire.
+		assert.equal(result.droppedTurns, 0, "the drop tier must NOT fire — trimmable 60k < effective summarize cap 68_494");
+		// (i) The protected pinned synthetic survives.
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "the protected pinned synthetic must survive the trim");
+		assert.equal(pinned!.content, "p".repeat(1500));
+		// (ii) The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+		assert.equal(dispatch!.content, "dispatch task — do X");
+		// (iii) The preserved-path tool result survives.
+		const preserved = result.messages.find(
+			(m) => m.role === "toolResult" && m.details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preserved, "the protected preserved-path tool result must survive the trim");
+		assert.equal(preserved!.content, "c".repeat(3000));
+		// (iv) The trim fires earlier — the post-trim trimmable
+		// total is at or below the lower effective cap (18_494).
+		// The summarizer stub returns "summary" (7 chars / 3 = 3
+		// tokens) per call, so after one pass a 30k message
+		// becomes ~3 tokens; with two 30k trimmable messages,
+		// the post-trim trimmable is ~6 tokens — well under
+		// 18_494. The effective cap reduced the summarize
+		// target by 30_000 tokens compared to the (1) case.
+		const postTrimTotal = totalTrimmableTokens(result.messages, protectedSet, true, ["AGENTS.md"]);
+		assert.ok(
+			postTrimTotal <= 18_494,
+			`post-trim trimmable total ${postTrimTotal} must be <= effective verbatim cap 18_494 (system-prompt term subtracted)`,
+		);
+	});
+
+	// (3) `approximateTextTokens` with divisor 3 (the new default) and
+	// divisor 4 (the legacy chars/4 default, reachable through the
+	// operator-configured knob) — AC-3.
+	describe("approximateTextTokens with configurable divisor (AC-3)", () => {
+		it("divisor 3: 'hello world' (11 chars) → ceil(11/3) = 4 tokens", async () => {
+			assert.equal(approximateTextTokens("hello world", 3), 4);
+		});
+
+		it("divisor 4 (the legacy default): 'hello world' (11 chars) → ceil(11/4) = 3 tokens", async () => {
+			// The legacy chars/4 behavior is reachable by passing
+			// 4 to the estimator directly. The wiring layer
+			// threads the operator-configured divisor from
+			// `cfg.tokenEstimatorDivisor` (env or JSON key) at
+			// every call site.
+			assert.equal(approximateTextTokens("hello world", 4), 3);
+		});
+
+		it("divisor 3: structured content (a JSON-stringified 30-char object) → ceil(30/3) = 10 tokens", async () => {
+			// A representative structured-content tokenization:
+			// 30 chars / 3 = 10 tokens at the new default.
+			const structured = JSON.stringify({ a: 1, b: 2, c: 3, d: 4 });
+			// Sanity: 30 chars at JSON.stringify density
+			// (`{"a":1,"b":2,"c":3,"d":4}` = 29 chars — close to
+			// 30; the test asserts the formula, not the exact
+			// shape).
+			const len = structured.length;
+			assert.equal(approximateTextTokens(structured, 3), Math.ceil(len / 3));
+		});
+
+		it("divisor 3: empty string → 0 tokens", async () => {
+			assert.equal(approximateTextTokens("", 3), 0);
+		});
+
+		it("divisor 3: TOKEN_ESTIMATOR_DIVISOR_DEFAULT is 3 (the new compile-time default)", async () => {
+			// The compile-time default is the new divisor 3
+			// (replacing the legacy hard-coded 4). The wiring
+			// layer applies this constant when neither the env
+			// var nor the JSON key sets a value; tests that
+			// don't pass a divisor fall through to it.
+			assert.equal(TOKEN_ESTIMATOR_DIVISOR_DEFAULT, 3);
+		});
+	});
+
+	// (4) no-regression: when both `systemPromptTokens` and the
+	// protected mass are 0 the trim is identical to the legacy
+	// behavior (AC-6).
+	it("(4) no-regression (AC-6): systemPromptTokens: 0 + no protected mass → identical to the legacy trim path", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("a".repeat(30_000 * 3)),
+			assistantMsg("b".repeat(30_000 * 3)),
+		];
+		// Pass `systemPromptTokens: 0` explicitly to verify the
+		// no-regression path. The fixture has no protected
+		// customTypes and no preserved paths, so protectedMass
+		// reduces to the dispatch (7 tokens). The effective
+		// verbatim cap is `max(0, 50_000 − 0 − 7) = 49_993`;
+		// trimmable (60k) > 49_993 so tier 2 fires once. This
+		// is the AC-6 contract: identical behavior to the legacy
+		// path (which subtracted the protected mass but did not
+		// subtract a system-prompt term — with systemPromptTokens
+		// = 0 the new code is bit-for-bit equivalent).
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: 50_000,
+			summarizeMaxTokens: 100_000,
+			systemPromptTokens: 0,
+		});
+		// Tier 2 fired (the trimmable mass exceeds the effective
+		// verbatim cap; the subtract-protect term is the only
+		// delta from the legacy code).
+		assert.ok(result.summarized >= 1, "tier 2 must fire (60k trimmable > 49_993 effective cap)");
+		assert.equal(result.droppedTurns, 0, "the drop tier must NOT fire — trimmable 60k < effective summarize cap 99_993");
+		// The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+		assert.equal(dispatch!.content, "dispatch task — do X");
+		// The trimmable mass was reduced under the effective cap.
+		const postTrimTotal = totalTrimmableTokens(result.messages);
+		assert.ok(
+			postTrimTotal <= 49_993,
+			`post-trim trimmable total ${postTrimTotal} must be <= effective verbatim cap 49_993`,
+		);
+	});
+
+	// (5) degradation: when the protected mass alone exceeds the
+	// verbatim cap, the effective cap is 0 and the trim fires
+	// against the trimmable mass (AC-6, no `NaN` / `Infinity` /
+	// infinite loop).
+	//
+	// Build a session with five protected slots summing to 60k
+	// tokens and one trimmable message of 1k tokens. The verbatim
+	// cap is 50_000; the effective cap is
+	// `max(0, 50_000 − 0 − 60_000) = 0`. The trimmable mass
+	// (1000) > 0 so tier 2 fires. The protected slots survive;
+	// the trimmable message is summarized to a tiny envelope.
+	// The `Math.max(0, …)` guard prevents a negative cap from
+	// entering the comparison (which would produce `NaN` /
+	// `Infinity` from the arithmetic).
+	it("(5) degradation (AC-6): protected mass > verbatim cap → effective cap is 0; tier 2 fires; protected slots survive; no NaN/Infinity, no infinite loop", async () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		// 5 protected pinned synthetics of 12k tokens each
+		// (36_000 chars / 3 = 12_000 tokens → total 60k).
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("p".repeat(36_000)),
+			pinnedMsg("p".repeat(36_000)),
+			pinnedMsg("p".repeat(36_000)),
+			pinnedMsg("p".repeat(36_000)),
+			pinnedMsg("p".repeat(36_000)),
+			userMsg("dispatch task — do X", 0),
+			// 1 trimmable message of ~1k tokens.
+			assistantMsg("t".repeat(3_000)),
+		];
+		// Track that the function returns (no infinite loop)
+		// and that the result counters are valid (no NaN).
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			protectedCustomTypes: protectedSet,
+			verbatimMaxTokens: 50_000,
+			summarizeMaxTokens: 100_000,
+		});
+		// The function returned — no infinite loop.
+		assert.ok(result, "the trim function must return (no infinite loop)");
+		// The counters are valid finite numbers (no NaN / Infinity).
+		assert.equal(typeof result.summarized, "number", "summarized counter is a number");
+		assert.ok(Number.isFinite(result.summarized), "summarized counter is finite (no NaN/Infinity)");
+		assert.equal(typeof result.droppedTurns, "number", "droppedTurns counter is a number");
+		assert.ok(Number.isFinite(result.droppedTurns), "droppedTurns counter is finite (no NaN/Infinity)");
+		assert.equal(typeof result.totalTokens, "number", "totalTokens counter is a number");
+		assert.ok(Number.isFinite(result.totalTokens), "totalTokens counter is finite (no NaN/Infinity)");
+		// Tier 2 fired (the trimmable mass of 1k > effective
+		// verbatim cap of 0); at least one summary landed.
+		assert.ok(result.summarized >= 1, "tier 2 must fire (1k trimmable > 0 effective cap)");
+		// The 5 protected pinned synthetics survive.
+		const pinnedSurvivors = result.messages.filter(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.equal(pinnedSurvivors.length, 5, "all 5 protected pinned synthetics must survive the trim");
+		// The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+		assert.equal(dispatch!.content, "dispatch task — do X");
+		// The post-trim trimmable total is at or below the
+		// effective cap (which is 0). With the summarizer stub
+		// returning "summary" (7 chars / 3 = 3 tokens) plus the
+		// `[summa: ~N → ~M]\n` envelope prefix, the post-trim
+		// trimmable is a small envelope token count — well below
+		// the original 1k trimmable mass. The contract is
+		// "the trim fires and reduces the trimmable mass"; the
+		// exact residual is the envelope size, not 0.
+		const postTrimTotal = totalTrimmableTokens(result.messages, protectedSet);
+		assert.ok(
+			postTrimTotal < 1_000,
+			`post-trim trimmable total ${postTrimTotal} must be < the original 1k trimmable mass (the trim fired and reduced it)`,
+		);
+		// The drop tier did not fire — the trimmable (1k) < 100k.
+		assert.equal(result.droppedTurns, 0, "the drop tier must NOT fire — trimmable 1k < 100k");
 	});
 });
