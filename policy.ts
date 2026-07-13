@@ -41,6 +41,15 @@ export const SUMMARIZE_TIER_MAX_TOKENS = 100_000;
 export const SUMMA_WORDS = 60;
 
 /**
+ * Compile-time default for the per-message token estimator divisor.
+ * The wiring layer uses this when neither the env var nor the JSON
+ * key sets a value. `3` reflects the chars/3 default that targets
+ * JSON/markup/code-heavy trimmable mass; the legacy chars/4
+ * behavior is reachable by setting the operator knob to `4`.
+ */
+export const TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3;
+
+/**
  * The plain-English aggregate prune reminder the policy injects at
  * the start of the tier-3 prune pass when any turns are dropped.
  * The reminder is a single, model-facing message that lets the LLM
@@ -216,6 +225,39 @@ export type TrimOptions = {
 	 * argument extraction in `index.ts`).
 	 */
 	protectedToolCallIds?: ReadonlySet<string>;
+	/**
+	 * Override the per-message token estimator divisor (default 3,
+	 * `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`). Used by both
+	 * `approximateMessageTokens` and `approximateTextTokens` for
+	 * every internal token-count site (trimmable mass, protected
+	 * mass, system-prompt mass, the `[summa: …]` envelope tag).
+	 * The wiring layer resolves this from
+	 * `PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR` env var and
+	 * the `tokenEstimatorDivisor` JSON key per the existing env >
+	 * JSON > default precedence. The policy never reads
+	 * `process.env` directly — the resolved value arrives as a
+	 * number on this field. `undefined` or non-positive values
+	 * fall through to `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`.
+	 */
+	tokenEstimatorDivisor?: number;
+	/**
+	 * The system-prompt token count for the current turn. The
+	 * wiring layer computes this from
+	 * `ctx.getSystemPrompt()` and the same `approximateTextTokens`
+	 * estimator the policy uses for messages, with the same
+	 * divisor. The system-prompt mass is constant within a single
+	 * trim pass (it does not change mid-trim) and is subtracted
+	 * from both tier caps alongside the protected-slot mass so
+	 * the effective budget reserves space for it. Default 0 —
+	 * the policy degrades to the AC-1 `tierNMax − protectedMass`
+	 * behavior when the wiring does not pass a count (test mocks,
+	 * minimal harness contexts). The policy never calls
+	 * `ctx.getSystemPrompt()` itself; the value arrives as a
+	 * number on this field. The system-prompt string is a
+	 * harness surface and stays in the wiring layer per the
+	 * purity contract (AGENTS.md rule 8).
+	 */
+	systemPromptTokens?: number;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
@@ -257,22 +299,58 @@ export type TrimResult = {
 	}>;
 };
 
-// ─── Per-message token accounting (chars / 4) ──────────────────────────
+// ─── Per-message token accounting (chars / divisor) ─────────────────────
 
 /**
- * Approximate the token count of a single message by summing the text
- * content and dividing by 4. The harness convention (per CLAUDE.md and
- * the documented model-card values) is chars / 4 ≈ tokens. Non-text
- * content blocks are stringified; custom roles fall through to JSON.
+ * Approximate the token count of a plain text string by dividing
+ * the character count by `divisor`. Returns `Math.ceil(text.length /
+ * divisor)`. The estimator is a lower bound on a real provider
+ * tokenizer; the divisor lets operators tune the constant to
+ * match the provider's actual per-token character ratio (the
+ * default `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` targets
+ * JSON/markup/code-heavy trimmable mass; the legacy chars/4
+ * behavior is reachable by passing `4`).
+ *
+ * Pure: string in, number out. No I/O, no `process.*`. Exported
+ * so the wiring layer can compute the system-prompt token count
+ * (a harness surface, `ctx.getSystemPrompt()`) with the same
+ * estimator the policy uses for message tokens — the trimmer's
+ * view of the system prompt and its view of the messages are
+ * then on the same scale.
+ */
+export function approximateTextTokens(text: string, divisor: number): number {
+	return Math.ceil(text.length / divisor);
+}
+
+/**
+ * Approximate the token count of a single message by summing the
+ * text content and dividing by `divisor`. The harness convention
+ * (per CLAUDE.md and the documented model-card values) is
+ * roughly `chars / N` for some provider-specific `N`; the
+ * default `3` reflects chars/3 (the chars/4 legacy is reachable
+ * by passing `4`). Non-text content blocks are stringified;
+ * custom roles fall through to JSON.
  *
  * The function is intentionally permissive on input shape — the
  * message type is structural and content blocks vary by role and
- * provider. The accounting is a lower bound (we undercount multi-modal
- * content), which biases toward trim; that's the safe direction.
+ * provider. The accounting is a lower bound (we undercount
+ * multi-modal content), which biases toward trim; that's the
+ * safe direction.
+ *
+ * The default `divisor` is `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`
+ * (= 3) — not 4, the legacy hard-coded value. The legacy
+ * behavior is preserved by an operator setting the divisor
+ * knob to 4 via the env/JSON channel (the wiring layer is the
+ * sole source of the operator-resolved value; this default
+ * keeps the policy self-consistent for tests that don't pass
+ * a divisor).
  */
-export function approximateMessageTokens(msg: TrimmableMessage): number {
+export function approximateMessageTokens(
+	msg: TrimmableMessage,
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
+): number {
 	const text = extractText(msg.content);
-	return Math.ceil(text.length / 4);
+	return approximateTextTokens(text, divisor);
 }
 
 /**
@@ -569,13 +647,14 @@ export function computeRecencyProtectedIndices(
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): ReadonlySet<number> {
 	const out = new Set<number>();
 	if (recencyFloorTokens === undefined || recencyFloorTokens <= 0) return out;
 	let acc = 0;
 	for (let i = messages.length - 1; i >= 0; i--) {
 		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, new Set(), protectedToolCallIds)) continue;
-		const tokens = approximateMessageTokens(messages[i]);
+		const tokens = approximateMessageTokens(messages[i], divisor);
 		out.add(i);
 		acc += tokens;
 		if (acc >= recencyFloorTokens) break;
@@ -665,11 +744,12 @@ export function totalTrimmableTokens(
 	preservedPatterns: ReadonlyArray<string> = [],
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
 		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
-		total += approximateMessageTokens(messages[i]);
+		total += approximateMessageTokens(messages[i], divisor);
 	}
 	return total;
 }
@@ -724,6 +804,8 @@ export async function applyThreeTierTrim(
 	const alreadySummarizedHashes = options.alreadySummarizedHashes ?? new Set<string>();
 	const backgroundSummarize = options.backgroundSummarize ?? false;
 	const protectedToolCallIds = options.protectedToolCallIds ?? new Set<string>();
+	const divisor = options.tokenEstimatorDivisor ?? TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
+	const systemPromptTokens = options.systemPromptTokens ?? 0;
 
 	// Compute the recency-protected slice once and thread it through
 	// every internal call. The slice is the operator's
@@ -740,38 +822,94 @@ export async function applyThreeTierTrim(
 		protectDispatch,
 		preservedPatterns,
 		protectedToolCallIds,
+		divisor,
 	);
 
-	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds);
+	// Compute the protected-slot mass once. The protected-mass
+	// sum is the token count of every message `isProtectedSlot`
+	// recognizes, with the same divisor the trimmable-mass
+	// accounting uses. Subtracting this from the raw tier caps
+	// (alongside the system-prompt term) produces the effective
+	// caps — the budget reserves space for the protected mass
+	// AND the system prompt before comparing against the
+	// trimmable mass. The protected mass is constant within a
+	// single trim pass (protected slots survive every drop /
+	// summarize pass by design).
+	let protectedMass = 0;
+	for (let i = 0; i < messages.length; i++) {
+		if (
+			isProtectedSlot(
+				messages[i],
+				i,
+				messages,
+				protectedCustomTypes,
+				protectDispatch,
+				preservedPatterns,
+				recencyProtectedIndices,
+				protectedToolCallIds,
+			)
+		) {
+			protectedMass += approximateMessageTokens(messages[i], divisor);
+		}
+	}
 
-	// Tier 3: hard-drop oldest whole turns until total ≤ summarizeMax.
-	// The "turn" is bounded by user messages: a turn is everything from
-	// one user message (exclusive of protected slots) up to (but not
-	// including) the next user message. We carve whole turns from the
+	// Effective caps: the raw tier caps minus the protected mass
+	// and the system-prompt term. The `Math.max(0, …)` guard
+	// prevents a negative cap from entering the tier comparison
+	// (which would produce `NaN` / `Infinity` from the
+	// arithmetic). When `protectedMass + systemPromptTokens ≥
+	// tierNMax` the effective cap is 0 and the tier comparison
+	// fires the drop / summarize path against the trimmable
+	// mass; the trimmer trims all trimmable content and
+	// protected slots are still protected (existing protection
+	// holds — protected slots are never trimmed). When both
+	// `systemPromptTokens` and `protectedMass` are 0 the
+	// effective caps equal the raw caps and behavior is
+	// identical to the legacy trim (AC-6 no-regression).
+	const effectiveVerbatimMax = Math.max(0, verbatimMax - systemPromptTokens - protectedMass);
+	const effectiveSummarizeMax = Math.max(0, summarizeMax - systemPromptTokens - protectedMass);
+
+	// First, decide the tier based on the trimmable total.
+	let total = totalTrimmableTokens(
+		messages,
+		protectedCustomTypes,
+		protectDispatch,
+		preservedPatterns,
+		recencyProtectedIndices,
+		protectedToolCallIds,
+		divisor,
+	);
+
+	// Tier 3: hard-drop oldest whole turns until total ≤
+	// effectiveSummarizeMax. The "turn" is bounded by user
+	// messages: a turn is everything from one user message
+	// (exclusive of protected slots) up to (but not including)
+	// the next user message. We carve whole turns from the
 	// oldest end.
-	if (total > summarizeMax) {
+	if (total > effectiveSummarizeMax) {
 		const { messages: dropped, droppedTurns, shouldFallThrough, droppedToolCallIds } = dropOldestTurns(
 			messages,
-			summarizeMax,
+			effectiveSummarizeMax,
 			protectedCustomTypes,
 			protectDispatch,
 			preservedPatterns,
 			dropFloorTokens,
 			recencyProtectedIndices,
 			protectedToolCallIds,
+			divisor,
 		);
 		// Drop-floor fall-through: when the next-oldest turn would
 		// push the trimmable total below `dropFloorTokens`, stop
 		// dropping and hand the surviving trimmable content off to
 		// the summarize path. The summarize path then trims the
 		// older half (trimmable messages OUTSIDE the recency
-		// window) down to summarizeMax — the recency slice stays
-		// intact and the drop tier never collapses the floor.
+		// window) down to effectiveSummarizeMax — the recency
+		// slice stays intact and the drop tier never collapses
+		// the floor.
 		if (shouldFallThrough) {
 			const result = await summarizeOldestUntilUnder(
 				dropped,
-				summarizeMax,
+				effectiveSummarizeMax,
 				summarizer,
 				summaWords,
 				protectedCustomTypes,
@@ -782,6 +920,7 @@ export async function applyThreeTierTrim(
 				backgroundSummarize,
 				protectedToolCallIds,
 				droppedToolCallIds,
+				divisor,
 			);
 			return {
 				messages: result.messages,
@@ -794,6 +933,7 @@ export async function applyThreeTierTrim(
 					preservedPatterns,
 					recencyProtectedIndices,
 					protectedToolCallIds,
+					divisor,
 				),
 				summarizedFingerprints: result.summarizedFingerprints,
 				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
@@ -801,18 +941,63 @@ export async function applyThreeTierTrim(
 			};
 		}
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(dropped, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds);
-		// If still over summarizeMax (a single trimmable turn is larger
-		// than the tier ceiling), summarize that turn's oldest messages
-		// as a fallback. This is the only path where summarize fires
-		// from tier 3; tier 2's summarize path is the normal one.
-		if (total > summarizeMax) {
-			const result = await summarizeOldestUntilUnder(dropped, summarizeMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize, protectedToolCallIds, droppedToolCallIds);
+		total = totalTrimmableTokens(
+			dropped,
+			protectedCustomTypes,
+			protectDispatch,
+			preservedPatterns,
+			recencyProtectedIndices,
+			protectedToolCallIds,
+			divisor,
+		);
+		// If still over effectiveSummarizeMax (a single trimmable
+		// turn is larger than the tier ceiling), summarize that
+		// turn's oldest messages as a fallback. This is the only
+		// path where summarize fires from tier 3; tier 2's
+		// summarize path is the normal one. The
+		// `recencyProtectedIndices` set is index-relative to the
+		// ORIGINAL `messages` array — after the drop pass, the
+		// recency-slice messages may have shifted indices. We
+		// recompute the slice against the post-drop `dropped`
+		// array so the recency carve-out survives the drop pass.
+		if (total > effectiveSummarizeMax) {
+			const droppedRecencyIndices = computeRecencyProtectedIndices(
+				dropped,
+				recencyFloor,
+				protectedCustomTypes,
+				protectDispatch,
+				preservedPatterns,
+				protectedToolCallIds,
+				divisor,
+			);
+			const result = await summarizeOldestUntilUnder(
+				dropped,
+				effectiveSummarizeMax,
+				summarizer,
+				summaWords,
+				protectedCustomTypes,
+				protectDispatch,
+				preservedPatterns,
+				droppedRecencyIndices,
+				alreadySummarizedHashes,
+				backgroundSummarize,
+				protectedToolCallIds,
+				droppedToolCallIds,
+				divisor,
+			);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
 				droppedTurns,
-				totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds),
+				totalTokens: totalTrimmableTokens(
+					result.messages,
+					protectedCustomTypes,
+					protectDispatch,
+					preservedPatterns,
+					droppedRecencyIndices,
+					protectedToolCallIds,
+					divisor,
+				),
 				summarizedFingerprints: result.summarizedFingerprints,
 				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
 				pendingSummaries: result.pendingSummaries,
@@ -829,14 +1014,36 @@ export async function applyThreeTierTrim(
 	}
 
 	// Tier 2: summarize oldest non-protected trimmable messages until
-	// total ≤ verbatimMax.
-	if (total > verbatimMax) {
-		const result = await summarizeOldestUntilUnder(messages, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize, protectedToolCallIds);
+	// total ≤ effectiveVerbatimMax.
+	if (total > effectiveVerbatimMax) {
+		const result = await summarizeOldestUntilUnder(
+			messages,
+			effectiveVerbatimMax,
+			summarizer,
+			summaWords,
+			protectedCustomTypes,
+			protectDispatch,
+			preservedPatterns,
+			recencyProtectedIndices,
+			alreadySummarizedHashes,
+			backgroundSummarize,
+			protectedToolCallIds,
+			new Set(),
+			divisor,
+		);
 		return {
 			messages: result.messages,
 			summarized: result.summarized,
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(result.messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds),
+			totalTokens: totalTrimmableTokens(
+				result.messages,
+				protectedCustomTypes,
+				protectDispatch,
+				preservedPatterns,
+				recencyProtectedIndices,
+				protectedToolCallIds,
+				divisor,
+			),
 			summarizedFingerprints: result.summarizedFingerprints,
 			backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
 			pendingSummaries: result.pendingSummaries,
@@ -877,6 +1084,7 @@ function dropOldestTurns(
 	dropFloorTokens: number | undefined = undefined,
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
 	// First pass: identify the trimmable turns and their token mass.
 	// A trimmable turn starts immediately after a non-dispatch user
@@ -901,20 +1109,20 @@ function dropOldestTurns(
 		if (isTurnAnchor) {
 			// Close any open trimmable turn at the previous boundary.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor));
 			}
 			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor));
 				turnStart = -1;
 			}
 		}
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
@@ -946,7 +1154,7 @@ function dropOldestTurns(
 			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
@@ -1082,11 +1290,12 @@ function makeTurn(
 	preservedPatterns: ReadonlyArray<string>,
 	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
 		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
-		tokens += approximateMessageTokens(messages[i]);
+		tokens += approximateMessageTokens(messages[i], divisor);
 	}
 	return { start, end, tokens };
 }
@@ -1140,6 +1349,7 @@ async function summarizeOldestUntilUnder(
 	backgroundSummarize: boolean = false,
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
 	droppedToolCallIdsFromDropPass: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): Promise<{
 	messages: TrimmableMessage[];
 	summarized: number;
@@ -1197,21 +1407,22 @@ async function summarizeOldestUntilUnder(
 		preservedPatterns,
 		recencyProtectedIndices,
 		protectedToolCallIds,
+		divisor,
 	);
 	while (
 		(backgroundSummarize
 			? estimatedTotal > cap
-			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds) > cap)
+			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor) > cap)
 	) {
 		// Find the oldest non-protected trimmable message at or
 		// after the cursor. Skip already-summarized by default.
-		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true, protectedToolCallIds);
+		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true, protectedToolCallIds, divisor);
 		// Escape clause: when the only candidates are already-
 		// summarized messages and the total is still over the cap,
 		// retry with the skip flag lifted so an already-summarized
 		// message gets a fresh summary rather than blocking progress.
 		if (target === -1) {
-			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false, protectedToolCallIds);
+			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false, protectedToolCallIds, divisor);
 			if (target === -1) break;
 		}
 		// Capture the ORIGINAL fingerprint before the content is
@@ -1221,7 +1432,7 @@ async function summarizeOldestUntilUnder(
 		summarizedFingerprints.push(fingerprint);
 		const msg = out[target];
 		const original = extractProseText(msg.content);
-		const originalTokens = approximateMessageTokens(msg);
+		const originalTokens = approximateMessageTokens(msg, divisor);
 		// Defensive bound: if the message is too small to benefit
 		// from summarization (summaWords ≥ originalTokens), bail
 		// rather than loop forever. Applies to both modes: in sync
@@ -1252,7 +1463,7 @@ async function summarizeOldestUntilUnder(
 				summary = original;
 			}
 			const summaryText = summary.length > 0 ? summary : original;
-			const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText });
+			const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText }, divisor);
 			// Build the rewrite. For an assistant message whose
 			// content is a `toolCall`-bearing array, the rewrite is
 			// block-level: protected `toolCall` blocks survive
@@ -1388,6 +1599,7 @@ function findOldestSummarizable(
 	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
 	skipAlreadySummarized: boolean = true,
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): number {
 	for (let i = startFrom; i < messages.length; i++) {
 		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;

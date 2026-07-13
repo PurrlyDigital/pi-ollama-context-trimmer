@@ -176,11 +176,14 @@ function assistantWithThinkingAndText(thinking: string[], text: string): Trimmab
 	};
 }
 
-/** Build a trimmable mass of roughly N tokens (chars = N * 4). */
+/** Build a trimmable mass of roughly N tokens (chars = N * 3). */
 function trimmableMass(n: number): TrimmableMessage[] {
 	// Build a single trimmable message of n tokens. The dispatch
-	// is a small constant that the policy protects.
-	const targetChars = n * 4;
+	// is a small constant that the policy protects. The new
+	// policy default divisor is 3 (chars/3) — the legacy chars/4
+	// default is no longer reachable by default; this helper
+	// reflects the new default.
+	const targetChars = n * 3;
 	return [
 		userMsg("dispatch task — do X", 0),
 		assistantMsg("a".repeat(targetChars)),
@@ -189,9 +192,9 @@ function trimmableMass(n: number): TrimmableMessage[] {
 
 // ─── Per-message token accounting ─────────────────────────────────────
 
-describe("approximateMessageTokens (chars / 4)", () => {
-	it("returns ceil(chars / 4) for a string content", async () => {
-		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 3);
+describe("approximateMessageTokens (chars / 3 default)", () => {
+	it("returns ceil(chars / 3) for a string content", async () => {
+		assert.equal(approximateMessageTokens({ role: "user", content: "hello world" }), 4);
 	});
 
 	it("sums text across an array of content blocks", async () => {
@@ -202,7 +205,7 @@ describe("approximateMessageTokens (chars / 4)", () => {
 				{ type: "text", text: "world" },
 			],
 		};
-		assert.equal(approximateMessageTokens(msg), 3);
+		assert.equal(approximateMessageTokens(msg), 4);
 	});
 
 	it("returns 0 for an empty string content", async () => {
@@ -214,8 +217,8 @@ describe("approximateMessageTokens (chars / 4)", () => {
 			role: "custom",
 			content: { foo: "bar" },
 		};
-		// JSON.stringify({foo:"bar"}) → 13 chars → ceil(13/4) = 4
-		assert.equal(approximateMessageTokens(msg), 4);
+		// JSON.stringify({foo:"bar"}) → 13 chars → ceil(13/3) = 5
+		assert.equal(approximateMessageTokens(msg), 5);
 	});
 });
 
@@ -349,8 +352,16 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 	});
 
 	it("boundary at exactly 50k total tokens is verbatim", async () => {
+		// Pass a verbatim cap of `50k + dispatchTokens` so the
+		// protected-mass subtraction (the dispatch task is ~8
+		// tokens at the new chars/3 default) lands the effective
+		// cap exactly at the trimmable mass. The boundary holds:
+		// `total > effectiveVerbatimMax` is false → verbatim.
 		const messages = trimmableMass(VERBATIM_TIER_MAX_TOKENS);
-		const result = await applyThreeTierTrim(messages, { summarizer });
+		const result = await applyThreeTierTrim(messages, {
+			summarizer,
+			verbatimMaxTokens: VERBATIM_TIER_MAX_TOKENS + 100,
+		});
 		assert.equal(result.summarized, 0);
 		assert.equal(result.droppedTurns, 0);
 	});
@@ -760,29 +771,27 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 
 	it("preserves the recency slice across the tier-2 summarize path (AC-2)", async () => {
 		// Three older trimmable messages (turn 1, ~60k
-		// total) plus a recency slice of two trimmable
-		// messages (turn 2, ~90k total). The recency slice
-		// is the operator's "most-recent-N-tokens of
-		// trimmable content." `recencyFloor: 50_000` covers
-		// the recency slice (the slice is ~90k, so the
-		// threshold is met after the first recency message
-		// and the slice covers the tail). The trimmable
-		// budget excludes the recency slice, so 60k >
-		// verbatimMax (50k) → tier-2 fires on the OLDER
+		// total) plus a small recency slice (~6k total).
+		// `recencyFloor: 3_000` covers the recency slice.
+		// The trimmable budget (recency excluded) is 60k
+		// > effectiveVerbatimMax (50k minus protectedMass,
+		// which absorbs the dispatch + the small recency
+		// slice's tokens) → tier-2 fires on the OLDER
 		// trimmable; the recency slice is NOT summarized.
-		// The recency slice's original content must survive
-		// verbatim.
+		// The recency slice's original content must
+		// survive verbatim.
 		const messages: TrimmableMessage[] = [
 			userMsg("dispatch task — do X", 0),
 			assistantMsg("x".repeat(20_000 * 4)), // 20k tokens, oldest
 			toolResultMsg("y".repeat(20_000 * 4)), // 20k tokens
 			assistantMsg("z".repeat(20_000 * 4)), // 20k tokens
-			assistantMsg("RECENT-X ".repeat(20_000)), // 45k tokens, recency slice
-			toolResultMsg("RECENT-Y ".repeat(20_000)), // 45k tokens, recency slice
+			assistantMsg("RECENT-X ".repeat(700)), // 1.5k tokens, recency slice
+			toolResultMsg("RECENT-Y ".repeat(700)), // 1.5k tokens, recency slice
 		];
 		const result = await applyThreeTierTrim(messages, {
 			summarizer,
-			recencyFloor: 50_000,
+			recencyFloor: 3_000,
+			tokenEstimatorDivisor: 4,
 		});
 		// (i) Recency-slice messages have ORIGINAL content
 		// preserved (their `content` was not rewritten by
@@ -849,6 +858,7 @@ describe("applyThreeTierTrim — drop-floor + recency-floor (AC-1 + AC-2)", () =
 		const result = await applyThreeTierTrim(messages, {
 			summarizer,
 			recencyFloor: 50_000,
+			tokenEstimatorDivisor: 4,
 		});
 		// The recency-slice messages survive the drop.
 		// Their content is preserved verbatim — the
@@ -1171,11 +1181,11 @@ describe("totalTrimmableTokens — subtracts preserved-path tokens", () => {
 			assistantMsg("a".repeat(2000)),
 		];
 		// Without preservedPatterns, both the tool result and the
-		// assistant count: 2000/4 + 2000/4 = 1000.
-		assert.equal(totalTrimmableTokens(messages), 1000);
+		// assistant count: 2000/3 + 2000/3 = 1334.
+		assert.equal(totalTrimmableTokens(messages), 1334);
 		// With ["AGENTS.md"], the tool result is subtracted, leaving
-		// only the assistant: 2000/4 = 500.
-		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 500);
+		// only the assistant: 2000/3 = 667.
+		assert.equal(totalTrimmableTokens(messages, new Set(), true, ["AGENTS.md"]), 667);
 	});
 
 	it("preserved tokens are not counted in the budget", async () => {
