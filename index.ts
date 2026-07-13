@@ -55,10 +55,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
 	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
+	approximateTextTokens,
 	computeFlatInputTokenSignal,
 	dedupSubagentNotify,
 	detectConsecutiveIdenticalToolCalls,
@@ -471,6 +473,41 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	pi.on("context", async (event, ctx) => {
 		// Read the current message stream.
 		const rawMessages = (event.messages ?? []) as unknown as ReadonlyArray<Record<string, unknown>>;
+		// Capture the fully assembled system prompt the LLM will see
+		// for this turn, then approximate its token count using the
+		// same text-level estimator the policy uses for message
+		// tokens (so the trimmer's view of the system prompt and its
+		// view of the messages are on the same scale). The
+		// `getSystemPrompt()` guard mirrors the existing
+		// `ctx?.hasUI` optional-chaining pattern: when the method is
+		// absent (test mocks pass `{}` as `ctx`, where `hasUI` is
+		// `undefined`; same shape for `getSystemPrompt`), the string
+		// defaults to `""` and the token count is 0 — no crash, no
+		// NaN. The harness-derived value threads into
+		// `applyThreeTierTrim` as the new `systemPromptTokens` field
+		// (AC-2, AC-5 — purity contract holds: the policy never
+		// reads `ctx` or `getSystemPrompt`).
+		const systemPromptString = typeof (ctx as { getSystemPrompt?: unknown } | null | undefined)?.getSystemPrompt === "function"
+			? (ctx as { getSystemPrompt: () => string }).getSystemPrompt()
+			: "";
+		// Resolve the operator-configured estimator divisor. `cfg.tokenEstimatorDivisor`
+		// is `undefined` when the operator did not set the env var or
+		// JSON key; the wiring layer applies the policy's
+		// compile-time default `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`
+		// (AC-3, AC-4). The `Math.trunc` integer coercion matches
+		// the `summaWords` / `recencyFloor` precedent in this file:
+		// `isPositiveNumber` accepts floats, so a fractional JSON
+		// value (e.g. `3.5`) would survive validation; `Math.trunc`
+		// enforces the integer contract the policy expects. NaN
+		// cannot arrive from the validated channels (`isPositiveNumber`
+		// rejects NaN), so the `??` fallback is unreachable for
+		// NaN. The resolved divisor is reused at the
+		// `applyThreeTierTrim` call site AND the two
+		// `approximateMessageTokens` call sites in the
+		// background-promise `.then()` — hoisted to a single const.
+		const tokenEstimatorDivisor =
+			cfg.tokenEstimatorDivisor !== undefined ? Math.trunc(cfg.tokenEstimatorDivisor) : TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
+		const systemPromptTokens = approximateTextTokens(systemPromptString, tokenEstimatorDivisor);
 		// Stamp userTurnAge on every message. The stamp is the source
 		// of truth for the dispatch-task protection; we pass the
 		// minimum shape (role) to the stampee and use the original
@@ -731,6 +768,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			preservedPatterns: expandedPreservedPatterns,
 			alreadySummarizedHashes: summarizedFingerprints,
 			protectedToolCallIds,
+			tokenEstimatorDivisor,
+			systemPromptTokens,
 		});
 		if (!backgroundMode && ctx?.hasUI) {
 			ctx.ui.setStatus("context-trimmer", undefined);
@@ -754,8 +793,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			for (const pending of result.pendingSummaries) {
 				pending.promise
 					.then((summaryText) => {
-						const originalTokens = approximateMessageTokens(pending.originalMessage);
-						const summaryTokens = approximateMessageTokens({ ...pending.originalMessage, content: summaryText });
+						const originalTokens = approximateMessageTokens(pending.originalMessage, tokenEstimatorDivisor);
+						const summaryTokens = approximateMessageTokens({ ...pending.originalMessage, content: summaryText }, tokenEstimatorDivisor);
 						const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
 						const summarized: TrimmableMessage = {
 							...pending.originalMessage,
