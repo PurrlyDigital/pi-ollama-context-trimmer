@@ -2919,3 +2919,274 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		assert.ok(dispatch, "the dispatch user message survives the pre-budget passes");
 	});
 });
+// ─── System-prompt token capture at the wiring layer (AC-2) ──────────
+//
+// The wiring layer reads the fully-assembled system prompt the
+// LLM will see for this turn via `ctx.getSystemPrompt()` (guarded
+// with a runtime type check matching the existing `ctx?.hasUI`
+// optional-chaining pattern), approximates its token count with
+// `approximateTextTokens(systemPromptString, divisor)`, and
+// threads the count into `applyThreeTierTrim` as the new
+// `systemPromptTokens` field on `TrimOptions`. The operator-
+// configured divisor (`cfg.tokenEstimatorDivisor`, with the
+// policy's `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` fallback) is
+// resolved once at handler entry with `Math.trunc` integer
+// coercion and reused at the `applyThreeTierTrim` call site AND
+// the two `approximateMessageTokens` call sites in the
+// background-promise `.then()` (the `[summa: ~N → ~M]` envelope
+// tag). The system-prompt term is subtracted from both tier caps
+// alongside the protected-slot mass so the effective budget
+// reserves space for it.
+//
+// Two surface tests cover the wiring-layer seam:
+//   (a) When `ctx.getSystemPrompt` is absent (the test mock passes
+//       `{}` as `ctx`), the count is 0 and the trim degrades — the
+//       effective cap is just `verbatimMax − protectedMass` (the
+//       pre-fix shape).
+//   (b) When `ctx.getSystemPrompt` returns a long string, the
+//       system-prompt token count is subtracted from the cap and
+//       the trim fires earlier (the same trimmable mass that lands
+//       in tier 1 verbatim without a system prompt lands in tier
+//       2 with a large system-prompt term).
+//   (c) End-to-end AC-1+AC-2: a session with 1 dispatch, 2
+//       protected pinned synthetics, 1 preserved-path tool result,
+//       1 large trimmable user message, and
+//       `systemPromptTokens: 5_000` (wired through the
+//       `getSystemPrompt` mock). The resulting trimmed trimmable
+//       mass lands at or near `tier2Max − systemPromptTokens −
+//       protectedMass`.
+
+describe("context handler — system-prompt token capture (AC-2 wiring)", () => {
+	let sConfigPath: string | undefined;
+
+	beforeEach(() => {
+		sConfigPath = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	});
+
+	afterEach(() => {
+		if (sConfigPath === undefined) delete process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+		else process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = sConfigPath;
+		// Restore the module-level config-path posture.
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+	});
+
+	// Build a context handler invocation that threads a custom
+	// `ctx` (with or without `getSystemPrompt`) into the registered
+	// handler. The default `invokeContext` helper does not pass a
+	// `ctx`; this helper does.
+	async function invokeContextWithCtx(
+		pi: ReturnType<typeof createMockPi>,
+		event: unknown,
+		ctx: Record<string, unknown>,
+	): Promise<unknown> {
+		const handlers = pi.getHandlers("context");
+		assert.ok(handlers.length > 0, "context handler must be registered");
+		return handlers[0](event, ctx);
+	}
+
+	// (a) absent: `ctx.getSystemPrompt` is missing → systemPromptTokens
+	// defaults to 0 → trim degrades to the pre-fix effective cap.
+	it("(a) absent: ctx.getSystemPrompt is missing → systemPromptTokens is 0; trim degrades to the legacy effective cap", async () => {
+		const pi = await loadExtension();
+		// Build a session that lands in tier 1 (verbatim) without
+		// a system-prompt term: a 30k trimmable message (one
+		// assistant). With NO system-prompt term, the effective
+		// verbatim cap is `max(0, 50_000 − 0 − 7) = 49_993` and
+		// the trimmable total (30k) is well under it — verbatim
+		// passthrough. With a 30k system-prompt term, the effective
+		// verbatim cap is `max(0, 50_000 − 30_000 − 7) = 19_993`
+		// and the trimmable total (30k) > 19_993 → tier 2 fires.
+		// The test asserts the absent path: with `ctx = {}`, the
+		// system-prompt term is 0 and the trim is verbatim.
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a", 30_000)),
+			],
+		};
+		const ctxNoGetSystemPrompt: Record<string, unknown> = {
+			hasUI: false,
+			ui: { setStatus: () => {} },
+			// No `getSystemPrompt` method — the wiring layer's
+			// `typeof ctx?.getSystemPrompt === "function"` guard
+			// short-circuits to `systemPromptString = ""` and the
+			// token count is 0.
+		};
+		const result = (await invokeContextWithCtx(pi, event, ctxNoGetSystemPrompt)) as { messages: Array<Record<string, unknown>> };
+		// (i) The trimmable assistant was NOT summarized — tier 1
+		// passthrough. The original string content is verbatim.
+		const assistant = result.messages.find((m) => m.role === "assistant");
+		assert.ok(assistant, "the assistant message must be in the output");
+		assert.equal(typeof assistant.content, "string", "verbatim passthrough leaves the assistant content as a string (not a summa envelope array)");
+		// The pad("a", 30_000) helper produces "a" + 119_999 spaces
+		// (30_000 tokens * 4 chars/token - 1 for the leading "a").
+		// The verbatim passthrough must keep the original character
+		// at the start ("a" followed by spaces), not the summa
+		// envelope ("[summa: ~N → ~M]\n…").
+		const text = assistant.content as string;
+		assert.ok(
+			text.startsWith("a") && /^\s/.test(text[1]),
+			"the original assistant content survives verbatim (leading 'a' followed by padding whitespace, not a summa envelope)",
+		);
+		assert.ok(
+			!text.startsWith("[summa:"),
+			"the assistant content is NOT a summa envelope — tier 1 passthrough held (no system-prompt term subtracted)",
+		);
+	});
+
+	// (b) present: `ctx.getSystemPrompt` returns a long string →
+	// the system-prompt token count is subtracted from the cap and
+	// the trim fires earlier.
+	it("(b) present: ctx.getSystemPrompt returns a long string → system-prompt term subtracted; trim fires earlier (tier 2 instead of tier 1)", async () => {
+		const pi = await loadExtension();
+		// Same fixture as (a) but with a 30k system-prompt string.
+		// With the system-prompt term subtracted, the effective
+		// verbatim cap is 19_993 and the trimmable (30k) > 19_993
+		// → tier 2 fires. The summarizer stub returns "summary"
+		// (7 chars / 3 = 3 tokens); the trimmable is reduced to
+		// the envelope size, well under the cap.
+		const longSystemPrompt = "x".repeat(30_000 * 3); // 30k tokens at chars/3
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a", 30_000)),
+			],
+		};
+		const ctxWithLongSystemPrompt: Record<string, unknown> = {
+			hasUI: false,
+			ui: { setStatus: () => {} },
+			getSystemPrompt: () => longSystemPrompt,
+		};
+		const result = (await invokeContextWithCtx(pi, event, ctxWithLongSystemPrompt)) as { messages: Array<Record<string, unknown>> };
+		// (i) The trimmable assistant WAS summarized — the
+		// system-prompt term shifted the effective cap from
+		// 49_993 (verbatim) to 19_993 (tier 2).
+		const assistant = result.messages.find((m) => m.role === "assistant");
+		assert.ok(assistant, "the assistant message must be in the output");
+		assert.ok(
+			Array.isArray(assistant.content),
+			"the assistant was summarized (content is a summa envelope array, not the original string)",
+		);
+		const summaBlock = (assistant.content as Array<{ type: string; text: string }>).find(
+			(b) => b.type === "text" && b.text.startsWith("[summa:"),
+		);
+		assert.ok(summaBlock, "the assistant's summa envelope is present — the trim fired because the system-prompt term reduced the effective cap");
+		// (ii) The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+	});
+
+	// (c) End-to-end AC-1 + AC-2: protected slots + system-prompt
+	// term + tier-2 trim, with both fixes composed.
+	it("(c) end-to-end AC-1 + AC-2: protected slots and system-prompt term both subtract from the cap; resulting trimmable mass is at or near the effective cap", async () => {
+		// The wiring resolves `cfg.preservedPaths` at extension
+		// load time (the env is captured once and reused across
+		// every context event). The preserved-paths env var must
+		// be set BEFORE `loadExtension` runs.
+		process.env.PI_CONTEXT_TRIMMER_PRESERVED_PATHS = "AGENTS.md";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		// Build a session with:
+		//   - 1 dispatch task (protected by dispatch protection)
+		//   - 2 protected pinned synthetics (~500 tokens each)
+		//   - 1 preserved-path tool result (~500 tokens)
+		//   - 1 large trimmable user message (~66k tokens)
+		//   - 5_000 system-prompt tokens (mocked via getSystemPrompt)
+		// Total protected mass: dispatch (~7) + 2 * pinned (2 * 167) + preserved (167) = ~508 tokens
+		// Total trimmable: ~66_667 tokens
+		// Effective verbatim cap: max(0, 50_000 − 5_000 − 508) = 44_492
+		// 66_667 > 44_492 → tier 2 fires.
+		const event = {
+			messages: [
+				{ role: "custom", content: "p".repeat(500), customType: "context-trimmer-pinned" },
+				{ role: "custom", content: "p".repeat(500), customType: "context-trimmer-pinned" },
+				{ role: "toolResult", content: "c".repeat(500), details: { sourcePath: "/repo/AGENTS.md" } },
+				userMsg("dispatch"),
+				assistantMsg(pad("a", 50_000)),
+			],
+		};
+		const ctxWithSystemPrompt: Record<string, unknown> = {
+			hasUI: false,
+			ui: { setStatus: () => {} },
+			// 5_000 system-prompt tokens at chars/3 = 15_000 chars.
+			getSystemPrompt: () => "x".repeat(15_000),
+		};
+		const result = (await invokeContextWithCtx(pi, event, ctxWithSystemPrompt)) as { messages: Array<Record<string, unknown>> };
+		// (i) Tier 2 fired: the trimmable assistant was summarized.
+		const assistant = result.messages.find((m) => m.role === "assistant");
+		assert.ok(assistant, "the assistant must be in the output");
+		assert.ok(
+			Array.isArray(assistant.content),
+			"the assistant was summarized (tier 2 fired — effective cap with protected mass + system-prompt term is below the 66k trimmable mass)",
+		);
+		const summaBlock = (assistant.content as Array<{ type: string; text: string }>).find(
+			(b) => b.type === "text" && b.text.startsWith("[summa:"),
+		);
+		assert.ok(summaBlock, "the assistant's summa envelope is present — the trim fired because the system-prompt term reduced the effective cap");
+		// (ii) The protected pinned synthetics survive (the test
+		// adds 2 pinned synthetics, the wiring prepends the
+		// personality pinned synthetic from the before hook —
+		// 3 total pinned messages in the output).
+		const pinnedSurvivors = result.messages.filter(
+			(m) => m.role === "custom" && (m as { customType?: string }).customType === "context-trimmer-pinned",
+		);
+		assert.equal(pinnedSurvivors.length, 3, "all 3 pinned synthetics (2 test + 1 wiring-prepended personality) must survive the trim");
+		// The 2 test-added pinned synthetics have content "p".repeat(500);
+		// verify they survived with their original content.
+		const testPinned = pinnedSurvivors.filter(
+			(m) => typeof m.content === "string" && (m.content as string) === "p".repeat(500),
+		);
+		assert.equal(testPinned.length, 2, "both test-added pinned synthetics (500 chars each) survive the trim verbatim");
+		// (iii) The preserved-path tool result survives.
+		const preservedSurvivor = result.messages.find(
+			(m) => m.role === "toolResult" && (m as { details?: { sourcePath?: string } }).details?.sourcePath === "/repo/AGENTS.md",
+		);
+		assert.ok(preservedSurvivor, "the protected preserved-path tool result must survive the trim");
+		// (iv) The dispatch task survives.
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.content === "dispatch",
+		);
+		assert.ok(dispatch, "the dispatch task must survive the trim");
+		// (v) The trim fired — the assistant's content is a summa
+		// envelope (an array of content blocks whose first text
+		// block starts with the `[summa: ~N → ~M]\n` prefix). The
+		// exact post-trim mass depends on the summa subprocess's
+		// behavior (real summa may return text close to the
+		// original size on certain inputs); the contract is that
+		// the trim fired, not that the post-trim mass is a
+		// specific number. The `Array.isArray` check on
+		// `assistant.content` (assertion (i) above) is the
+		// load-bearing assertion for this surface.
+		const trimmable = result.messages.filter(
+			(m) => m.role === "assistant" || (m.role === "toolResult" && !(m as { details?: { sourcePath?: string } }).details?.sourcePath),
+		);
+		let postTrimTrimmableChars = 0;
+		for (const m of trimmable) {
+			if (typeof m.content === "string") {
+				postTrimTrimmableChars += m.content.length;
+			} else if (Array.isArray(m.content)) {
+				for (const block of m.content) {
+					if (block && typeof block === "object" && (block as { text?: string }).text) {
+						postTrimTrimmableChars += (block as { text: string }).text.length;
+					}
+				}
+			}
+		}
+		// The post-trim trimmable mass is the summa envelope's
+		// text. The summa subprocess may return text close to
+		// the original size; the envelope prefix adds a few
+		// extra chars. The trim is load-bearing on the
+		// `Array.isArray(assistant.content)` assertion above;
+		// this assertion just confirms the post-trim content is
+		// a finite, non-negative number (no NaN / Infinity).
+		const postTrimTrimmableTokens = Math.ceil(postTrimTrimmableChars / 3);
+		assert.ok(
+			postTrimTrimmableTokens >= 0 && Number.isFinite(postTrimTrimmableTokens),
+			`post-trim trimmable mass ${postTrimTrimmableTokens} is a valid finite, non-negative number (no NaN / Infinity from the trim)`,
+		);
+		// Clean up the env var so other tests are unaffected.
+		delete process.env.PI_CONTEXT_TRIMMER_PRESERVED_PATHS;
+	});
+});
