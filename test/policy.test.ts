@@ -10,10 +10,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+	applyIntercomKeepLast,
 	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	countReasoningBlocks,
+	dedupSubagentNotify,
 	extractReasoningText,
 	extractText,
 	fingerprintToolCall,
@@ -21,6 +23,7 @@ import {
 	detectConsecutiveIdenticalToolCalls,
 	computeFlatInputTokenSignal,
 	hasReasoning,
+	keepLatestSubagentToolResult,
 	REASONING_BLOCK_CAP_DEFAULT,
 	shouldHardBlock,
 	FLAT_INPUT_TOKEN_TOLERANCE,
@@ -2709,5 +2712,514 @@ describe("applyThreeTierTrim — tier-3 summarize-fallback targets summarizeMax"
 			),
 		);
 		assert.ok(survivor, "the already-summarized message survives the trim path");
+	});
+});
+
+// ─── Pre-budget collapse — applyIntercomKeepLast (AC-2) ─────────────
+//
+// `applyIntercomKeepLast` is the Rule 1 pre-budget collapse for
+// `intercom_message` custom entries. Recency hardtrim: keep the last
+// N by stream order, drop the rest. Cap semantics:
+//   keepLast === -1  → passthrough (no allocation when the input is
+//                      large; the policy returns `messages.slice()`).
+//   keepLast ===  0  → drop every intercom_message entry.
+//   keepLast  >  0   → keep the last `keepLast` entries.
+// Pure: no I/O, no `process.*`; the wiring layer coerces floats with
+// `Math.trunc` (summaWords precedent) and gates by the
+// `resolveIntercomInstalled` extension probe.
+
+function intercomMsg(text: string, customType = "intercom_message"): TrimmableMessage {
+	return { role: "custom", content: text, customType };
+}
+
+function customMsg(text: string, customType: string): TrimmableMessage {
+	return { role: "custom", content: text, customType };
+}
+
+describe("applyIntercomKeepLast", () => {
+	// ── cap === -1 (passthrough) ──────────────────────────────────
+
+	it("keepLast === -1: returns the input unchanged (passthrough)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			intercomMsg("first"),
+			assistantMsg("hi"),
+			intercomMsg("second"),
+			intercomMsg("third"),
+		];
+		const out = applyIntercomKeepLast(messages, -1);
+		assert.equal(out.length, messages.length);
+		for (let i = 0; i < out.length; i++) {
+			assert.equal(out[i], messages[i], `message ${i} preserved at keepLast=-1`);
+		}
+	});
+
+	// ── cap === 0 (drop all) ─────────────────────────────────────
+
+	it("keepLast === 0: drops every intercom_message entry; non-intercom entries preserved", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			intercomMsg("first"),
+			assistantMsg("hi"),
+			intercomMsg("second"),
+			intercomMsg("third"),
+			{ role: "toolResult", content: "ok" },
+		];
+		const out = applyIntercomKeepLast(messages, 0);
+		assert.equal(out.length, 3, "every intercom_message is dropped (dispatch + assistant + toolResult survive)");
+		assert.equal((out[0] as TrimmableMessage).role, "user");
+		assert.equal((out[1] as TrimmableMessage).role, "assistant");
+		assert.equal((out[2] as TrimmableMessage).role, "toolResult");
+		// No `customType: "intercom_message"` survives.
+		for (const m of out) {
+			assert.notEqual((m as TrimmableMessage).customType, "intercom_message");
+		}
+	});
+
+	// ── cap === 1 (keep last) ────────────────────────────────────
+
+	it("keepLast === 1: only the LAST intercom_message survives; all earlier ones dropped", async () => {
+		const messages: TrimmableMessage[] = [
+			intercomMsg("first"),
+			assistantMsg("hi"),
+			intercomMsg("second"),
+			intercomMsg("third"),
+		];
+		const out = applyIntercomKeepLast(messages, 1);
+		assert.equal(out.length, 2, "dispatch + 1 surviving intercom (second assistant + last intercom)");
+		assert.equal((out[0] as TrimmableMessage).role, "assistant");
+		assert.equal((out[1] as TrimmableMessage).customType, "intercom_message");
+		assert.equal((out[1] as TrimmableMessage).content, "third", "the LAST intercom_message by stream order survives");
+	});
+
+	// ── cap === 3 (keep last 3) ─────────────────────────────────
+
+	it("keepLast === 3: the last 3 intercom_message entries survive (of 5 total)", async () => {
+		const messages: TrimmableMessage[] = [
+			intercomMsg("m1"),
+			intercomMsg("m2"),
+			intercomMsg("m3"),
+			intercomMsg("m4"),
+			intercomMsg("m5"),
+		];
+		const out = applyIntercomKeepLast(messages, 3);
+		assert.equal(out.length, 3);
+		assert.deepEqual(
+			out.map((m) => (m as TrimmableMessage).content),
+			["m3", "m4", "m5"],
+			"the last 3 intercom_message entries by stream order survive (m1 and m2 are dropped)",
+		);
+	});
+
+	// ── cap > total: no over-drop (cap is a count, not a floor) ──
+
+	it("keepLast > total intercom_message entries: every entry survives (no over-drop)", async () => {
+		const messages: TrimmableMessage[] = [
+			intercomMsg("m1"),
+			intercomMsg("m2"),
+		];
+		const out = applyIntercomKeepLast(messages, 10);
+		assert.equal(out.length, 2, "all entries survive when cap > total");
+	});
+
+	// ── mixed stream: non-intercom custom entries untouched ──────
+
+	it("preserves non-intercom_message custom entries (subagent-notify, pinned, preserved)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			intercomMsg("icm-1"),
+			customMsg("notify-1", "subagent-notify"),
+			intercomMsg("icm-2"),
+			pinnedMsg("agent def"),
+			customMsg("preserved-1", "context-trimmer-preserved"),
+			intercomMsg("icm-3"),
+		];
+		const out = applyIntercomKeepLast(messages, 1);
+		// Surviving: dispatch + subagent-notify + pinned + preserved + last intercom = 5.
+		assert.equal(out.length, 5);
+		const customTypes = out
+			.map((m) => (m as TrimmableMessage).customType)
+			.filter((ct) => ct !== undefined);
+		assert.deepEqual(customTypes, [
+			"subagent-notify",
+			"context-trimmer-pinned",
+			"context-trimmer-preserved",
+			"intercom_message",
+		], "non-intercom custom entries survive in stream order");
+		assert.equal(out[out.length - 1].content, "icm-3", "the LAST intercom_message by stream order survives");
+	});
+
+	// ── no intercom_message entries: pure passthrough ───────────
+
+	it("messages with no intercom_message entries: input returned unchanged (no scan overhead when not present)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("hi"),
+			{ role: "toolResult", content: "ok" },
+		];
+		for (const keepLast of [-1, 0, 1, 5]) {
+			const out = applyIntercomKeepLast(messages, keepLast);
+			assert.equal(out.length, messages.length, `length preserved at keepLast=${keepLast}`);
+			for (let i = 0; i < out.length; i++) {
+				assert.equal(out[i], messages[i], `message ${i} preserved at keepLast=${keepLast}`);
+			}
+		}
+	});
+
+	// ── immutability: the input array is not mutated ──────────────
+
+	it("does not mutate the input messages array", async () => {
+		const messages: TrimmableMessage[] = [
+			intercomMsg("a"),
+			intercomMsg("b"),
+			intercomMsg("c"),
+		];
+		const snapshot = JSON.stringify(messages);
+		applyIntercomKeepLast(messages, 1);
+		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated");
+	});
+
+	// ── purity: function source has no process.* or I/O ──────────
+
+	it("purity: applyIntercomKeepLast source has no process.*, node:fs, node:os, or other I/O", async () => {
+		const src = applyIntercomKeepLast.toString();
+		assert.ok(!src.includes("process."), "applyIntercomKeepLast must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "applyIntercomKeepLast must not import node:fs");
+		assert.ok(!src.includes("node:os"), "applyIntercomKeepLast must not import node:os");
+		assert.ok(!src.includes("fetch("), "applyIntercomKeepLast must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "applyIntercomKeepLast must not perform filesystem I/O");
+	});
+});
+
+// ─── Pre-budget collapse — dedupSubagentNotify (AC-4) ─────────────
+//
+// `dedupSubagentNotify` is the Rule 2 pre-budget collapse for
+// `subagent-notify` custom entries. Keep the first occurrence of
+// each run identity in stream order; drop every subsequent duplicate.
+// No knob — duplicates are always noise.
+//
+// Run identity: `details.sessionValue` when present (the
+// per-run-stable session file / share URL), else a deterministic
+// fingerprint of `details` (`agent` + `status` + `resultPreview` +
+// `taskInfo`). Entries with neither signal fall back to the stream
+// index and are not deduped.
+
+function notifyMsg(label: string, runId: string): TrimmableMessage {
+	return {
+		role: "custom",
+		content: label,
+		customType: "subagent-notify",
+		details: { sessionValue: runId, agent: "tester", status: "completed" },
+	};
+}
+
+function notifyWithAgent(label: string, agent: string, status: string, resultPreview: string): TrimmableMessage {
+	return {
+		role: "custom",
+		content: label,
+		customType: "subagent-notify",
+		details: { agent, status, resultPreview, taskInfo: { id: "task-1" } },
+	};
+}
+
+describe("dedupSubagentNotify", () => {
+	it("keeps the first occurrence of each run identity; drops subsequent duplicates", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			notifyMsg("first-run-1", "run-1"),
+			assistantMsg("hi"),
+			// Redelivery of run-1 (same sessionValue) — must be dropped.
+			notifyMsg("redeliver-run-1", "run-1"),
+			notifyMsg("first-run-2", "run-2"),
+			// Redelivery of run-2 — must be dropped.
+			notifyMsg("redeliver-run-2", "run-2"),
+			notifyMsg("first-run-3", "run-3"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 5, "2 duplicates dropped (run-1 redelivery, run-2 redelivery)");
+		const notifyEntries = out.filter((m) => m.customType === "subagent-notify");
+		assert.equal(notifyEntries.length, 3);
+		assert.deepEqual(
+			notifyEntries.map((m) => m.content),
+			["first-run-1", "first-run-2", "first-run-3"],
+			"the first occurrence of each run identity survives",
+		);
+	});
+
+	it("preserves non-subagent-notify custom entries (intercom_message, pinned, preserved)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("n1", "run-1"),
+			intercomMsg("icm"),
+			notifyMsg("n1-dup", "run-1"),
+			pinnedMsg("agent def"),
+			notifyMsg("n2", "run-2"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 4, "the duplicate subagent-notify is dropped; other entries survive");
+		const roles = out.map((m) => m.role);
+		assert.deepEqual(roles, ["custom", "custom", "custom", "custom"]);
+		const customTypes = out.map((m) => m.customType);
+		assert.deepEqual(customTypes, [
+			"subagent-notify",
+			"intercom_message",
+			"context-trimmer-pinned",
+			"subagent-notify",
+		]);
+	});
+
+	it("no duplicates: input returned unchanged", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("n1", "run-1"),
+			notifyMsg("n2", "run-2"),
+			notifyMsg("n3", "run-3"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 3, "no duplicates → all entries survive");
+	});
+
+	it("run identity via details fingerprint when sessionValue is absent", async () => {
+		// Two entries with the same `agent` + `status` + `resultPreview`
+		// + `taskInfo` and no `sessionValue`. The fingerprint-based
+		// run identity collapses them to one (the second is a
+		// redelivery).
+		const messages: TrimmableMessage[] = [
+			notifyWithAgent("first", "tester", "completed", "result-A"),
+			notifyWithAgent("second-redeliver", "tester", "completed", "result-A"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 1, "fingerprint-based identity collapses the redelivery");
+		assert.equal(out[0].content, "first");
+	});
+
+	it("distinct fingerprints: each entry is a distinct run", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyWithAgent("a", "tester", "completed", "result-A"),
+			notifyWithAgent("b", "tester", "completed", "result-B"),
+			notifyWithAgent("c", "tester", "failed", "result-A"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 3, "distinct fingerprints → all entries survive");
+	});
+
+	it("entry with no `details` payload: index-fallback identity, treated as distinct runs", async () => {
+		// Two entries with the same customType but no `details` (and
+		// therefore no `sessionValue` and no fingerprint). The
+		// index-fallback path makes each a distinct run — the second
+		// is NOT dropped (no identity collision to dedup against).
+		const m1: TrimmableMessage = { role: "custom", content: "x", customType: "subagent-notify" };
+		const m2: TrimmableMessage = { role: "custom", content: "y", customType: "subagent-notify" };
+		const out = dedupSubagentNotify([m1, m2]);
+		assert.equal(out.length, 2, "index-fallback identity treats each entry as a distinct run");
+	});
+
+	it("first-occurrence retention preserves temporal order (the first delivery is the one the model already saw)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("first", "run-1"),
+			notifyMsg("second", "run-1"),
+			notifyMsg("third", "run-1"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 1);
+		assert.equal(out[0].content, "first", "the FIRST occurrence is the one that survives (not the latest)");
+	});
+
+	it("does not mutate the input messages array", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("a", "run-1"),
+			notifyMsg("a-dup", "run-1"),
+		];
+		const snapshot = JSON.stringify(messages);
+		dedupSubagentNotify(messages);
+		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated");
+	});
+
+	it("purity: dedupSubagentNotify source has no process.*, node:fs, node:os, or other I/O", async () => {
+		const src = dedupSubagentNotify.toString();
+		assert.ok(!src.includes("process."), "dedupSubagentNotify must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "dedupSubagentNotify must not import node:fs");
+		assert.ok(!src.includes("node:os"), "dedupSubagentNotify must not import node:os");
+		assert.ok(!src.includes("fetch("), "dedupSubagentNotify must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "dedupSubagentNotify must not perform filesystem I/O");
+	});
+});
+
+// ─── Pre-budget collapse — keepLatestSubagentToolResult (AC-5) ────
+//
+// `keepLatestSubagentToolResult` is the Rule 3 pre-budget collapse
+// for `toolResult:subagent` entries. Drop every such entry except
+// the LAST one (by stream order). No knob — prior subagent tool
+// results are not needed once a newer one exists. Identification:
+// `role === "toolResult" && toolName === "subagent"`.
+
+function subagentToolResult(text: string): TrimmableMessage {
+	return { role: "toolResult", content: text, toolName: "subagent" } as TrimmableMessage;
+}
+
+function nonSubagentToolResult(text: string): TrimmableMessage {
+	return { role: "toolResult", content: text, toolName: "bash" } as TrimmableMessage;
+}
+
+describe("keepLatestSubagentToolResult", () => {
+	it("keeps only the LATEST toolResult:subagent entry; all earlier ones dropped", async () => {
+		const messages: TrimmableMessage[] = [
+			subagentToolResult("result-1"),
+			subagentToolResult("result-2"),
+			subagentToolResult("result-3"),
+		];
+		const out = keepLatestSubagentToolResult(messages);
+		assert.equal(out.length, 1);
+		assert.equal(out[0].content, "result-3", "only the LATEST toolResult:subagent survives");
+	});
+
+	it("preserves non-subagent toolResult entries (e.g. toolResult:bash)", async () => {
+		const messages: TrimmableMessage[] = [
+			subagentToolResult("sub-1"),
+			nonSubagentToolResult("bash-1"),
+			subagentToolResult("sub-2"),
+			nonSubagentToolResult("bash-2"),
+			subagentToolResult("sub-3"),
+		];
+		const out = keepLatestSubagentToolResult(messages);
+		// Surviving: bash-1, bash-2, sub-3 (the latest subagent tool result).
+		assert.equal(out.length, 3);
+		const toolNames = out.map((m) => (m as TrimmableMessage & { toolName?: string }).toolName);
+		assert.deepEqual(toolNames, ["bash", "bash", "subagent"]);
+		assert.equal(out[2].content, "sub-3", "the latest subagent tool result by stream order is the one that survives");
+	});
+
+	it("single toolResult:subagent entry: passthrough", async () => {
+		const messages: TrimmableMessage[] = [subagentToolResult("only")];
+		const out = keepLatestSubagentToolResult(messages);
+		assert.equal(out.length, 1);
+		assert.equal(out[0].content, "only");
+	});
+
+	it("zero toolResult:subagent entries: passthrough (all entries preserved)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("hi"),
+			nonSubagentToolResult("bash-1"),
+		];
+		const out = keepLatestSubagentToolResult(messages);
+		assert.equal(out.length, 3);
+		for (let i = 0; i < out.length; i++) {
+			assert.equal(out[i], messages[i], `message ${i} preserved`);
+		}
+	});
+
+	it("empty input: returns an empty array", async () => {
+		const out = keepLatestSubagentToolResult([]);
+		assert.equal(out.length, 0);
+	});
+
+	it("mixed stream: subagent-notify and intercom_message entries untouched", async () => {
+		const messages: TrimmableMessage[] = [
+			intercomMsg("icm-1"),
+			subagentToolResult("sub-1"),
+			notifyMsg("n1", "run-1"),
+			subagentToolResult("sub-2"),
+			notifyMsg("n1-dup", "run-1"),
+		];
+		const out = keepLatestSubagentToolResult(messages);
+		// After Rule 3: icm-1, n1, sub-2 (latest subagent), n1-dup.
+		// (Rule 2 is the wiring layer's job, not Rule 3's — Rule 3
+		// drops subagent tool results; the duplicate notify survives
+		// this pass and would be deduped by Rule 2 earlier in the
+		// pipeline. The composition test below pins the
+		// pipeline-order behavior.)
+		assert.equal(out.length, 4);
+		const subagentToolResults = out.filter((m) => (m as TrimmableMessage & { toolName?: string }).toolName === "subagent");
+		assert.equal(subagentToolResults.length, 1, "exactly one toolResult:subagent survives");
+		assert.equal(subagentToolResults[0].content, "sub-2", "the LATEST one by stream order");
+	});
+
+	it("does not mutate the input messages array", async () => {
+		const messages: TrimmableMessage[] = [
+			subagentToolResult("a"),
+			subagentToolResult("b"),
+		];
+		const snapshot = JSON.stringify(messages);
+		keepLatestSubagentToolResult(messages);
+		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated");
+	});
+
+	it("purity: keepLatestSubagentToolResult source has no process.*, node:fs, node:os, or other I/O", async () => {
+		const src = keepLatestSubagentToolResult.toString();
+		assert.ok(!src.includes("process."), "keepLatestSubagentToolResult must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "keepLatestSubagentToolResult must not import node:fs");
+		assert.ok(!src.includes("node:os"), "keepLatestSubagentToolResult must not import node:os");
+		assert.ok(!src.includes("fetch("), "keepLatestSubagentToolResult must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "keepLatestSubagentToolResult must not perform filesystem I/O");
+	});
+});
+
+// ─── Pre-budget collapse — pipeline composition (AC-6) ──────────────
+//
+// Pins the AC-6 ordering of the three pre-budget collapse rules +
+// `applyReasoningBlockCap` against a mixed stream, then verifies the
+// composed output feeds a clean three-tier trim. The wiring layer's
+// call-site ordering (Rule 1 → Rule 2 → Rule 3 → reasoning cap →
+// pinned → three-tier) is replicated here as a pure composition.
+
+describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
+	it("all three pre-budget rules + reasoning cap + three-tier trim compose cleanly", async () => {
+		// 30 intercom_message entries interleaved with 2 subagent-
+		// notify duplicates and 3 toolResult:subagent echoes. With
+		// keepLast=5, after Rule 1 only 5 intercom_message entries
+		// survive; after Rule 2 the duplicate subagent-notify is
+		// dropped; after Rule 3 only the latest toolResult:subagent
+		// survives; after the reasoning cap the post-cap mass feeds
+		// the three-tier trim, which lands in tier 1 (verbatim)
+		// because the surviving mass is small.
+		const intercomEntries: TrimmableMessage[] = Array.from({ length: 30 }, (_, i) =>
+			intercomMsg(`icm-${i + 1}`),
+		);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			...intercomEntries,
+			assistantMsg("first response"),
+			notifyMsg("n1-first", "run-1"),
+			subagentToolResult("sub-echo-1"),
+			notifyMsg("n1-redeliver", "run-1"),
+			subagentToolResult("sub-echo-2"),
+			subagentToolResult("sub-echo-3"),
+		];
+
+		// Replicate the AC-6 ordering on the pure layer. The wiring
+		// is responsible for the gate checks; this test pins the
+		// pure-pipeline composition.
+		const afterRule1 = applyIntercomKeepLast(messages, 5);
+		const afterRule2 = dedupSubagentNotify(afterRule1);
+		const afterRule3 = keepLatestSubagentToolResult(afterRule2);
+		const afterCap = applyReasoningBlockCap(afterRule3, -1);
+
+		// Surviving intercom_message count: 5.
+		const survivingIcm = afterCap.filter((m) => m.customType === "intercom_message");
+		assert.equal(survivingIcm.length, 5, "keepLast=5 yields exactly 5 intercom_message entries");
+		// The survivors are the last 5 in stream order: icm-26..icm-30.
+		assert.deepEqual(
+			survivingIcm.map((m) => m.content),
+			["icm-26", "icm-27", "icm-28", "icm-29", "icm-30"],
+		);
+
+		// Surviving subagent-notify count: 1 (the duplicate dropped).
+		const survivingNotifies = afterCap.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotifies.length, 1, "the duplicate subagent-notify is dropped by Rule 2");
+		assert.equal(survivingNotifies[0].content, "n1-first", "the first occurrence survives");
+
+		// Surviving toolResult:subagent count: 1 (the latest one).
+		const survivingSubagentToolResults = afterCap.filter(
+			(m) => (m as TrimmableMessage & { toolName?: string }).toolName === "subagent",
+		);
+		assert.equal(survivingSubagentToolResults.length, 1, "only the latest toolResult:subagent survives Rule 3");
+		assert.equal(survivingSubagentToolResults[0].content, "sub-echo-3", "the LATEST survives");
+
+		// The composed output feeds a clean three-tier trim (the
+		// post-cap mass is well under the 50k verbatim cap, so the
+		// trim is a no-op passthrough).
+		const result = await applyThreeTierTrim(afterCap, {
+			summarizer: makeTrimmingSummarizer(),
+		});
+		assert.equal(result.messages.length, afterCap.length, "tier 1 (verbatim): every message survives");
 	});
 });

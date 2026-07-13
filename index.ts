@@ -55,12 +55,15 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+	applyIntercomKeepLast,
 	applyReasoningBlockCap,
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	computeFlatInputTokenSignal,
+	dedupSubagentNotify,
 	detectConsecutiveIdenticalToolCalls,
 	isPathPreserved,
+	keepLatestSubagentToolResult,
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
 	messageFingerprint,
@@ -73,6 +76,7 @@ import { createPinnedTier, PINNED_CUSTOM_TYPE } from "./pinned-tier.ts";
 import {
 	resolveConfig,
 	parseConfigFile,
+	DEFAULT_INTERCOM_KEEP_LAST,
 	ENV,
 	type ContextTrimmerConfig,
 	type LoopGuardMode,
@@ -323,6 +327,34 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		return loopGuardResolved;
 	}
 
+	// Pre-budget-collapse extension-gating resolvers. Resolved lazily
+	// on the first `context` call and cached for the session, mirroring
+	// the existing `resolveProtectDispatch` pattern. Each gates one or
+	// more pre-budget collapse rules:
+	//   - `intercomInstalled` → Rules 1 + 2 (applyIntercomKeepLast,
+	//     dedupSubagentNotify) — both ride the pi-intercom extension.
+	//   - `subagentsInstalled` → Rule 3 (keepLatestSubagentToolResult) —
+	//     rides the pi-subagents extension.
+	// Two independent resolvers rather than one combined flag: the
+	// gates are distinct and a combined flag would couple unrelated
+	// extensions. The probes reuse `safeGetAllTools(pi)` so a minimal
+	// or unavailable API degrades to `[]` (inert) rather than
+	// throwing.
+	let intercomInstalledResolved: boolean | undefined;
+	function resolveIntercomInstalled(): boolean {
+		if (intercomInstalledResolved !== undefined) return intercomInstalledResolved;
+		const tools = safeGetAllTools(pi);
+		intercomInstalledResolved = tools.some((t) => t?.name === "intercom");
+		return intercomInstalledResolved;
+	}
+	let subagentsInstalledResolved: boolean | undefined;
+	function resolveSubagentsInstalled(): boolean {
+		if (subagentsInstalledResolved !== undefined) return subagentsInstalledResolved;
+		const tools = safeGetAllTools(pi);
+		subagentsInstalledResolved = tools.some((t) => t?.name === "subagent");
+		return subagentsInstalledResolved;
+	}
+
 	// Loop-guard thresholds. `Math.trunc` integer coercion matches
 	// the `summaWords` precedent in this file. Default nudge
 	// threshold is 3; hard-block defaults to off. The
@@ -496,7 +528,41 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// `base` (the stream before pinned injection) so the
 		// pinned synthetic is never at risk of being dropped.
 		const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
-		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(base, reasoningBlockCap);
+		// Pre-budget collapse (extension-gated category trims). Each
+		// pass runs on `base` (after source-path stamping, before
+		// pinned injection) and its output feeds the existing
+		// `applyReasoningBlockCap` call. The ordering is fixed per
+		// the AC-6 binding: Rule 1 → Rule 2 → Rule 3 → reasoning
+		// cap → pinned → three-tier. Each pass is skipped entirely
+		// (no array allocation, no scan) when its gate is false.
+		// The pinned synthetic is never at risk — it is injected
+		// AFTER the pre-budget passes, matching the existing
+		// `applyReasoningBlockCap` invariant. The pre-budget passes
+		// run on the source-path-stamped `base` so a
+		// `toolResult:subagent` entry that also matches a
+		// preserved-path pattern is identifiable; the
+		// category-specific predicates and the preserved-paths
+		// channel are disjoint surfaces (predicates target
+		// `role+customType` / `role+toolName`; the preserved-paths
+		// channel stamps `PRESERVED_CUSTOM_TYPE` on `base` AFTER
+		// the pre-budget window). The cache-substituted
+		// `intercom_message` entries preserve `customType` (the
+		// cache spreads the original message, including
+		// `customType`); Rule 1 still applies on a cache-substituted
+		// entry.
+		const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;
+		const intercomInstalled = resolveIntercomInstalled();
+		const subagentsInstalled = resolveSubagentsInstalled();
+		const afterRule1: TrimmableMessage[] = intercomInstalled
+			? applyIntercomKeepLast(base, intercomKeepLast)
+			: base;
+		const afterRule2: TrimmableMessage[] = intercomInstalled
+			? dedupSubagentNotify(afterRule1)
+			: afterRule1;
+		const afterRule3: TrimmableMessage[] = subagentsInstalled
+			? keepLatestSubagentToolResult(afterRule2)
+			: afterRule2;
+		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(afterRule3, reasoningBlockCap);
 		const withPinned: TrimmableMessage[] = pinned
 			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...cappedBase]
 			: cappedBase;

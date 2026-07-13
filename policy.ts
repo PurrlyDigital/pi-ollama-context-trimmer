@@ -1343,6 +1343,189 @@ export function applyReasoningBlockCap(
 	return out;
 }
 
+// ─── Pre-budget collapse (extension-gated category trims) ─────────
+//
+// Three pure array-in/array-out transforms that collapse transcript
+// entries — `intercom_message`, `subagent-notify`, and
+// `toolResult:subagent` — that accumulate outside the three-tier
+// budget. Each function targets a single category and is tier-blind
+// (drops regardless of which three-tier budget slot the entry would
+// have occupied). The wiring layer (`index.ts`) invokes them on
+// `base` after source-path stamping and before pinned injection,
+// and gates each by an extension-presence probe (pi-intercom,
+// pi-subagents) so a session without the gating extension sees no
+// behavior change.
+//
+// Identification predicates match the source extensions:
+//   - `intercom_message`:  role === "custom" && customType === "intercom_message" (pi-intercom)
+//   - `subagent-notify`:   role === "custom" && customType === "subagent-notify"  (pi-intercom)
+//   - `toolResult:subagent`: role === "toolResult" && toolName === "subagent"     (pi-subagents)
+//
+// Purity: each function is a pure array transform — no `process.*`,
+// no Node I/O, no `pi` reference. Mirrors the `applyReasoningBlockCap`
+// purity contract. The wiring layer is responsible for the gate
+// (extension-presence probe) and the integer coercion of the
+// `keepLast` knob.
+
+/**
+ * Pure recency hardtrim for `intercom_message` custom entries. Drops
+ * every `intercom_message` entry except the last `keepLast` (by
+ * stream order). Cap semantics:
+ *
+ *   keepLast === -1  → return the input unchanged (passthrough).
+ *   keepLast ===  0  → drop every `intercom_message` entry.
+ *   keepLast  >  0   → keep the last `keepLast` `intercom_message`
+ *                       entries by stream order, drop the rest.
+ *
+ * Identification: `role === "custom" && customType === "intercom_message"`.
+ * Non-`intercom_message` entries (user / assistant / toolResult /
+ * other custom types) are preserved untouched. The function does NOT
+ * mutate the input array; it returns a fresh `TrimmableMessage[]`.
+ */
+export function applyIntercomKeepLast(
+	messages: ReadonlyArray<TrimmableMessage>,
+	keepLast: number,
+): TrimmableMessage[] {
+	if (keepLast === -1) return messages.slice();
+	const total = messages.length;
+	const indices: number[] = [];
+	for (let i = 0; i < total; i++) {
+		const m = messages[i];
+		if (m.role === "custom" && m.customType === "intercom_message") {
+			indices.push(i);
+		}
+	}
+	if (indices.length === 0) return messages.slice();
+	if (keepLast === 0) {
+		const dropSet = new Set(indices);
+		const out: TrimmableMessage[] = new Array(total - indices.length);
+		let j = 0;
+		for (let i = 0; i < total; i++) {
+			if (!dropSet.has(i)) out[j++] = messages[i];
+		}
+		return out;
+	}
+	if (keepLast >= indices.length) return messages.slice();
+	const dropCount = indices.length - keepLast;
+	const dropSet = new Set<number>();
+	for (let i = 0; i < dropCount; i++) dropSet.add(indices[i]);
+	const out: TrimmableMessage[] = new Array(total - dropCount);
+	let j = 0;
+	for (let i = 0; i < total; i++) {
+		if (!dropSet.has(i)) out[j++] = messages[i];
+	}
+	return out;
+}
+
+/**
+ * Run-identity key for `subagent-notify` entries. The stable
+ * identifier that distinguishes one delivery from a redelivery of
+ * the same run is the entry's `details.sessionValue` when present
+ * (the per-run-stable session file / share URL), falling back to a
+ * fingerprint of the `details` payload (agent / status / resultPreview /
+ * taskInfo) when `sessionValue` is absent. Entries with no usable
+ * `details` payload fall back to the entry's stream index — the
+ * dedup is then a no-op for that entry (every occurrence is treated
+ * as a distinct run).
+ */
+function subagentNotifyRunId(msg: TrimmableMessage, index: number): string {
+	const details = msg.details as Record<string, unknown> | undefined;
+	if (!details || typeof details !== "object") return `__idx__:${index}`;
+	const sessionValue = details.sessionValue;
+	if (typeof sessionValue === "string" && sessionValue.length > 0) {
+		return `sessionValue:${sessionValue}`;
+	}
+	const fpParts: string[] = [];
+	const fields = ["agent", "status", "resultPreview", "taskInfo"] as const;
+	for (const f of fields) {
+		const v = details[f];
+		if (v === undefined || v === null) continue;
+		try {
+			fpParts.push(`${f}=${JSON.stringify(v)}`);
+		} catch {
+			fpParts.push(`${f}=<unserializable>`);
+		}
+	}
+	if (fpParts.length === 0) return `__idx__:${index}`;
+	return `fingerprint:${fpParts.join("|")}`;
+}
+
+/**
+ * Pure dedup for `subagent-notify` custom entries. Keeps the FIRST
+ * occurrence of each run identity in stream order; drops every
+ * subsequent duplicate. Identification:
+ * `role === "custom" && customType === "subagent-notify"`.
+ * Non-`subagent-notify` entries are preserved untouched. No knob —
+ * duplicates are always noise.
+ *
+ * Run identity: `details.sessionValue` (the per-run-stable session
+ * file / share URL) when present, else a deterministic fingerprint
+ * of `details` (`agent` + `status` + `resultPreview` + `taskInfo`).
+ * Entries with neither signal fall back to their stream index and
+ * are not deduped against other entries (each is treated as a
+ * distinct run).
+ */
+export function dedupSubagentNotify(messages: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
+	const total = messages.length;
+	const seen = new Set<string>();
+	const keep: boolean[] = new Array(total).fill(true);
+	let dropped = 0;
+	for (let i = 0; i < total; i++) {
+		const m = messages[i];
+		if (m.role !== "custom" || m.customType !== "subagent-notify") continue;
+		const runId = subagentNotifyRunId(m, i);
+		if (seen.has(runId)) {
+			keep[i] = false;
+			dropped += 1;
+		} else {
+			seen.add(runId);
+		}
+	}
+	if (dropped === 0) return messages.slice();
+	const out: TrimmableMessage[] = new Array(total - dropped);
+	let j = 0;
+	for (let i = 0; i < total; i++) {
+		if (keep[i]) out[j++] = messages[i];
+	}
+	return out;
+}
+
+/**
+ * Pure latest-only hard cut for `toolResult:subagent` entries. Drops
+ * every `role: "toolResult"` entry whose `toolName === "subagent"`
+ * except the LAST one (by stream order). Identification:
+ * `role === "toolResult" && toolName === "subagent"`.
+ * Non-`subagent` `toolResult` entries are preserved untouched. No
+ * knob — prior subagent tool results are not needed once a newer
+ * one exists. Tier-blind — drops regardless of three-tier budget slot.
+ */
+export function keepLatestSubagentToolResult(messages: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
+	const total = messages.length;
+	let lastIdx = -1;
+	for (let i = 0; i < total; i++) {
+		const m = messages[i];
+		if (m.role === "toolResult" && (m as TrimmableMessage & { toolName?: string }).toolName === "subagent") {
+			lastIdx = i;
+		}
+	}
+	if (lastIdx < 0) return messages.slice();
+	const dropSet = new Set<number>();
+	for (let i = 0; i < total; i++) {
+		const m = messages[i];
+		if (i === lastIdx) continue;
+		if (m.role === "toolResult" && (m as TrimmableMessage & { toolName?: string }).toolName === "subagent") {
+			dropSet.add(i);
+		}
+	}
+	if (dropSet.size === 0) return messages.slice();
+	const out: TrimmableMessage[] = new Array(total - dropSet.size);
+	let j = 0;
+	for (let i = 0; i < total; i++) {
+		if (!dropSet.has(i)) out[j++] = messages[i];
+	}
+	return out;
+}
+
 // ─── Loop guard (defense-in-depth for model-caused loops) ──────────
 //
 // Detects repeated identical tool-call sequences in the assistant

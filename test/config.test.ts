@@ -14,6 +14,7 @@ import {
 	DEFAULT_PROTECT_DISPATCH,
 	DEFAULT_LOOP_GUARD,
 	DEFAULT_ASYNC_MODE,
+	DEFAULT_INTERCOM_KEEP_LAST,
 	type EnvRecord,
 } from "../config.ts";
 
@@ -1395,5 +1396,244 @@ describe("reasoningBlockCap — file parse: all-or-nothing per field", () => {
 		});
 		assert.equal(f.reasoningBlockCap, 3, "well-typed reasoningBlockCap survives a neighboring bad value");
 		assert.equal(f.tier1MaxTokens, undefined, "the badly-typed neighboring field is dropped");
+	});
+});
+
+// ─── intercomKeepLast (Rule 1 of the pre-budget collapse) ─────────
+//
+// `intercomKeepLast` is the operator-configurable knob that controls
+// how many `intercom_message` custom entries the wiring layer keeps
+// per message stream (counted from the latest). Integer semantics:
+// `-1` = send all (passthrough), `0` = send none, any positive
+// integer is the count of entries to keep. The knob is exposed in
+// BOTH channels (env `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` and
+// the `intercomKeepLast` JSON key) per the tandem principle;
+// precedence is env > file > compile-time default (`DEFAULT_INTERCOM_KEEP_LAST`
+// = `-1`, mirroring the `reasoningBlockCap` `-1` precedent). The
+// wiring layer coerces floats with `Math.trunc` (summaWords
+// precedent) before passing the value to the pure policy function.
+
+describe("intercomKeepLast — file channel (parseConfigFile)", () => {
+	it("file parse: -1 (passthrough sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: -1 }).intercomKeepLast, -1);
+	});
+
+	it("file parse: 0 (send-none sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: 0 }).intercomKeepLast, 0);
+	});
+
+	it("file parse: a positive integer is accepted", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: 1 }).intercomKeepLast, 1);
+		assert.equal(parseConfigFile({ intercomKeepLast: 5 }).intercomKeepLast, 5);
+		assert.equal(parseConfigFile({ intercomKeepLast: 100 }).intercomKeepLast, 100);
+	});
+
+	it("file parse: value < -1 is treated as absent", () => {
+		// -2 and below fail `isValidBlockCap`'s `v >= -1` check
+		// and are treated as absent (the resolver falls through
+		// to the env / default layer). The intercomKeepLast
+		// resolver reuses `isValidBlockCap` (the same integer-
+		// including-sentinel predicate the reasoningBlockCap
+		// resolver uses).
+		assert.equal(parseConfigFile({ intercomKeepLast: -2 }).intercomKeepLast, undefined);
+		assert.equal(parseConfigFile({ intercomKeepLast: -100 }).intercomKeepLast, undefined);
+	});
+
+	it("file parse: a non-integer (float) is treated as absent", () => {
+		// `isValidBlockCap` requires `Number.isInteger`; floats
+		// fail that check and are treated as absent. The
+		// `Math.trunc` coercion lives at the wiring layer (per
+		// the summaWords precedent), not at the resolver.
+		assert.equal(parseConfigFile({ intercomKeepLast: 1.5 }).intercomKeepLast, undefined);
+		assert.equal(parseConfigFile({ intercomKeepLast: 0.5 }).intercomKeepLast, undefined);
+		assert.equal(parseConfigFile({ intercomKeepLast: -0.5 }).intercomKeepLast, undefined);
+	});
+
+	it("file parse: non-numeric (string, boolean, null, object) is treated as absent", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: "5" }).intercomKeepLast, undefined, "string '5' is rejected (the JSON channel does not coerce)");
+		assert.equal(parseConfigFile({ intercomKeepLast: true }).intercomKeepLast, undefined, "boolean true is rejected");
+		assert.equal(parseConfigFile({ intercomKeepLast: null }).intercomKeepLast, undefined, "null is rejected");
+		assert.equal(parseConfigFile({ intercomKeepLast: { a: 1 } }).intercomKeepLast, undefined, "object is rejected");
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: Number.NaN }).intercomKeepLast, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ intercomKeepLast: Number.POSITIVE_INFINITY }).intercomKeepLast, undefined);
+		assert.equal(parseConfigFile({ intercomKeepLast: Number.NEGATIVE_INFINITY }).intercomKeepLast, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).intercomKeepLast, undefined);
+	});
+});
+
+describe("intercomKeepLast — resolveConfig (precedence)", () => {
+	// The wiring layer's contract is
+	// `cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST`
+	// — the resolver returns `undefined` when neither channel sets
+	// a value, and the wiring layer applies the compile-time
+	// default. The tests below assert the resolver's behavior; the
+	// wiring layer's `Math.trunc` coercion is covered in
+	// `integration.test.ts`.
+
+	it("env > file: env wins when both channels set a value", () => {
+		const cfg = resolveConfig({
+			file: { intercomKeepLast: 3 },
+			env: { [ENV.intercomKeepLast]: "5" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, 5, "env value 5 wins over file value 3");
+	});
+
+	it("env wins with -1 (passthrough sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { intercomKeepLast: 1 },
+			env: { [ENV.intercomKeepLast]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, -1, "env -1 wins over file 1 (passthrough sentinel is honored)");
+	});
+
+	it("env wins with 0 (send-none sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { intercomKeepLast: 1 },
+			env: { [ENV.intercomKeepLast]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, 0, "env 0 wins over file 1 (send-none sentinel is honored)");
+	});
+
+	it("file-only: env unset, file sets a value → file value returned", () => {
+		const cfg = resolveConfig({
+			file: { intercomKeepLast: 7 },
+		});
+		assert.equal(cfg.intercomKeepLast, 7, "file-only returns the file value");
+	});
+
+	it("nothing configured: both unset → resolver returns undefined (wiring applies the compile-time default)", () => {
+		// The resolver does NOT apply a default itself — the
+		// wiring layer (index.ts) is what reads
+		// `DEFAULT_INTERCOM_KEEP_LAST` when the resolver returns
+		// undefined. The two-layer contract mirrors the existing
+		// `reasoningBlockCap` shape.
+		const cfg = resolveConfig({});
+		assert.equal(cfg.intercomKeepLast, undefined, "no value configured → undefined (wiring layer applies the default)");
+	});
+
+	it("DEFAULT_INTERCOM_KEEP_LAST is the documented constant (-1 passthrough)", () => {
+		// The default is `-1` (passthrough — every intercom_message
+		// survives) so existing operators see no behavior change
+		// when upgrading. To opt in to a cap, set the env var or
+		// JSON key to `0` (send none) or a positive integer
+		// (keep the last N).
+		assert.equal(DEFAULT_INTERCOM_KEEP_LAST, -1);
+	});
+
+	it("empty-string env falls back to file value", () => {
+		const cfg = resolveConfig({
+			file: { intercomKeepLast: 3 },
+			env: { [ENV.intercomKeepLast]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, 3, "empty-string env is treated as no override; file value wins");
+	});
+
+	it("badly-typed env (non-integer string) falls back to file value", () => {
+		// The env parser is strict: a non-numeric string ("abc")
+		// returns undefined; a non-integer numeric string ("1.5")
+		// likewise returns undefined (Number('1.5') === 1.5, which
+		// fails Number.isInteger). The fallback chain: env
+		// (undefined) → file value.
+		const cfgAbc = resolveConfig({
+			file: { intercomKeepLast: 3 },
+			env: { [ENV.intercomKeepLast]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfgAbc.intercomKeepLast, 3, "env 'abc' falls back to file value");
+		const cfgFloat = resolveConfig({
+			file: { intercomKeepLast: 3 },
+			env: { [ENV.intercomKeepLast]: "1.5" } as EnvRecord,
+		});
+		assert.equal(cfgFloat.intercomKeepLast, 3, "env '1.5' (non-integer) falls back to file value");
+	});
+
+	it("badly-typed file value falls back to env (then to undefined)", () => {
+		// The two-step pipeline: parseConfigFile drops the bad
+		// file value, then resolveConfig's env parser picks up
+		// the env value.
+		const parsed = parseConfigFile({ intercomKeepLast: "5" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.intercomKeepLast]: "3" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, 3, "parseConfigFile drops the bad file value; env value wins");
+	});
+
+	it("badly-typed in BOTH channels → resolver returns undefined", () => {
+		// The two-step pipeline: parseConfigFile drops the bad
+		// file value, then resolveConfig's env parser drops the
+		// bad env string. The resolver returns undefined when
+		// neither channel yields a valid value.
+		const parsed = parseConfigFile({ intercomKeepLast: "5" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.intercomKeepLast]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, undefined, "both channels badly-typed → undefined (wiring default applies)");
+	});
+
+	it("env value < -1 falls back to file value (or undefined)", () => {
+		const cfgFile = resolveConfig({
+			file: { intercomKeepLast: 3 },
+			env: { [ENV.intercomKeepLast]: "-2" } as EnvRecord,
+		});
+		assert.equal(cfgFile.intercomKeepLast, 3, "env -2 falls back to file value");
+		const cfgUnset = resolveConfig({
+			env: { [ENV.intercomKeepLast]: "-100" } as EnvRecord,
+		});
+		assert.equal(cfgUnset.intercomKeepLast, undefined, "env -100, no file → undefined");
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric integer string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.intercomKeepLast]: "10" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, 10);
+		assert.equal(typeof cfg.intercomKeepLast, "number");
+	});
+
+	it("env parse: the -1 sentinel is preserved as a number, not coerced to 0", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.intercomKeepLast]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.intercomKeepLast, -1, "env -1 is preserved as the passthrough sentinel");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.intercomKeepLast is the documented namespace", () => {
+		assert.equal(ENV.intercomKeepLast, "PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST");
+	});
+
+	// --- Math.trunc coercion at the wiring layer (covered as a
+	//     config-layer test for the resolveConfig contract: the
+	//     resolver does NOT coerce; float inputs are rejected by
+	//     the parseConfigFile `isValidBlockCap` predicate and
+	//     treated as absent). The wiring layer's coercion is
+	//     exercised end-to-end in `integration.test.ts`.
+
+	it("resolver contract: floats are treated as absent at the parse layer; the wiring layer applies Math.trunc to a configured integer value", () => {
+		// The resolver does not coerce floats — the parseConfigFile
+		// predicate `isValidBlockCap` rejects non-integers, so a
+		// file value of `1.5` is dropped. The wiring layer
+		// (`index.ts`) coerces the resolved integer to its integer
+		// form via `Math.trunc(cfg.intercomKeepLast)` — a
+		// deliberate `60.0` becomes `60`, a deliberate `60.5`
+		// would be stripped to `60`. The end-to-end wiring-layer
+		// coercion is covered in `integration.test.ts`.
+		const parsedFloat = parseConfigFile({ intercomKeepLast: 1.5 });
+		assert.equal(parsedFloat.intercomKeepLast, undefined, "non-integer file value is treated as absent (Math.trunc is the wiring layer's job, not the resolver's)");
+		const parsedInteger = parseConfigFile({ intercomKeepLast: 5 });
+		assert.equal(parsedInteger.intercomKeepLast, 5, "integer file value survives the parse");
 	});
 });
