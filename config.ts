@@ -100,6 +100,15 @@ export interface ContextTrimmerConfig {
 	 *  (counted from the latest). Overrides the policy default when
 	 *  set. */
 	readonly reasoningBlockCap?: number;
+	/** `intercom_message` recency hardtrim. The wiring layer (in
+	 *  the context handler) keeps the last N `intercom_message`
+	 *  custom entries in the message stream and drops the rest
+	 *  before the three-tier trim runs. Integer semantics:
+	 *  `-1` = send all (passthrough), `0` = send none, any
+	 *  positive integer = send that many (counted from the latest).
+	 *  The wiring layer coerces with `Math.trunc` (summaWords
+	 *  precedent). Overrides the policy default when set. */
+	readonly intercomKeepLast?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -116,6 +125,14 @@ export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
  *  out with `false` (env `PI_CONTEXT_TRIMMER_ASYNC_MODE=0` or
  *  `"asyncMode": false` in the config file). */
 export const DEFAULT_ASYNC_MODE = true;
+
+/** Default `intercom_message` recency hardtrim count. The default is
+ *  `-1` (passthrough — keep all `intercom_message` entries) so
+ *  existing operators see no behavior change when upgrading. The
+ *  wiring layer applies the default when neither the env var nor
+ *  the JSON key sets a value. The wiring coerces with `Math.trunc`
+ *  (summaWords precedent). */
+export const DEFAULT_INTERCOM_KEEP_LAST = -1;
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
  *  the wiring layer and tests reference a single source of truth. */
@@ -134,6 +151,7 @@ export const ENV = {
 	asyncMode: "PI_CONTEXT_TRIMMER_ASYNC_MODE",
 	pinSubagent: "PI_CONTEXT_TRIMMER_PIN_SUBAGENT",
 	reasoningBlockCap: "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP",
+	intercomKeepLast: "PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -157,6 +175,7 @@ export interface ParsedConfigFile {
 	asyncMode?: boolean;
 	pinSubagent?: boolean;
 	reasoningBlockCap?: number;
+	intercomKeepLast?: number;
 }
 
 /**
@@ -214,6 +233,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (isValidBlockCap(o.reasoningBlockCap)) {
 		out.reasoningBlockCap = o.reasoningBlockCap;
 	}
+	if (isValidBlockCap(o.intercomKeepLast)) {
+		out.intercomKeepLast = o.intercomKeepLast;
+	}
 	return out;
 }
 
@@ -269,6 +291,8 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.loopGuardHardBlock]) ?? file.loopGuardHardBlock;
 	const reasoningBlockCap =
 		parseBlockCapEnv(env[ENV.reasoningBlockCap]) ?? file.reasoningBlockCap;
+	const intercomKeepLast =
+		parseBlockCapEnv(env[ENV.intercomKeepLast]) ?? file.intercomKeepLast;
 
 	let asyncMode: boolean;
 	const envAm = env[ENV.asyncMode];
@@ -321,6 +345,7 @@ export function resolveConfig(opts: {
 		asyncMode,
 		pinSubagent,
 		reasoningBlockCap,
+		intercomKeepLast,
 	};
 }
 

@@ -2521,3 +2521,265 @@ describe("persistence seam — appendEntry records drop state", () => {
 		assert.equal(dropped.length, 0, "no context-trimmer-dropped entry on the tier-2 path (no drop fired)");
 	});
 });
+
+// ─── Pre-budget collapse — gating + placement (AC-8 integration) ───
+//
+// End-to-end tests for the pre-budget collapse rules (Rules 1, 2,
+// 3) and their extension-gating detection. The mock pi here exposes
+// a configurable `getAllTools()` so each test can register the
+// `intercom` and/or `subagent` tool independently and assert the
+// gate fires (or does not fire) accordingly. The rules run on `base`
+// before `applyReasoningBlockCap` and before pinned injection; the
+// tests assert the collapsed entries are visible in the trimmed
+// output the handler returns.
+
+function createMockPiWithTools(toolNames: readonly string[]) {
+	const handlers: Record<string, Handler[]> = {};
+	const tools: Array<{ name: string }> = toolNames.map((name) => ({ name }));
+	const pi = {
+		on(event: string, handler: Handler) {
+			if (!handlers[event]) handlers[event] = [];
+			handlers[event].push(handler);
+		},
+		getHandlers(event: string): Handler[] {
+			return handlers[event] ?? [];
+		},
+		getAllTools(): Array<{ name: string }> {
+			return tools;
+		},
+	};
+	return pi;
+}
+
+async function loadExtensionWithTools(toolNames: readonly string[]) {
+	const pi = createMockPiWithTools(toolNames);
+	await contextTrimmerExtension(pi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+	return pi;
+}
+
+async function fireContextBasic(pi: ReturnType<typeof createMockPiWithTools>, event: unknown) {
+	const handlers = pi.getHandlers("context");
+	assert.ok(handlers.length > 0, "context handler must be registered");
+	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
+}
+
+describe("pre-budget collapse — gating detection (AC-1 end-to-end)", () => {
+	let sConfigPath: string | undefined;
+
+	beforeEach(() => {
+		sConfigPath = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+	});
+
+	afterEach(() => {
+		if (sConfigPath === undefined) delete process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+		else process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = sConfigPath;
+		// Restore the module-level config-path posture.
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+	});
+
+	it("Rules 1 + 2 fire when the `intercom` tool is registered", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtensionWithTools(["intercom"]);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "custom", content: "icm-1", customType: "intercom_message" },
+				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "icm-2", customType: "intercom_message" },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// After Rule 1 (keepLast=-1 passthrough, no intercom_message
+		// drop), Rule 2 (the duplicate subagent-notify is dropped):
+		// the trimmed output should NOT carry the duplicate.
+		const survivingNotifies = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotifies.length, 1, "the duplicate subagent-notify is dropped by Rule 2 (gated on pi-intercom)");
+		assert.equal(survivingNotifies[0].content, "n1-first", "the first occurrence is the one that survives");
+	});
+
+	it("Rules 1 + 2 are inert when the `intercom` tool is NOT registered (gating degrades to passthrough)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtensionWithTools([]); // no intercom tool
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "custom", content: "icm-1", customType: "intercom_message" },
+				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// Without pi-intercom installed, Rules 1 and 2 are inert.
+		// The duplicate subagent-notify is NOT deduped.
+		const survivingNotifies = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotifies.length, 2, "without pi-intercom, the duplicate subagent-notify survives (Rule 2 is inert)");
+	});
+
+	it("Rule 3 fires when the `subagent` tool is registered", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtensionWithTools(["subagent"]);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
+				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
+				{ role: "toolResult", content: "sub-3", toolName: "subagent" },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// After Rule 3, only the LATEST toolResult:subagent survives.
+		const surviving = result.messages.filter((m) => (m as { toolName?: string }).toolName === "subagent");
+		assert.equal(surviving.length, 1, "only the latest toolResult:subagent survives Rule 3");
+		assert.equal(surviving[0].content, "sub-3");
+	});
+
+	it("Rule 3 is inert when the `subagent` tool is NOT registered (gating degrades to passthrough)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtensionWithTools([]); // no subagent tool
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
+				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// Without pi-subagents installed, Rule 3 is inert — every
+		// toolResult:subagent survives.
+		const surviving = result.messages.filter((m) => (m as { toolName?: string }).toolName === "subagent");
+		assert.equal(surviving.length, 2, "without pi-subagents, all toolResult:subagent entries survive (Rule 3 is inert)");
+	});
+
+	it("gating is independent: a session with only `intercom` does NOT enable Rule 3, and vice versa", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		// (a) only intercom registered → Rule 3 inert.
+		const piIntercom = await loadExtensionWithTools(["intercom"]);
+		const event1 = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
+				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
+			],
+		};
+		const result1 = (await fireContextBasic(piIntercom, event1)) as { messages: Array<Record<string, unknown>> };
+		const surviving1 = result1.messages.filter((m) => (m as { toolName?: string }).toolName === "subagent");
+		assert.equal(surviving1.length, 2, "with only intercom registered, Rule 3 stays inert");
+
+		// (b) only subagent registered → Rule 2 inert (subagent-notify
+		// duplicates survive).
+		const piSub = await loadExtensionWithTools(["subagent"]);
+		const event2 = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			],
+		};
+		const result2 = (await fireContextBasic(piSub, event2)) as { messages: Array<Record<string, unknown>> };
+		const surviving2 = result2.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(surviving2.length, 2, "with only subagent registered, Rule 2 stays inert");
+	});
+});
+
+describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () => {
+	let sConfigPath: string | undefined;
+	let sIntercomKeepLast: string | undefined;
+
+	beforeEach(() => {
+		sConfigPath = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+		sIntercomKeepLast = process.env[CONFIG_ENV.intercomKeepLast];
+	});
+
+	afterEach(() => {
+		if (sConfigPath === undefined) delete process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
+		else process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = sConfigPath;
+		if (sIntercomKeepLast === undefined) delete process.env[CONFIG_ENV.intercomKeepLast];
+		else process.env[CONFIG_ENV.intercomKeepLast] = sIntercomKeepLast;
+		// Restore the module-level config-path posture.
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+	});
+
+	// 30 intercom_message entries + keepLast=5 → exactly 5 survive.
+	it("30 intercom_message entries + keepLast=5: exactly 5 survive into the trimmed output", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.intercomKeepLast] = "5";
+		const pi = await loadExtensionWithTools(["intercom"]);
+		const messages: Array<Record<string, unknown>> = [userMsg("dispatch")];
+		for (let i = 1; i <= 30; i++) {
+			messages.push({ role: "custom", content: `icm-${i}`, customType: "intercom_message" });
+		}
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingIcm = result.messages.filter((m) => m.customType === "intercom_message");
+		assert.equal(survivingIcm.length, 5, "keepLast=5 yields exactly 5 intercom_message entries");
+		// The survivors are the last 5 in stream order: icm-26..icm-30.
+		assert.deepEqual(
+			survivingIcm.map((m) => m.content),
+			["icm-26", "icm-27", "icm-28", "icm-29", "icm-30"],
+		);
+	});
+
+	// Pinned synthetic survives the pre-budget passes.
+	it("pinned synthetic survives the pre-budget collapse passes (the pin is injected AFTER the pre-budget window)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtensionWithTools(["intercom", "subagent"]);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "custom", content: "icm-1", customType: "intercom_message" },
+				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
+				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// (i) The pinned synthetic is the FIRST message in the result
+		// (the wiring prepends it after the pre-budget window).
+		assert.equal(result.messages[0].customType, "context-trimmer-pinned", "the pinned synthetic is at the top of the result");
+		// (ii) The duplicate subagent-notify is dropped (Rule 2).
+		const survivingNotifies = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotifies.length, 1);
+		// (iii) Only the latest toolResult:subagent survives (Rule 3).
+		const survivingToolResults = result.messages.filter((m) => (m as { toolName?: string }).toolName === "subagent");
+		assert.equal(survivingToolResults.length, 1);
+		assert.equal(survivingToolResults[0].content, "sub-2", "the LATEST toolResult:subagent survives");
+		// (iv) All intercom_message entries survive (keepLast=-1
+		// passthrough is the default).
+		const survivingIcm = result.messages.filter((m) => m.customType === "intercom_message");
+		assert.equal(survivingIcm.length, 1, "keepLast=-1 passthrough keeps every intercom_message");
+	});
+
+	// Cache-substituted intercom_message still carries customType and is subject to Rule 1.
+	it("cache-substituted intercom_message still carries customType and is subject to Rule 1", async () => {
+		// Pin a pre-existing summarized cache entry. The summary cache
+		// substitutes `{ ...pending.originalMessage, content: ... }`
+		// at the wiring layer — the spread preserves `customType`,
+		// so a cached (already-summarized) `intercom_message` is
+		// still an `intercom_message` and is subject to Rule 1.
+		// The existing 'in-memory cache skips already-summarized
+		// messages on the next context event' suite is the structural
+		// test for cache preservation; this test pins the pre-budget
+		// pass behavior on a cache-substituted entry.
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.intercomKeepLast] = "0"; // drop ALL intercom_message entries.
+		const pi = await loadExtensionWithTools(["intercom"]);
+		// A single intercom_message + dispatch. The cache is empty
+		// (no prior background summary), so the input message is
+		// the one Rule 1 sees. The Rule 1 collapse drops it.
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "custom", content: "icm-1", customType: "intercom_message" },
+			],
+		};
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingIcm = result.messages.filter((m) => m.customType === "intercom_message");
+		assert.equal(survivingIcm.length, 0, "keepLast=0 drops every intercom_message entry (Rule 1 fires)");
+		// The dispatch survives (the pin is prepended; the dispatch
+		// is the only trimmable user message).
+		const dispatch = result.messages.find((m) => m.role === "user" && m.content === "dispatch");
+		assert.ok(dispatch, "the dispatch user message survives the pre-budget passes");
+	});
+});
