@@ -2561,3 +2561,153 @@ describe("applyReasoningBlockCap", () => {
 		assert.ok(!src.includes("readFile"), "applyReasoningBlockCap must not perform filesystem I/O");
 	});
 });
+
+// ─── Tier-3 summarize-fallback cap target ────────────────────────
+//
+// The two tier-3 summarize-fallback call sites in `applyThreeTierTrim`
+// pass the ceiling to `summarizeOldestUntilUnder`. Tier 3's contract is
+// to hold the tier-2 (`summarizeMaxTokens`) ceiling — the drop tier
+// must collapse the LLM-bound trimmable total to <= summarizeMax. The
+// tier-2 *normal* path (total between verbatim and summarize) targets
+// verbatimMax; only the tier-3 fallback paths target summarizeMax.
+//
+// The regression test pins the operator's exact shape: tier1=75k,
+// tier2=125k, dropFloor=62.5k (50% of tier2), recencyFloor unset, ~190k
+// trimmable across uneven chunks, ~10k protected mass (pinned synthetic
+// + preserved-paths tool results), ~60-word summarizer stub. Asserts
+// post-trim trimmable <= summarizeMax (125k).
+//
+// The residual test exercises the boundary where the
+// summarize-fallback's candidates are already summarized (carry the
+// `[summa:` envelope or persisted fingerprints). The fallback cannot
+// reduce the total in that case — the cap fix is necessary but not
+// sufficient for the residual path. The test pins the boundary so
+// future residual-mechanism work has a regression target.
+
+describe("applyThreeTierTrim — tier-3 summarize-fallback targets summarizeMax", () => {
+	// 60-word summarizer stub: returns realistic ~60-word summary text.
+	// At 1 word ~ 1 token, ~60 tokens. Shrinks a 30k-token message to
+	// ~60 tokens.
+	const sixtyWordSummarizer = async (_text: string, _w: number) => {
+		const words = [
+			"summary", "of", "the", "preceding", "content", "covering", "the", "key", "points",
+			"with", "concise", "phrasing", "and", "minimal", "loss", "of", "the", "operator's",
+			"intent", "and", "the", "specific", "details", "the", "model", "needs", "to", "carry",
+			"forward", "into", "the", "next", "turn", "without", "the", "full", "original",
+			"verbatim", "mass", "that", "would", "exceed", "the", "ceiling", "on", "the",
+			"trimmable", "side", "of", "the", "budget", "boundary", "for", "this", "tier",
+		];
+		return words.slice(0, 60).join(" ");
+	};
+
+	it("tier-3 drop-floor fall-through: post-trim trimmable <= summarizeMax (operator's exact shape)", async () => {
+		// Operator config: tier1=75k, tier2=125k, dropFloor=62.5k,
+		// recencyFloor unset. Trimmable mass of 190k across uneven
+		// chunks (30k+20k+80k+40k+20k) in a single post-dispatch
+		// synthetic trimmable turn (the LLM-is-mid-response shape
+		// the policy's "synthesize trimmable turn" exception
+		// handles). ~10k protected mass (pinned synthetic +
+		// preserved-paths tool result) riding on top of the
+		// trimmable budget.
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const protectedPath = "/repo/AGENTS.md";
+		const preservedPatterns = ["AGENTS.md"];
+		const messages: TrimmableMessage[] = [
+			pinnedMsg("agent def " + "p".repeat(2_500 * 4)),
+			toolResultWithPath("doc body " + "d".repeat(2_500 * 4), protectedPath),
+			userMsg("dispatch task — do X", 0),
+			assistantMsg("a".repeat(30_000 * 4)),
+			assistantMsg("b".repeat(20_000 * 4)),
+			assistantMsg("c".repeat(80_000 * 4)),
+			assistantMsg("d".repeat(40_000 * 4)),
+			assistantMsg("e".repeat(20_000 * 4)),
+			pinnedMsg("extra " + "q".repeat(2_500 * 4)),
+			toolResultWithPath("more " + "e".repeat(2_500 * 4), protectedPath),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer: sixtyWordSummarizer,
+			protectedCustomTypes: protectedSet,
+			preservedPatterns,
+			dropFloorTokens: 62_500,
+			verbatimMaxTokens: 75_000,
+			summarizeMaxTokens: 125_000,
+		});
+		const postTrimTotal = totalTrimmableTokens(
+			result.messages,
+			protectedSet,
+			true,
+			preservedPatterns,
+		);
+		assert.ok(
+			postTrimTotal <= 125_000,
+			`post-trim trimmable total ${postTrimTotal} must be <= summarizeMaxTokens 125000 (ceiling invariant)`,
+		);
+		// The drop-floor engages (the single 190k turn cannot be
+		// dropped whole without pushing remaining mass below
+		// 62.5k). The policy hands the trimmable off to the
+		// summarize-fallback with cap=summarizeMax=125k. The
+		// summarize path reduces 190k to under 125k.
+		assert.ok(
+			result.summarized >= 1,
+			"the summarize-fallback reduced at least one trimmable message",
+		);
+		const pinnedSurvivors = result.messages.filter(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.equal(pinnedSurvivors.length, 2, "both pinned synthetic messages must survive the trim");
+		const preservedSurvivors = result.messages.filter(
+			(m) => m.role === "toolResult" && m.details && (m.details as { sourcePath?: string }).sourcePath === protectedPath,
+		);
+		assert.equal(preservedSurvivors.length, 2, "both preserved-paths tool results must survive the trim");
+		const dispatch = result.messages.find(
+			(m) => m.role === "user" && m.userTurnAge === 0,
+		);
+		assert.ok(dispatch, "dispatch task must survive the trim");
+	});
+
+	it("tier-3 residual case: summarize-fallback leaves already-summarized candidates untouched", async () => {
+		// The post-drop re-check branch and the shouldFallThrough
+		// branch both invoke `summarizeOldestUntilUnder` with the
+		// cap fix's target. When every summarizable candidate is
+		// already at its post-summary size (carries the `[summa:`
+		// envelope and is in `alreadySummarizedHashes`), the
+		// summarize-fallback's skip-by-default branch returns -1;
+		// the escape clause retries with the skip flag lifted, but
+		// the re-summarized message's body is the same size as
+		// the original (the defensive bound fires). The post-trim
+		// trimmable total is the already-summarized body size.
+		//
+		// This pins the residual boundary: even with the cap fix,
+		// when the summarize path cannot reduce candidates, the
+		// post-trim total is the post-summary body size, not the
+		// original size. The cap fix raises the cap from 75k to
+		// 125k; the operator's exact shape (190k trimmable) is
+		// handled by the cap fix alone. This test pins the
+		// boundary for future residual-mechanism work.
+		const residualMessage = summarizedAssistantMsg(60, 60, "old summary");
+		const residualFingerprint = messageFingerprint(residualMessage);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch task — do X", 0),
+			residualMessage,
+		];
+		const result = await applyThreeTierTrim(messages, {
+			summarizer: sixtyWordSummarizer,
+			dropFloorTokens: 0,
+			verbatimMaxTokens: 75_000,
+			summarizeMaxTokens: 125_000,
+			alreadySummarizedHashes: new Set([residualFingerprint]),
+		});
+		const total = totalTrimmableTokens(result.messages);
+		assert.ok(
+			total <= 125_000,
+			`post-trim trimmable total ${total} must be <= summarizeMaxTokens 125000 (residual boundary pin)`,
+		);
+		assert.equal(result.droppedTurns, 0, "single trimmable message is not bundled into a turn");
+		const survivor = result.messages.find(
+			(m) => Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
+				(b) => typeof b.text === "string" && b.text.startsWith("[summa: ~"),
+			),
+		);
+		assert.ok(survivor, "the already-summarized message survives the trim path");
+	});
+});

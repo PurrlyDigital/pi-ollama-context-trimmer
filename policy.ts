@@ -655,12 +655,12 @@ export async function applyThreeTierTrim(
 		// dropping and hand the surviving trimmable content off to
 		// the summarize path. The summarize path then trims the
 		// older half (trimmable messages OUTSIDE the recency
-		// window) down to verbatimMax — the recency slice stays
+		// window) down to summarizeMax — the recency slice stays
 		// intact and the drop tier never collapses the floor.
 		if (shouldFallThrough) {
 			const result = await summarizeOldestUntilUnder(
 				dropped,
-				verbatimMax,
+				summarizeMax,
 				summarizer,
 				summaWords,
 				protectedCustomTypes,
@@ -693,7 +693,7 @@ export async function applyThreeTierTrim(
 		// as a fallback. This is the only path where summarize fires
 		// from tier 3; tier 2's summarize path is the normal one.
 		if (total > summarizeMax) {
-			const result = await summarizeOldestUntilUnder(dropped, verbatimMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
+			const result = await summarizeOldestUntilUnder(dropped, summarizeMax, summarizer, summaWords, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, alreadySummarizedHashes, backgroundSummarize);
 			return {
 				messages: result.messages,
 				summarized: result.summarized,
