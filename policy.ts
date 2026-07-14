@@ -1897,6 +1897,54 @@ export function applyIntercomKeepLast(
 }
 
 /**
+ * Pure recency hardtrim for `subagent-notify` custom entries. Keeps
+ * the last N `subagent-notify` entries by stream order and drops the
+ * rest. Identification: `role === "custom" && customType === "subagent-notify"`.
+ * Non-`subagent-notify` entries are preserved untouched. Cap semantics
+ * mirror `applyIntercomKeepLast`:
+ *   keepLast === -1  → passthrough (returns a shallow copy).
+ *   keepLast ===  0  → drop every `subagent-notify` entry.
+ *   keepLast  >  0   → keep the last `keepLast` entries.
+ * Pure: no I/O, no `process.*`; the wiring layer coerces floats with
+ * `Math.trunc` (summaWords precedent) and gates by the
+ * `resolveIntercomInstalled` extension probe.
+ */
+export function applySubagentNotifyKeepLast(
+	messages: ReadonlyArray<TrimmableMessage>,
+	keepLast: number,
+): TrimmableMessage[] {
+	if (keepLast === -1) return messages.slice();
+	const total = messages.length;
+	const indices: number[] = [];
+	for (let i = 0; i < total; i++) {
+		const m = messages[i];
+		if (m.role === "custom" && m.customType === "subagent-notify") {
+			indices.push(i);
+		}
+	}
+	if (indices.length === 0) return messages.slice();
+	if (keepLast === 0) {
+		const dropSet = new Set(indices);
+		const out: TrimmableMessage[] = new Array(total - indices.length);
+		let j = 0;
+		for (let i = 0; i < total; i++) {
+			if (!dropSet.has(i)) out[j++] = messages[i];
+		}
+		return out;
+	}
+	if (keepLast >= indices.length) return messages.slice();
+	const dropCount = indices.length - keepLast;
+	const dropSet = new Set<number>();
+	for (let i = 0; i < dropCount; i++) dropSet.add(indices[i]);
+	const out: TrimmableMessage[] = new Array(total - dropCount);
+	let j = 0;
+	for (let i = 0; i < total; i++) {
+		if (!dropSet.has(i)) out[j++] = messages[i];
+	}
+	return out;
+}
+
+/**
  * Run-identity key for `subagent-notify` entries. The stable
  * identifier that distinguishes one delivery from a redelivery of
  * the same run is the entry's `details.sessionValue` when present

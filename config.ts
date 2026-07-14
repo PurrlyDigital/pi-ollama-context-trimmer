@@ -123,6 +123,18 @@ export interface ContextTrimmerConfig {
 	 *  The wiring layer coerces with `Math.trunc` (summaWords
 	 *  precedent). Overrides the policy default when set. */
 	readonly intercomKeepLast?: number;
+	/** `subagent-notify` recency hardtrim. The wiring layer (in
+	 *  the context handler) keeps the last N `subagent-notify`
+	 *  custom entries in the message stream and drops the rest
+	 *  before the three-tier trim runs. Integer semantics:
+	 *  `-1` = send all (passthrough), `0` = send none, any
+	 *  positive integer = send that many (counted from the latest).
+	 *  The wiring layer coerces with `Math.trunc` (summaWords
+	 *  precedent). Default fallthrough: when unset in both env and
+	 *  JSON, the effective value equals the resolved
+	 *  `intercomKeepLast` value (env > JSON >
+	 *  `DEFAULT_INTERCOM_KEEP_LAST`). */
+	readonly subagentNotifyKeepLast?: number;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -167,6 +179,7 @@ export const ENV = {
 	pinSubagent: "PI_CONTEXT_TRIMMER_PIN_SUBAGENT",
 	reasoningBlockCap: "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP",
 	intercomKeepLast: "PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST",
+	subagentNotifyKeepLast: "PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -199,6 +212,7 @@ export interface ParsedConfigFile {
 	pinSubagent?: boolean;
 	reasoningBlockCap?: number;
 	intercomKeepLast?: number;
+	subagentNotifyKeepLast?: number;
 }
 
 /**
@@ -262,6 +276,9 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (isValidBlockCap(o.intercomKeepLast)) {
 		out.intercomKeepLast = o.intercomKeepLast;
 	}
+	if (isValidBlockCap(o.subagentNotifyKeepLast)) {
+		out.subagentNotifyKeepLast = o.subagentNotifyKeepLast;
+	}
 	return out;
 }
 
@@ -321,6 +338,8 @@ export function resolveConfig(opts: {
 		parseBlockCapEnv(env[ENV.reasoningBlockCap]) ?? file.reasoningBlockCap;
 	const intercomKeepLast =
 		parseBlockCapEnv(env[ENV.intercomKeepLast]) ?? file.intercomKeepLast;
+	const subagentNotifyKeepLast =
+		parseBlockCapEnv(env[ENV.subagentNotifyKeepLast]) ?? file.subagentNotifyKeepLast;
 
 	let asyncMode: boolean;
 	const envAm = env[ENV.asyncMode];
@@ -375,6 +394,7 @@ export function resolveConfig(opts: {
 		pinSubagent,
 		reasoningBlockCap,
 		intercomKeepLast,
+		subagentNotifyKeepLast,
 	};
 }
 

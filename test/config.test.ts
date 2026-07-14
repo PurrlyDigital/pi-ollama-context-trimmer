@@ -1637,6 +1637,206 @@ describe("intercomKeepLast — resolveConfig (precedence)", () => {
 		assert.equal(parsedInteger.intercomKeepLast, 5, "integer file value survives the parse");
 	});
 });
+// ─── subagentNotifyKeepLast (Rule 2b of the pre-budget collapse) ─────
+//
+// `subagentNotifyKeepLast` is the operator-configurable knob that
+// controls how many `subagent-notify` custom entries the wiring layer
+// keeps per message stream (counted from the latest), mirroring
+// `intercomKeepLast`. Integer semantics: `-1` = send all (passthrough),
+// `0` = send none, any positive integer is the count of entries to
+// keep. The knob is exposed in BOTH channels (env
+// `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` and the
+// `subagentNotifyKeepLast` JSON key) per the tandem principle;
+// precedence is env > file > default fallthrough to the resolved
+// `intercomKeepLast` value. The wiring layer coerces floats with
+// `Math.trunc` (summaWords precedent) before passing the value to
+// the pure policy function.
+
+describe("subagentNotifyKeepLast — file channel (parseConfigFile)", () => {
+	it("file parse: -1 (passthrough sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: -1 }).subagentNotifyKeepLast, -1);
+	});
+
+	it("file parse: 0 (send-none sentinel) is accepted", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 0 }).subagentNotifyKeepLast, 0);
+	});
+
+	it("file parse: a positive integer is accepted", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 1 }).subagentNotifyKeepLast, 1);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 5 }).subagentNotifyKeepLast, 5);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 100 }).subagentNotifyKeepLast, 100);
+	});
+
+	it("file parse: value < -1 is treated as absent", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: -2 }).subagentNotifyKeepLast, undefined);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: -100 }).subagentNotifyKeepLast, undefined);
+	});
+
+	it("file parse: a non-integer (float) is treated as absent", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 1.5 }).subagentNotifyKeepLast, undefined);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: 0.5 }).subagentNotifyKeepLast, undefined);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: -0.5 }).subagentNotifyKeepLast, undefined);
+	});
+
+	it("file parse: non-numeric (string, boolean, null, object) is treated as absent", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: "5" }).subagentNotifyKeepLast, undefined, "string '5' is rejected (the JSON channel does not coerce)");
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: true }).subagentNotifyKeepLast, undefined, "boolean true is rejected");
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: null }).subagentNotifyKeepLast, undefined, "null is rejected");
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: { a: 1 } }).subagentNotifyKeepLast, undefined, "object is rejected");
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: Number.NaN }).subagentNotifyKeepLast, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: Number.POSITIVE_INFINITY }).subagentNotifyKeepLast, undefined);
+		assert.equal(parseConfigFile({ subagentNotifyKeepLast: Number.NEGATIVE_INFINITY }).subagentNotifyKeepLast, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ personalityPath: "/p" }).subagentNotifyKeepLast, undefined);
+	});
+});
+
+describe("subagentNotifyKeepLast — resolveConfig (precedence)", () => {
+	// The wiring layer's contract is
+	// `cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : cfg.intercomKeepLast`
+	// — the resolver returns `undefined` when neither channel sets
+	// a value, and the wiring layer falls through to the resolved
+	// `intercomKeepLast` value. The tests below assert the resolver's
+	// behavior; the wiring layer's fallthrough is covered in
+	// `integration.test.ts`.
+
+	it("env > file: env wins when both channels set a value", () => {
+		const cfg = resolveConfig({
+			file: { subagentNotifyKeepLast: 3 },
+			env: { [ENV.subagentNotifyKeepLast]: "5" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 5, "env value 5 wins over file value 3");
+	});
+
+	it("env wins with -1 (passthrough sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { subagentNotifyKeepLast: 1 },
+			env: { [ENV.subagentNotifyKeepLast]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, -1, "env -1 wins over file 1 (passthrough sentinel is honored)");
+	});
+
+	it("env wins with 0 (send-none sentinel)", () => {
+		const cfg = resolveConfig({
+			file: { subagentNotifyKeepLast: 1 },
+			env: { [ENV.subagentNotifyKeepLast]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 0, "env 0 wins over file 1 (send-none sentinel is honored)");
+	});
+
+	it("file-only: env unset, file sets a value → file value returned", () => {
+		const cfg = resolveConfig({
+			file: { subagentNotifyKeepLast: 7 },
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 7, "file-only returns the file value");
+	});
+
+	it("nothing configured: both unset → resolver returns undefined (wiring falls through to intercomKeepLast)", () => {
+		// The resolver does NOT apply a default itself — the
+		// wiring layer (index.ts) is what reads the resolved
+		// `intercomKeepLast` value when the resolver returns
+		// undefined. The two-layer contract mirrors the existing
+		// `intercomKeepLast` shape.
+		const cfg = resolveConfig({});
+		assert.equal(cfg.subagentNotifyKeepLast, undefined, "no value configured → undefined (wiring layer falls through to intercomKeepLast)");
+	});
+
+	it("empty-string env falls back to file value", () => {
+		const cfg = resolveConfig({
+			file: { subagentNotifyKeepLast: 3 },
+			env: { [ENV.subagentNotifyKeepLast]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 3, "empty-string env is treated as no override; file value wins");
+	});
+
+	it("badly-typed env (non-integer string) falls back to file value", () => {
+		const cfgAbc = resolveConfig({
+			file: { subagentNotifyKeepLast: 3 },
+			env: { [ENV.subagentNotifyKeepLast]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfgAbc.subagentNotifyKeepLast, 3, "env 'abc' falls back to file value");
+		const cfgFloat = resolveConfig({
+			file: { subagentNotifyKeepLast: 3 },
+			env: { [ENV.subagentNotifyKeepLast]: "1.5" } as EnvRecord,
+		});
+		assert.equal(cfgFloat.subagentNotifyKeepLast, 3, "env '1.5' (non-integer) falls back to file value");
+	});
+
+	it("badly-typed file value falls back to env (then to undefined)", () => {
+		const parsed = parseConfigFile({ subagentNotifyKeepLast: "5" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.subagentNotifyKeepLast]: "3" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 3, "parseConfigFile drops the bad file value; env value wins");
+	});
+
+	it("badly-typed in BOTH channels → resolver returns undefined", () => {
+		const parsed = parseConfigFile({ subagentNotifyKeepLast: "5" });
+		const cfg = resolveConfig({
+			file: parsed,
+			env: { [ENV.subagentNotifyKeepLast]: "abc" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, undefined, "both channels badly-typed → undefined (wiring default fallthrough applies)");
+	});
+
+	it("env value < -1 falls back to file value (or undefined)", () => {
+		const cfgFile = resolveConfig({
+			file: { subagentNotifyKeepLast: 3 },
+			env: { [ENV.subagentNotifyKeepLast]: "-2" } as EnvRecord,
+		});
+		assert.equal(cfgFile.subagentNotifyKeepLast, 3, "env -2 falls back to file value");
+		const cfgUnset = resolveConfig({
+			env: { [ENV.subagentNotifyKeepLast]: "-100" } as EnvRecord,
+		});
+		assert.equal(cfgUnset.subagentNotifyKeepLast, undefined, "env -100, no file → undefined");
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric integer string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.subagentNotifyKeepLast]: "10" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, 10);
+		assert.equal(typeof cfg.subagentNotifyKeepLast, "number");
+	});
+
+	it("env parse: the -1 sentinel is preserved as a number, not coerced to 0", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.subagentNotifyKeepLast]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfg.subagentNotifyKeepLast, -1, "env -1 is preserved as the passthrough sentinel");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.subagentNotifyKeepLast is the documented namespace", () => {
+		assert.equal(ENV.subagentNotifyKeepLast, "PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST");
+	});
+
+	// --- Math.trunc coercion at the wiring layer (covered as a
+	//     config-layer test for the resolveConfig contract: the
+	//     resolver does NOT coerce; float inputs are rejected by
+	//     the parseConfigFile `isValidBlockCap` predicate and
+	//     treated as absent). The wiring layer's coercion is
+	//     exercised end-to-end in `integration.test.ts`.
+
+	it("resolver contract: floats are treated as absent at the parse layer; the wiring layer applies Math.trunc to a configured integer value", () => {
+		const parsedFloat = parseConfigFile({ subagentNotifyKeepLast: 1.5 });
+		assert.equal(parsedFloat.subagentNotifyKeepLast, undefined, "non-integer file value is treated as absent (Math.trunc is the wiring layer's job, not the resolver's)");
+		const parsedInteger = parseConfigFile({ subagentNotifyKeepLast: 5 });
+		assert.equal(parsedInteger.subagentNotifyKeepLast, 5, "integer file value survives the parse");
+	});
+});
 // ─── tokenEstimatorDivisor (the operator-configurable chars-per-token) ─
 //
 // `tokenEstimatorDivisor` is the operator-configurable knob that
