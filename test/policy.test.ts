@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import {
 	applyIntercomKeepLast,
 	applyReasoningBlockCap,
+	applySubagentNotifyKeepLast,
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	approximateTextTokens,
@@ -2985,6 +2986,174 @@ function notifyWithAgent(label: string, agent: string, status: string, resultPre
 		details: { agent, status, resultPreview, taskInfo: { id: "task-1" } },
 	};
 }
+
+// ─── Pre-budget collapse — applySubagentNotifyKeepLast (AC-2) ────────
+//
+// `applySubagentNotifyKeepLast` is the recency hardtrim for
+// `subagent-notify` custom entries, mirroring `applyIntercomKeepLast`.
+// Cap semantics:
+//   keepLast === -1  → passthrough (no allocation when the input is
+//                      large; the policy returns `messages.slice()`).
+//   keepLast ===  0  → drop every subagent-notify entry.
+//   keepLast  >  0   → keep the last `keepLast` entries.
+// Pure: no I/O, no `process.*`; the wiring layer coerces floats with
+// `Math.trunc` (summaWords precedent) and gates by the
+// `resolveIntercomInstalled` extension probe.
+
+describe("applySubagentNotifyKeepLast", () => {
+	// ── cap === -1 (passthrough) ──────────────────────────────────
+
+	it("keepLast === -1: returns the input unchanged (passthrough)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			notifyMsg("first", "run-1"),
+			assistantMsg("hi"),
+			notifyMsg("second", "run-2"),
+			notifyMsg("third", "run-3"),
+		];
+		const out = applySubagentNotifyKeepLast(messages, -1);
+		assert.equal(out.length, messages.length);
+		for (let i = 0; i < out.length; i++) {
+			assert.equal(out[i], messages[i], `message ${i} preserved at keepLast=-1`);
+		}
+	});
+
+	// ── cap === 0 (drop all) ─────────────────────────────────────
+
+	it("keepLast === 0: drops every subagent-notify entry; non-subagent-notify entries preserved", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			notifyMsg("first", "run-1"),
+			assistantMsg("hi"),
+			notifyMsg("second", "run-2"),
+			notifyMsg("third", "run-3"),
+			{ role: "toolResult", content: "ok" },
+		];
+		const out = applySubagentNotifyKeepLast(messages, 0);
+		assert.equal(out.length, 3, "every subagent-notify is dropped (dispatch + assistant + toolResult survive)");
+		assert.equal((out[0] as TrimmableMessage).role, "user");
+		assert.equal((out[1] as TrimmableMessage).role, "assistant");
+		assert.equal((out[2] as TrimmableMessage).role, "toolResult");
+		// No `customType: "subagent-notify"` survives.
+		for (const m of out) {
+			assert.notEqual((m as TrimmableMessage).customType, "subagent-notify");
+		}
+	});
+
+	// ── cap === 1 (keep last) ────────────────────────────────────
+
+	it("keepLast === 1: only the LAST subagent-notify survives; all earlier ones dropped", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("first", "run-1"),
+			assistantMsg("hi"),
+			notifyMsg("second", "run-2"),
+			notifyMsg("third", "run-3"),
+		];
+		const out = applySubagentNotifyKeepLast(messages, 1);
+		assert.equal(out.length, 2, "assistant + 1 surviving subagent-notify");
+		assert.equal((out[0] as TrimmableMessage).role, "assistant");
+		assert.equal((out[1] as TrimmableMessage).customType, "subagent-notify");
+		assert.equal((out[1] as TrimmableMessage).content, "third", "the LAST subagent-notify by stream order survives");
+	});
+
+	// ── cap === 3 (keep last 3) ─────────────────────────────────
+
+	it("keepLast === 3: the last 3 subagent-notify entries survive (of 5 total)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("m1", "run-1"),
+			notifyMsg("m2", "run-2"),
+			notifyMsg("m3", "run-3"),
+			notifyMsg("m4", "run-4"),
+			notifyMsg("m5", "run-5"),
+		];
+		const out = applySubagentNotifyKeepLast(messages, 3);
+		assert.equal(out.length, 3);
+		assert.deepEqual(
+			out.map((m) => (m as TrimmableMessage).content),
+			["m3", "m4", "m5"],
+			"the last 3 subagent-notify entries by stream order survive (m1 and m2 are dropped)",
+		);
+	});
+
+	// ── cap > total: no over-drop ────────────────────────────────
+
+	it("keepLast > total subagent-notify entries: every entry survives (no over-drop)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("m1", "run-1"),
+			notifyMsg("m2", "run-2"),
+		];
+		const out = applySubagentNotifyKeepLast(messages, 10);
+		assert.equal(out.length, 2, "all entries survive when cap > total");
+	});
+
+	// ── mixed stream: non-subagent-notify custom entries untouched ─
+
+	it("preserves non-subagent-notify custom entries (intercom_message, pinned, preserved)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			notifyMsg("notify-1", "run-1"),
+			customMsg("icm-1", "intercom_message"),
+			notifyMsg("notify-2", "run-2"),
+			pinnedMsg("agent def"),
+			customMsg("preserved-1", "context-trimmer-preserved"),
+			notifyMsg("notify-3", "run-3"),
+		];
+		const out = applySubagentNotifyKeepLast(messages, 1);
+		// Surviving: dispatch + intercom_message + pinned + preserved + last subagent-notify = 5.
+		assert.equal(out.length, 5);
+		const customTypes = out
+			.map((m) => (m as TrimmableMessage).customType)
+			.filter((ct) => ct !== undefined);
+		assert.deepEqual(customTypes, [
+			"intercom_message",
+			"context-trimmer-pinned",
+			"context-trimmer-preserved",
+			"subagent-notify",
+		], "non-subagent-notify custom entries survive in stream order");
+		assert.equal(out[out.length - 1].content, "notify-3", "the LAST subagent-notify by stream order survives");
+	});
+
+	// ── no subagent-notify entries: pure passthrough ─────────────
+
+	it("messages with no subagent-notify entries: input returned unchanged (no scan overhead when not present)", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("hi"),
+			{ role: "toolResult", content: "ok" },
+		];
+		for (const keepLast of [-1, 0, 1, 5]) {
+			const out = applySubagentNotifyKeepLast(messages, keepLast);
+			assert.equal(out.length, messages.length, `length preserved at keepLast=${keepLast}`);
+			for (let i = 0; i < out.length; i++) {
+				assert.equal(out[i], messages[i], `message ${i} preserved at keepLast=${keepLast}`);
+			}
+		}
+	});
+
+	// ── immutability: the input array is not mutated ──────────────
+
+	it("does not mutate the input messages array", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyMsg("a", "run-1"),
+			notifyMsg("b", "run-2"),
+			notifyMsg("c", "run-3"),
+		];
+		const snapshot = JSON.stringify(messages);
+		applySubagentNotifyKeepLast(messages, 1);
+		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated");
+	});
+
+	// ── purity: function source has no process.* or I/O ──────────
+
+	it("purity: applySubagentNotifyKeepLast source has no process.*, node:fs, node:os, or other I/O", async () => {
+		const src = applySubagentNotifyKeepLast.toString();
+		assert.ok(!src.includes("process."), "applySubagentNotifyKeepLast must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "applySubagentNotifyKeepLast must not import node:fs");
+		assert.ok(!src.includes("node:os"), "applySubagentNotifyKeepLast must not import node:os");
+		assert.ok(!src.includes("fetch("), "applySubagentNotifyKeepLast must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "applySubagentNotifyKeepLast must not perform filesystem I/O");
+	});
+});
 
 describe("dedupSubagentNotify", () => {
 	it("keeps the first occurrence of each run identity; drops subsequent duplicates", async () => {

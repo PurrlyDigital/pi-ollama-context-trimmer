@@ -2918,6 +2918,101 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		const dispatch = result.messages.find((m) => m.role === "user" && m.content === "dispatch");
 		assert.ok(dispatch, "the dispatch user message survives the pre-budget passes");
 	});
+
+	// ── subagentNotifyKeepLast integration ────────────────────────
+
+	it("subagentNotifyKeepLast=5: 30 subagent-notify entries → exactly 5 survive (after dedup)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.subagentNotifyKeepLast] = "5";
+		const pi = await loadExtensionWithTools(["intercom"]);
+		const messages: Array<Record<string, unknown>> = [userMsg("dispatch")];
+		for (let i = 1; i <= 30; i++) {
+			messages.push({ role: "custom", content: `notify-${i}`, customType: "subagent-notify", details: { sessionValue: `run-${i}` } });
+		}
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotify.length, 5, "subagentNotifyKeepLast=5 yields exactly 5 subagent-notify entries");
+		assert.deepEqual(
+			survivingNotify.map((m) => m.content),
+			["notify-26", "notify-27", "notify-28", "notify-29", "notify-30"],
+		);
+	});
+
+	it("subagentNotifyKeepLast=0: drops every subagent-notify entry", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.subagentNotifyKeepLast] = "0";
+		const pi = await loadExtensionWithTools(["intercom"]);
+		const messages: Array<Record<string, unknown>> = [
+			userMsg("dispatch"),
+			{ role: "custom", content: "n1", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			{ role: "custom", content: "n2", customType: "subagent-notify", details: { sessionValue: "run-2" } },
+		];
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotify.length, 0, "subagentNotifyKeepLast=0 drops every subagent-notify entry");
+	});
+
+	it("subagentNotifyKeepLast default fallthrough: unset → uses resolved intercomKeepLast value", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		// Set intercomKeepLast=3 but leave subagentNotifyKeepLast unset.
+		process.env[CONFIG_ENV.intercomKeepLast] = "3";
+		delete process.env[CONFIG_ENV.subagentNotifyKeepLast];
+		const pi = await loadExtensionWithTools(["intercom"]);
+		const messages: Array<Record<string, unknown>> = [userMsg("dispatch")];
+		for (let i = 1; i <= 10; i++) {
+			messages.push({ role: "custom", content: `notify-${i}`, customType: "subagent-notify", details: { sessionValue: `run-${i}` } });
+		}
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotify.length, 3, "unset subagentNotifyKeepLast falls through to intercomKeepLast=3");
+		assert.deepEqual(
+			survivingNotify.map((m) => m.content),
+			["notify-8", "notify-9", "notify-10"],
+		);
+	});
+
+	it("subagentNotifyKeepLast ordering: dedup → recency trim (dedup first, then keep-last on deduped stream)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.subagentNotifyKeepLast] = "2";
+		const pi = await loadExtensionWithTools(["intercom"]);
+		// 3 distinct runs, but run-1 appears twice (duplicate).
+		// After dedup: 3 entries (run-1, run-2, run-3).
+		// After keep-last=2: run-2 and run-3 survive.
+		const messages: Array<Record<string, unknown>> = [
+			userMsg("dispatch"),
+			{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			{ role: "custom", content: "n1-dup", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			{ role: "custom", content: "n2", customType: "subagent-notify", details: { sessionValue: "run-2" } },
+			{ role: "custom", content: "n3", customType: "subagent-notify", details: { sessionValue: "run-3" } },
+		];
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotify.length, 2, "dedup first (3 distinct), then keep-last=2 → 2 survive");
+		assert.deepEqual(
+			survivingNotify.map((m) => m.content),
+			["n2", "n3"],
+			"the last 2 distinct subagent-notify entries survive (run-1 deduped, then run-1 dropped by recency)",
+		);
+	});
+
+	it("subagentNotifyKeepLast gated by intercom tool: no intercom → no recency trim (inert)", async () => {
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		process.env[CONFIG_ENV.subagentNotifyKeepLast] = "1";
+		const pi = await loadExtensionWithTools([]); // no intercom tool
+		const messages: Array<Record<string, unknown>> = [
+			userMsg("dispatch"),
+			{ role: "custom", content: "n1", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+			{ role: "custom", content: "n2", customType: "subagent-notify", details: { sessionValue: "run-2" } },
+		];
+		const event = { messages };
+		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
+		assert.equal(survivingNotify.length, 2, "no intercom tool → subagentNotifyKeepLast is inert; all entries survive");
+	});
 });
 // ─── System-prompt token capture at the wiring layer (AC-2) ──────────
 //

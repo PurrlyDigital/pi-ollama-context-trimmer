@@ -58,6 +58,7 @@ import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
 	applyReasoningBlockCap,
+	applySubagentNotifyKeepLast,
 	applyThreeTierTrim,
 	approximateMessageTokens,
 	approximateTextTokens,
@@ -674,6 +675,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// `customType`); Rule 1 still applies on a cache-substituted
 		// entry.
 		const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;
+		const subagentNotifyKeepLast = cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : intercomKeepLast;
 		const intercomInstalled = resolveIntercomInstalled();
 		const subagentsInstalled = resolveSubagentsInstalled();
 		const afterRule1: TrimmableMessage[] = intercomInstalled
@@ -682,9 +684,12 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const afterRule2: TrimmableMessage[] = intercomInstalled
 			? dedupSubagentNotify(afterRule1)
 			: afterRule1;
-		const afterRule3: TrimmableMessage[] = subagentsInstalled
-			? keepLatestSubagentToolResult(afterRule2)
+		const afterRule2b: TrimmableMessage[] = intercomInstalled
+			? applySubagentNotifyKeepLast(afterRule2, subagentNotifyKeepLast)
 			: afterRule2;
+		const afterRule3: TrimmableMessage[] = subagentsInstalled
+			? keepLatestSubagentToolResult(afterRule2b)
+			: afterRule2b;
 		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(afterRule3, reasoningBlockCap);
 		const withPinned: TrimmableMessage[] = pinned
 			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...cappedBase]
