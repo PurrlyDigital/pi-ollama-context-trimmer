@@ -251,6 +251,38 @@ const execFileAsync = promisify(execFile);
 let lastSummarizerFailed = false;
 
 /**
+ * Wraps an async summarizer function with a promise-chain
+ * serialization gate that ensures only one invocation runs at a
+ * time. When multiple calls arrive concurrently (the policy fires
+ * them without await in background mode), each call waits for the
+ * previous one to complete before starting its own work. The gate
+ * is promise-based (not a blocking mutex), so the event loop stays
+ * responsive.
+ *
+ * Exported for testability: the AC-5 concurrent-invocation
+ * tracking test wraps a non-self-serializing tracking stub with
+ * this wrapper to verify the "one in flight" invariant at the
+ * policy layer.
+ */
+export function serializeSummarizer<T extends (...args: any[]) => Promise<string>>(fn: T): T {
+	let gate: Promise<void> = Promise.resolve();
+	const wrapped = async (...args: any[]): Promise<string> => {
+		const prev = gate;
+		let release: () => void;
+		gate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await prev;
+		try {
+			return await fn(...args);
+		} finally {
+			release!();
+		}
+	};
+	return wrapped as T;
+}
+
+/**
  * The default production summarizer: shells out to Python `summa`
  * asynchronously via `execFile` (non-blocking — the event loop is
  * not stalled while summa runs). On error (summa missing, input too
@@ -258,8 +290,14 @@ let lastSummarizerFailed = false;
  * trim path stays total-bounded; the diagnostic is exposed via the
  * `lastSummarizerFailed` export. Tests pass their own `summarizer`
  * and never hit this path.
+ *
+ * Serialization: the `execFileAsync` call is wrapped in the
+ * `serializeSummarizer` gate, ensuring only one summa subprocess
+ * runs at a time. The policy fires summarizer calls without await
+ * (background mode); the serialization is the callback's
+ * responsibility, not the policy's.
  */
-async function defaultSummaSummarizer(text: string, words: number): Promise<string> {
+const defaultSummaSummarizer = serializeSummarizer(async (text: string, words: number): Promise<string> => {
 	if (!text || text.length < 200) return text;
 	const script =
 		"import sys\n" +
@@ -279,7 +317,7 @@ async function defaultSummaSummarizer(text: string, words: number): Promise<stri
 		lastSummarizerFailed = true;
 		return text;
 	}
-}
+});
 
 // ─── Extension entry point ─────────────────────────────────────────────
 
