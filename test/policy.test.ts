@@ -42,6 +42,7 @@ import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	type TrimmableMessage,
 } from "../policy.ts";
+import { serializeSummarizer } from "../index.ts";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 
@@ -2225,6 +2226,83 @@ describe("applyThreeTierTrim — background summarizer mode", () => {
 		// to that text.
 		const summaryText = await result.pendingSummaries![0].promise;
 		assert.equal(summaryText, "summary", "the pending promise resolves to the summarizer's return value");
+	});
+});
+
+// ─── Concurrent-invocation tracking (AC-5) ───────────────────────────
+//
+// Characterization test of the production serializer's invariant:
+// when the policy fires summarizer callbacks in background mode,
+// the summarizer must never have more than one invocation in flight
+// at a time. The test synthesizes 5+ summarizable messages, calls
+// `applyThreeTierTrim` with `backgroundSummarize: true` and a
+// tracking summarizer that increments a counter on entry, awaits a
+// small deferred promise, decrements on exit, and records the
+// high-water mark. The assertion verifies the concurrent-invocation
+// count never exceeds 1.
+//
+// The tracking summarizer is deliberately NON-self-serializing (no
+// internal gate). It is wrapped with the production
+// `serializeSummarizer` from `index.ts` — the same wrapper that
+// gates `defaultSummaSummarizer`. This verifies the production
+// serializer's invariant at the policy layer without shelling out
+// to Python.
+//
+// Messages are sized to land in the summarize tier (tier 2):
+// total trimmable tokens between VERBATIM_TIER_MAX_TOKENS (50k)
+// and SUMMARIZE_TIER_MAX_TOKENS (100k). Each assistant message
+// is 15k tokens (45k chars), well above summaWords (60) so the
+// summarization is beneficial. 5 messages × 15k = 75k total,
+// comfortably in tier 2.
+
+describe("applyThreeTierTrim — concurrent-invocation tracking (AC-5)", () => {
+	it("never exceeds 1 concurrent summarizer invocation in background mode", async () => {
+		// Build 5 summarizable messages sized to land in tier 2
+		// (total trimmable tokens between 50k and 100k).
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			assistantMsg("a".repeat(15_000 * 3)),
+			assistantMsg("b".repeat(15_000 * 3)),
+			assistantMsg("c".repeat(15_000 * 3)),
+			assistantMsg("d".repeat(15_000 * 3)),
+			assistantMsg("e".repeat(15_000 * 3)),
+		];
+
+		let concurrent = 0;
+		let highWater = 0;
+
+		// A NON-self-serializing tracking stub: no internal gate,
+		// no promise-chain serialization. If the production
+		// serializer's gate were absent, the policy's fan-out
+		// would call this stub concurrently and highWater > 1.
+		const rawStub = async (_text: string, _w: number): Promise<string> => {
+			concurrent += 1;
+			highWater = Math.max(highWater, concurrent);
+			// Yield control briefly so other summarizer calls can
+			// enter if the serializer is not gating them.
+			await new Promise((r) => setTimeout(r, 5));
+			concurrent -= 1;
+			return "summary";
+		};
+
+		// Wrap the raw stub with the production serializer gate.
+		const serializedStub = serializeSummarizer(rawStub);
+
+		const result = await applyThreeTierTrim(messages, {
+			summarizer: serializedStub,
+			backgroundSummarize: true,
+		});
+		// (i) At least one background promise was fired.
+		assert.ok(result.summarized >= 1, "at least one background promise was fired");
+		// (ii) The high-water mark of concurrent invocations is 1.
+		assert.equal(highWater, 1, "concurrent summarizer invocations never exceeded 1");
+		// (iii) All pending promises resolve.
+		if (result.pendingSummaries) {
+			for (const pending of result.pendingSummaries) {
+				const text = await pending.promise;
+				assert.equal(text, "summary", "each pending promise resolves to the summary text");
+			}
+		}
 	});
 });
 
