@@ -43,12 +43,12 @@ The extension is global — once installed, every Pi session (parent and subagen
 ## How the protected inputs are wired
 
 - The agent def travels as a **synthetic `custom` message** (`customType: "context-trimmer-pinned"`) prepended to the per-LLM-call view. The trim policy's `protectedCustomTypes` option matches that customType and excludes the synthetic from the budget.
-- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from summary and drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
+- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
 - A session that contains ONLY the dispatch + the pinned synthetic + a single short trimmable message (e.g. a freshly dispatched subagent) never enters the trim path: the trimmable mass is under 50k, so the messages are returned verbatim.
 
 ## Loop guard
 
-Defense-in-depth alongside the trim. The trim bounds **context size** (drop / summarize over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
+Defense-in-depth alongside the trim. The trim bounds **context size** (drop / hold-untouched over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
 
 The guard is **ON by default for every session** (every session posture — parent and subagent). The previous subagent-only `"auto"` posture was dropped because behavioral-loop detection is the same concern whether the model is in a parent or a subagent session. Operators opt out with `"loopGuard": false` in the config file, or `PI_CONTEXT_TRIMMER_LOOP_GUARD=0` in the environment. The previous `"auto"` value is no longer accepted — it is treated as absent and the resolver falls through to the default `true`.
 
@@ -170,7 +170,7 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (441 tests, ~1s on a modern laptop):
+Run the test suite (316 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency

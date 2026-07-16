@@ -1289,7 +1289,7 @@ export function applyIntercomKeepLast(
  *   keepLast ===  0  → drop every `subagent-notify` entry.
  *   keepLast  >  0   → keep the last `keepLast` entries.
  * Pure: no I/O, no `process.*`; the wiring layer coerces floats with
- * `Math.trunc` (summaWords precedent) and gates by the
+ * `Math.trunc` and gates by the
  * `resolveIntercomInstalled` extension probe.
  */
 export function applySubagentNotifyKeepLast(

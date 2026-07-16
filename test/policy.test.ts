@@ -1,11 +1,8 @@
 // ─── Policy tests — three-tier trim ──────────────────────────────────
 //
 // Covers the three tiers, the protected slots (dispatch task +
-// pinned-tier synthetic), the per-message token accounting, the
-// oldest-first whole-turn drop, and the summarize-loop semantics.
-// The Python `summa` subprocess is mocked via a deterministic
-// `summarizer` callback; the integration test in
-// `integration.test.ts` exercises the production default separately.
+// pinned-tier synthetic), the per-message token accounting, and the
+// oldest-first whole-turn drop.
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
@@ -335,6 +332,53 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 	});
 });
 
+// ─── Tier 2 empty seam (transient hold-untouched behavior) ────────────
+//
+// The summarize path was removed. Tier 2 holds middle-band messages
+// untouched; Tier 3 catches oversize if it grows further. This
+// describe block locks the transient hold-untouched behavior as a
+// discoverable, greppable contract.
+
+describe("applyThreeTierTrim — tier 2 empty seam (hold-untouched)", () => {
+	it("returns messages unchanged when total is between verbatim and summarize caps", async () => {
+		const messages = trimmableMass(60_000);
+		const result = await applyThreeTierTrim(messages);
+		assert.equal(result.droppedTurns, 0);
+		assert.equal(result.messages.length, messages.length);
+		for (let i = 0; i < messages.length; i++) {
+			assert.equal(result.messages[i].content, messages[i].content);
+		}
+	});
+
+	it("preserves the dispatch task through the hold-untouched tier", async () => {
+		const messages = trimmableMass(60_000);
+		const result = await applyThreeTierTrim(messages);
+		assert.equal(result.messages[0].content, "dispatch task — do X");
+	});
+
+	it("preserves protected custom types through the hold-untouched tier", async () => {
+		const protectedSet = new Set(["context-trimmer-pinned"]);
+		const messages = [
+			pinnedMsg("agent def " + "p".repeat(20_000 * 4)),
+			userMsg("dispatch", 0),
+			assistantMsg("x".repeat(30_000 * 4)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			protectedCustomTypes: protectedSet,
+		});
+		const pinned = result.messages.find(
+			(m) => m.role === "custom" && m.customType === "context-trimmer-pinned",
+		);
+		assert.ok(pinned, "pinned message must be preserved");
+	});
+
+	it("totalTokens equals the input total (no change)", async () => {
+		const messages = trimmableMass(60_000);
+		const result = await applyThreeTierTrim(messages);
+		assert.equal(result.totalTokens, totalTrimmableTokens(messages));
+	});
+});
+
 function notifyWithAgent(label: string, agent: string, status: string, resultPreview: string): TrimmableMessage {
 	return {
 		role: "custom",
@@ -382,7 +426,7 @@ function customMsg(label: string, customType: string): TrimmableMessage {
 //   keepLast ===  0  → drop every subagent-notify entry.
 //   keepLast  >  0   → keep the last `keepLast` entries.
 // Pure: no I/O, no `process.*`; the wiring layer coerces floats with
-// `Math.trunc` (summaWords precedent) and gates by the
+// `Math.trunc` and gates by the
 // `resolveIntercomInstalled` extension probe.
 
 describe("applySubagentNotifyKeepLast", () => {
@@ -850,11 +894,11 @@ describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
 // it as `protectedToolCallIds: ReadonlySet<string>`), and the policy
 // keeps each protected `toolCall` block + its matching `toolResult`
 // as an atomic chain at block-level granularity. The chain is
-// protected from drop AND summarize: the protected `toolResult` is
+// protected from drop: the protected `toolResult` is
 // a message-level protected slot, and the protected `toolCall` block
 // survives inside its assistant message via the block-level
 // carve-out. An unprotected `toolCall` block that is dropped or
-// summarized has its matching `toolResult` dropped alongside (the
+// dropped has its matching `toolResult` dropped alongside (the
 // pair is atomic in both directions, no orphan).
 //
 // The test surface below covers the five AC-7 cases:
@@ -864,14 +908,14 @@ describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
 //       by association.
 //   (b) block-level granularity — the assistant turn is NOT a
 //       protected slot, so the `text`/`thinking` blocks stay
-//       trimmable/summarizable while the protected `toolCall` block
+//       trimmable/trimmable while the protected `toolCall` block
 //       survives inside the rewritten message.
 //   (c) orphan scenario for both tiers — a `toolResult` whose
-//       matching `toolCall` is in a dropped or summarized turn
+//       matching `toolCall` is in a dropped turn
 //       does not survive with a dangling `toolCallId` (the
 //       protected `toolResult` survives; the unprotected
 //       `toolResult` is dropped alongside its `toolCall`).
-//   (d) no-regression floor — unprotected pairs drop/summarize as
+//   (d) no-regression floor — unprotected pairs drop as
 //       before (the existing behavior is preserved).
 //   (e) wiring-layer JSONL reconstruction — exercised in
 //       `integration.test.ts` (the protected set is reconstructible
@@ -935,14 +979,14 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 	});
 
 	// (b) block-level granularity: the assistant message is NOT a
-	// protected slot. The `text` block is summarizeable, but the
+	// protected slot. The `text` block is trimmable, but the
 	// protected `toolCall` block survives inside the rewritten
 	// message. The protected `toolResult` survives by association.
 
 	it("(b) block-level: assistant turn stays a trimmable candidate; protected `toolCall` block survives inside the hold-untouched tier", async () => {
 		const protectedCallId = "call_AGENTS_md_b";
 		// Build a session that lands in tier 2: a large trimmable
-		// message. With the summarize path removed, tier 2 holds
+		// message. With the hold-untouched path removed, tier 2 holds
 		// middle-band messages untouched. The protected `toolCall`
 		// block survives inside the message; the `text` block is
 		// preserved as-is.
@@ -962,7 +1006,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 			preservedPatterns: ["AGENTS.md"],
 			protectedToolCallIds: new Set([protectedCallId]),
 		});
-		// (i) Tier 2 hold-untouched: no drop, no summarize.
+		// (i) Tier 2 hold-untouched: hold-untouched.
 		assert.equal(result.droppedTurns, 0, "tier 2 hold-untouched");
 		// (ii) The protected `toolCall` block survives inside the
 		// message — the carve-out kept it.
@@ -975,7 +1019,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 			(b) => b.type === "toolCall" && b.id === protectedCallId,
 		);
 		assert.ok(survivingToolCall, "the protected `toolCall` block survives inside the assistant message");
-		// (iii) The text block is preserved as-is (no summa envelope).
+		// (iii) The text block is preserved as-is (verbatim preserved).
 		const textBlock = content.find(
 			(b) => b.type === "text",
 		);
@@ -1107,13 +1151,13 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 		void carvedContent;
 	});
 
-	// (c2) orphan scenario — summarize tier: a protected `toolResult`
-	// whose matching `toolCall` is in a summarize candidate turn
+	// (c2) orphan scenario — hold-untouched tier: a protected `toolResult`
+	// whose matching `toolCall` is in a trimmable candidate turn
 	// survives by association; the unprotected `toolResult` is
 	// dropped alongside its unprotected `toolCall` block when the
 	// rewrite drops that block.
 
-	it("(c) orphan — summarize tier: protected `toolResult` survives; unprotected pair survives (tier 2 hold-untouched)", async () => {
+	it("(c) orphan — hold-untouched tier: protected `toolResult` survives; unprotected pair survives (tier 2 hold-untouched)", async () => {
 		const protectedCallId = "call_AGENTS_md_c2";
 		const unprotectedCallId = "call_CLAUDE_md_c2";
 		const longText = "z".repeat(60_000 * 4);
@@ -1134,7 +1178,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 			preservedPatterns: ["AGENTS.md"],
 			protectedToolCallIds: new Set([protectedCallId]),
 		});
-		// (i) Tier 2 hold-untouched: no drop, no summarize.
+		// (i) Tier 2 hold-untouched: hold-untouched.
 		assert.equal(result.droppedTurns, 0, "tier 2 hold-untouched");
 		// (ii) The protected `toolResult` survives by association.
 		const survivingProtectedResult = result.messages.find(
@@ -1161,7 +1205,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 	});
 
 	// (d) no-regression floor: an unprotected pair (no `protectedToolCallIds`
-	// entry, no `preservedPatterns` match) drops / summarizes as
+	// entry, no `preservedPatterns` match) drops as
 	// before. The fix does not change unprotected behavior.
 
 	it("(d) no-regression: unprotected pair (no `protectedToolCallIds`) survives (tier 2 hold-untouched)", async () => {
@@ -1184,7 +1228,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 		const result = await applyThreeTierTrim(messages, {
 			// No `preservedPatterns`, no `protectedToolCallIds`.
 		});
-		// (i) Tier 2 hold-untouched: no drop, no summarize.
+		// (i) Tier 2 hold-untouched: hold-untouched.
 		assert.equal(result.droppedTurns, 0, "tier 2 hold-untouched");
 		// (ii) The unprotected `toolResult` survives (tier 2
 		// hold-untouched — no rewrite, no drop).
@@ -1290,7 +1334,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 // ─── Effective budget with protected mass + system-prompt term ──────────
 //
 // The new `systemPromptTokens` field on `TrimOptions` is subtracted
-// from the verbatim and summarize tier caps alongside the protected-
+// from the verbatim and hold-untouched tier caps alongside the protected-
 // slot mass. The result is the effective cap the policy compares the
 // trimmable mass against: `effectiveVerbatimMax = max(0, verbatimMax
 // − systemPromptTokens − protectedMass)`. The `Math.max(0, …)` guard
@@ -1350,7 +1394,7 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 			verbatimMaxTokens: 50_000,
 			summarizeMaxTokens: 100_000,
 		});
-		// Tier 2 hold-untouched: no drop, no summarize.
+		// Tier 2 hold-untouched: hold-untouched.
 		assert.equal(result.droppedTurns, 0, "tier 2 hold-untouched");
 		// (i) The protected pinned synthetic survives with original content.
 		const pinned = result.messages.find(
@@ -1391,7 +1435,7 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 			summarizeMaxTokens: 100_000,
 			systemPromptTokens: 30_000,
 		});
-		// Tier 2 hold-untouched: no drop, no summarize.
+		// Tier 2 hold-untouched: hold-untouched.
 		assert.equal(result.droppedTurns, 0, "tier 2 hold-untouched");
 		// (i) The protected pinned synthetic survives.
 		const pinned = result.messages.find(

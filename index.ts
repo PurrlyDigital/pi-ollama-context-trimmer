@@ -505,11 +505,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		//   (a) the additive-OR `isProtectedSlot` branch for the
 		//       matching `toolResult` messages (kept by association,
 		//       excluded from the budget, never dropped/summarized),
-		//   (b) the block-level carve-out in `dropOldestTurns` and
-		//       `summarizeOldestUntilUnder` (the protected
-		//       `toolCall` block survives inside the rewritten
+		//   (b) the block-level carve-out in `dropOldestTurns` (the protected
+		//       `toolCall` block survives inside the dropped
 		//       assistant message; `text`/`thinking` and unprotected
-		//       `toolCall` blocks are dropped/summarized).
+		//       `toolCall` blocks are dropped).
 		// Computed BEFORE the pre-budget collapse passes and the
 		// reasoning-block cap so the set reflects the assistant
 		// messages as the model emitted them (the cap / pre-budget
@@ -585,17 +584,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// with `~/` expanded at the wiring layer to the operator's
 		// home directory (the pure predicate receives the expanded
 		// pattern; it never reads `os.homedir()` itself).
-		// Coerce `summaWords` to an integer at the wiring layer. The
-		// downstream Python `summa` subprocess parses its `words` argv
-		// via `int(sys.argv[2])`, which raises ValueError on a float
-		// (e.g. `60.5` from a config-file value with a trailing
-		// `.0` or a deliberately fractional cap). `isPositiveNumber`
-		// accepts floats (it's a Number.isFinite check), so the
-		// resolver can hand a float through the env>JSON>default
-		// precedence — the policy guards the integer contract, not
-		// the resolver. `Math.trunc` is the integer-coercion
-		// primitive: it preserves a deliberate `60.0` as `60` (the
-		// rejected Option A — silently dropping the value via a
 		// Drop-floor: a percentage of the effective summarize cap,
 		// resolved to a token count at the wiring layer (the policy
 		// receives the resolved numeric `dropFloorTokens`, not the

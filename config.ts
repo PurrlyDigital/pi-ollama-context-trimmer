@@ -110,8 +110,8 @@ export interface ContextTrimmerConfig {
 	 *  before the three-tier trim runs. Integer semantics:
 	 *  `-1` = send all (passthrough), `0` = send none, any
 	 *  positive integer = send that many (counted from the latest).
-	 *  The wiring layer coerces with `Math.trunc` (summaWords
-	 *  precedent). Overrides the policy default when set. */
+	 *  The wiring layer coerces with `Math.trunc`.
+	 *  Overrides the policy default when set. */
 	readonly intercomKeepLast?: number;
 	/** `subagent-notify` recency hardtrim. The wiring layer (in
 	 *  the context handler) keeps the last N `subagent-notify`
@@ -119,8 +119,8 @@ export interface ContextTrimmerConfig {
 	 *  before the three-tier trim runs. Integer semantics:
 	 *  `-1` = send all (passthrough), `0` = send none, any
 	 *  positive integer = send that many (counted from the latest).
-	 *  The wiring layer coerces with `Math.trunc` (summaWords
-	 *  precedent). Default fallthrough: when unset in both env and
+	 *  The wiring layer coerces with `Math.trunc`.
+	 *  Default fallthrough: when unset in both env and
 	 *  JSON, the effective value equals the resolved
 	 *  `intercomKeepLast` value (env > JSON >
 	 *  `DEFAULT_INTERCOM_KEEP_LAST`). */

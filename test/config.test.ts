@@ -1072,7 +1072,7 @@ describe("reasoningBlockCap — file parse: all-or-nothing per field", () => {
 // the `intercomKeepLast` JSON key) per the tandem principle;
 // precedence is env > file > compile-time default (`DEFAULT_INTERCOM_KEEP_LAST`
 // = `-1`, mirroring the `reasoningBlockCap` `-1` precedent). The
-// wiring layer coerces floats with `Math.trunc` (summaWords
+// wiring layer coerces floats with `Math.trunc`
 // precedent) before passing the value to the pure policy function.
 
 describe("intercomKeepLast — file channel (parseConfigFile)", () => {
@@ -1105,7 +1105,7 @@ describe("intercomKeepLast — file channel (parseConfigFile)", () => {
 		// `isValidBlockCap` requires `Number.isInteger`; floats
 		// fail that check and are treated as absent. The
 		// `Math.trunc` coercion lives at the wiring layer (per
-		// the summaWords precedent), not at the resolver.
+		// the integer-coercion precedent), not at the resolver.
 		assert.equal(parseConfigFile({ intercomKeepLast: 1.5 }).intercomKeepLast, undefined);
 		assert.equal(parseConfigFile({ intercomKeepLast: 0.5 }).intercomKeepLast, undefined);
 		assert.equal(parseConfigFile({ intercomKeepLast: -0.5 }).intercomKeepLast, undefined);
