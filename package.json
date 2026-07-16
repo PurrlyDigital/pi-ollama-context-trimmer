@@ -1,7 +1,7 @@
 {
   "name": "pi-ollama-context-trimmer",
   "version": "0.1.0",
-  "description": "Pi extension that trims LLM-bound message streams against a three-tier token budget (verbatim / summa-summarize / hard-drop). Required for subagents to survive long tool-result tails.",
+  "description": "Pi extension that trims LLM-bound message streams against a three-tier token budget (verbatim / hold-untouched / hard-drop). Required for subagents to survive long tool-result tails.",
   "author": "Purrly Digital",
   "license": "MIT",
   "type": "module",
@@ -20,7 +20,6 @@
     "context-trimmer",
     "tokens",
     "trim",
-    "summarize",
     "ai",
     "agents",
     "cli"
