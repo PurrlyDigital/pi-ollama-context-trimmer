@@ -54,9 +54,6 @@ export interface ContextTrimmerConfig {
 	/** Optional summarize-tier cap (tokens). Overrides the policy
 	 *  default when set. */
 	readonly tier2MaxTokens?: number;
-	/** Optional per-summary word cap passed to summa. Overrides the
-	 *  policy default when set. */
-	readonly summaWords?: number;
 	/** Optional token-estimator divisor (chars per token). Overrides
 	 *  the policy's compile-time default `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`
 	 *  when set. Resolved through the env channel
@@ -68,7 +65,7 @@ export interface ContextTrimmerConfig {
 	 *  precedence layer; the policy applies
 	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT` at the call site when both
 	 *  channels are absent. Positive integer; the wiring layer coerces
-	 *  with `Math.trunc` (summaWords precedent) if the consumer needs
+	 *  with `Math.trunc` if the consumer needs
 	 *  an integer. */
 	readonly tokenEstimatorDivisor?: number;
 	/** Optional drop-tier floor as a percentage (0, 100] of the
@@ -83,22 +80,15 @@ export interface ContextTrimmerConfig {
 	readonly loopGuard?: LoopGuardMode;
 	/** Loop-guard nudge threshold (consecutive identical assistant
 	 *  tool-call turns before the wiring layer injects a nudge).
-	 *  Positive integer; the wiring layer coerces with `Math.trunc`
-	 *  (summaWords precedent). Overrides the policy default when
-	 *  set. */
+	 *  Positive integer; the wiring layer coerces with `Math.trunc`.
+	 *  Overrides the policy default when set. */
 	readonly loopGuardThreshold?: number;
 	/** Loop-guard hard-block threshold (consecutive identical
 	 *  assistant tool-call turns before the wiring layer hard-blocks
 	 *  the next one). `undefined` means hard-block is off. Positive
-	 *  integer; the wiring layer coerces with `Math.trunc` (summaWords
-	 *  precedent). Overrides the policy default when set. */
+	 *  integer; the wiring layer coerces with `Math.trunc`.
+	 *  Overrides the policy default when set. */
 	readonly loopGuardHardBlock?: number;
-	/** Whether background (non-blocking) summarization is enabled.
-	 *  When true (default), the trim path fires summarizer promises in
-	 *  the background and returns immediately, caching the results for
-	 *  the next context event. When false, the trim path awaits each
-	 *  summarizer call synchronously (legacy behavior). */
-	readonly asyncMode?: boolean;
 	/** Subagent-context pin override. When `undefined` (the default),
 	 *  the wiring layer skips the pinned-tier injection in child/
 	 *  subagent sessions (`PI_SUBAGENT_CHILD=1`); when `true`, the
@@ -120,8 +110,8 @@ export interface ContextTrimmerConfig {
 	 *  before the three-tier trim runs. Integer semantics:
 	 *  `-1` = send all (passthrough), `0` = send none, any
 	 *  positive integer = send that many (counted from the latest).
-	 *  The wiring layer coerces with `Math.trunc` (summaWords
-	 *  precedent). Overrides the policy default when set. */
+	 *  The wiring layer coerces with `Math.trunc`.
+	 *  Overrides the policy default when set. */
 	readonly intercomKeepLast?: number;
 	/** `subagent-notify` recency hardtrim. The wiring layer (in
 	 *  the context handler) keeps the last N `subagent-notify`
@@ -129,8 +119,8 @@ export interface ContextTrimmerConfig {
 	 *  before the three-tier trim runs. Integer semantics:
 	 *  `-1` = send all (passthrough), `0` = send none, any
 	 *  positive integer = send that many (counted from the latest).
-	 *  The wiring layer coerces with `Math.trunc` (summaWords
-	 *  precedent). Default fallthrough: when unset in both env and
+	 *  The wiring layer coerces with `Math.trunc`.
+	 *  Default fallthrough: when unset in both env and
 	 *  JSON, the effective value equals the resolved
 	 *  `intercomKeepLast` value (env > JSON >
 	 *  `DEFAULT_INTERCOM_KEEP_LAST`). */
@@ -146,18 +136,11 @@ export const DEFAULT_PROTECT_DISPATCH: ProtectDispatchMode = "auto";
  *  whether the model is in a parent or a subagent session. */
 export const DEFAULT_LOOP_GUARD: LoopGuardMode = true;
 
-/** Default async mode: ON (non-blocking summarization). Backgrounding
- *  is the default; operators who need legacy synchronous behavior opt
- *  out with `false` (env `PI_CONTEXT_TRIMMER_ASYNC_MODE=0` or
- *  `"asyncMode": false` in the config file). */
-export const DEFAULT_ASYNC_MODE = true;
-
 /** Default `intercom_message` recency hardtrim count. The default is
  *  `-1` (passthrough — keep all `intercom_message` entries) so
  *  existing operators see no behavior change when upgrading. The
  *  wiring layer applies the default when neither the env var nor
- *  the JSON key sets a value. The wiring coerces with `Math.trunc`
- *  (summaWords precedent). */
+ *  the JSON key sets a value. */
 export const DEFAULT_INTERCOM_KEEP_LAST = -1;
 
 /** Env-var names (the `PI_CONTEXT_TRIMMER_*` namespace). Exported so
@@ -169,13 +152,11 @@ export const ENV = {
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
 	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
 	tokenEstimatorDivisor: "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR",
-	summaWords: "PI_CONTEXT_TRIMMER_SUMMA_WORDS",
 	dropFloorPercent: "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT",
 	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
 	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
-	asyncMode: "PI_CONTEXT_TRIMMER_ASYNC_MODE",
 	pinSubagent: "PI_CONTEXT_TRIMMER_PIN_SUBAGENT",
 	reasoningBlockCap: "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP",
 	intercomKeepLast: "PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST",
@@ -202,13 +183,11 @@ export interface ParsedConfigFile {
 	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
 	 *  default when neither channel sets a value. */
 	tokenEstimatorDivisor?: number;
-	summaWords?: number;
 	dropFloorPercent?: number;
 	recencyFloor?: number;
 	loopGuard?: LoopGuardMode;
 	loopGuardThreshold?: number;
 	loopGuardHardBlock?: number;
-	asyncMode?: boolean;
 	pinSubagent?: boolean;
 	reasoningBlockCap?: number;
 	intercomKeepLast?: number;
@@ -244,9 +223,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	if (isPositiveNumber(o.tokenEstimatorDivisor)) {
 		out.tokenEstimatorDivisor = o.tokenEstimatorDivisor;
 	}
-	if (isPositiveNumber(o.summaWords)) {
-		out.summaWords = o.summaWords;
-	}
 	if (isDropFloorPercent(o.dropFloorPercent)) {
 		out.dropFloorPercent = o.dropFloorPercent;
 	}
@@ -262,9 +238,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.loopGuardHardBlock)) {
 		out.loopGuardHardBlock = o.loopGuardHardBlock;
-	}
-	if (o.asyncMode === true || o.asyncMode === false) {
-		out.asyncMode = o.asyncMode;
 	}
 	const ps = o.pinSubagent;
 	if (ps === true || ps === false) {
@@ -311,8 +284,6 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
 	const tokenEstimatorDivisor =
 		parseNumberEnv(env[ENV.tokenEstimatorDivisor]) ?? file.tokenEstimatorDivisor;
-	const summaWords =
-		parseNumberEnv(env[ENV.summaWords]) ?? file.summaWords;
 	const dropFloorPercent =
 		parsePercentEnv(env[ENV.dropFloorPercent]) ?? file.dropFloorPercent;
 	const recencyFloor =
@@ -340,18 +311,6 @@ export function resolveConfig(opts: {
 		parseBlockCapEnv(env[ENV.intercomKeepLast]) ?? file.intercomKeepLast;
 	const subagentNotifyKeepLast =
 		parseBlockCapEnv(env[ENV.subagentNotifyKeepLast]) ?? file.subagentNotifyKeepLast;
-
-	let asyncMode: boolean;
-	const envAm = env[ENV.asyncMode];
-	if (envAm === "1") {
-		asyncMode = true;
-	} else if (envAm === "0") {
-		asyncMode = false;
-	} else if (file.asyncMode === true || file.asyncMode === false) {
-		asyncMode = file.asyncMode;
-	} else {
-		asyncMode = DEFAULT_ASYNC_MODE;
-	}
 
 	let pinSubagent: boolean | undefined;
 	const envPs = env[ENV.pinSubagent];
@@ -384,13 +343,11 @@ export function resolveConfig(opts: {
 		tier1MaxTokens,
 		tier2MaxTokens,
 		tokenEstimatorDivisor,
-		summaWords,
 		dropFloorPercent,
 		recencyFloor,
 		loopGuard,
 		loopGuardThreshold,
 		loopGuardHardBlock,
-		asyncMode,
 		pinSubagent,
 		reasoningBlockCap,
 		intercomKeepLast,

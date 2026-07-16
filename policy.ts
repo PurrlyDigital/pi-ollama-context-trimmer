@@ -4,21 +4,21 @@
 // (chars / 4 per message, summed):
 //
 //   0–50k          → verbatim, no action
-//   50k–100k       → in-place summa summarize the OLDEST non-protected
-//                    trimmable messages until the total is back under 50k
+//   50k–100k       → hold middle-band messages untouched (transient
+//                    behavior; Tier 3 catches oversize if it grows further)
 //   100k+          → hard drop the OLDEST whole turns (user+assistant+
 //                    tool+custom together) until the total is back under
 //                    100k
 //
 // Subagent protected inputs (subagent-only, excluded from the 50k/100k
-// budget, never summarize, never drop):
+// budget, never dropped):
 //   1. The system prompt (agent def). It travels as a SEPARATE field on
 //      the LLM call, NOT in the trimmable `messages` array — so the
 //      protection is a no-op for this code path (its tokens are never
 //      in the budget). Documented here so the invariant is visible.
 //   2. The first user message (dispatch instructions). The first user
-//      message carries the dispatch task; removing or summarizing it
-//      would lose the subagent's instructions. The message is marked
+//      message carries the dispatch task; removing it would lose the
+//      subagent's instructions. The message is marked
 //      with `userTurnAge === 0` in the stamp; the exemption reads that
 //      field. The spec also requires that its tokens be SUBTRACTED from
 //      the cap total so the budget measures only the trimmable mass.
@@ -37,8 +37,6 @@ export const VERBATIM_TIER_MAX_TOKENS = 50_000;
 /** Summarize tier ceiling. Totals above this fall into the drop tier. */
 export const SUMMARIZE_TIER_MAX_TOKENS = 100_000;
 
-/** Word budget for summa's per-message in-place summary. */
-export const SUMMA_WORDS = 60;
 
 /**
  * Compile-time default for the per-message token estimator divisor.
@@ -101,25 +99,6 @@ export type TrimmableMessage = {
 /** Options bag for `applyThreeTierTrim`. */
 export type TrimOptions = {
 	/**
-	 * The summarizer callback. Production wires this to a Python `summa`
-	 * subprocess; tests pass a deterministic in-process stub. Receives
-	 * the text to summarize and the word budget, returns a promise of
-	 * the summary. The pure policy never provides a default; the
-	 * wiring layer is required to pass one, and a missing callback
-	 * short-circuits the summarize path (returns messages unchanged).
-	 */
-	summarizer?: (text: string, words: number) => Promise<string>;
-	/**
-	 * When true, the summarize path fires summarizer promises in the
-	 * background instead of awaiting them. The messages are returned
-	 * with original (un-summarized) content; the pending promises are
-	 * carried in `TrimResult.pendingSummaries` for the wiring layer to
-	 * await and cache. When false (default), the summarize path awaits
-	 * each summarizer call and rewrites content in place (synchronous
-	 * behavior).
-	 */
-	backgroundSummarize?: boolean;
-	/**
 	 * Override the verbatim tier ceiling (default 50k). Useful for tests
 	 * that want to exercise the boundary at a smaller scale.
 	 */
@@ -128,21 +107,18 @@ export type TrimOptions = {
 	 * Override the summarize tier ceiling (default 100k).
 	 */
 	summarizeMaxTokens?: number;
-	/**
-	 * Override the word budget for summa summaries (default 60).
-	 */
-	summaWords?: number;
+
 	/**
 	 * The set of `customType` values that mark a message as a protected
 	 * slot (e.g. the agent-def / pinned-tier synthetic). Protected
 	 * custom-type messages are excluded from the budget, never
-	 * summarized, and never dropped. The wiring layer passes the
+	 * dropped. The wiring layer passes the
 	 * pinning customType (e.g. `"context-trimmer-pinned"`) here.
 	 */
 	protectedCustomTypes?: ReadonlySet<string>;
 	/**
 	 * Whether to protect the first user message as a subagent dispatch
-	 * slot (exempting it from summary/drop and subtracting its tokens
+	 * slot (exempting it from drop and subtracting its tokens
 	 * from the budget). Defaults to `true`. The wiring layer sets this
 	 * based on whether the `pi-subagents` extension is installed — the
 	 * protection only makes sense in a subagent session, so a plain
@@ -155,8 +131,8 @@ export type TrimOptions = {
 	 * Path patterns that mark a message as a protected slot via its
 	 * stamped source path. A message whose `details.sourcePath` matches
 	 * a pattern (per the locked fuzzy-vs-absolute grammar; see
-	 * `isPathPreserved`) is excluded from the budget, never summarized,
-	 * and never dropped. The wiring layer passes the operator-resolved
+	 * `isPathPreserved`) is excluded from the budget, never dropped.
+	 * The wiring layer passes the operator-resolved
 	 * `preservedPaths` (with `~/` already expanded via `os.homedir()`)
 	 * here. Defaults to `[]` (no paths preserved) so the predicate
 	 * shape is uniform across all internal call sites.
@@ -166,36 +142,28 @@ export type TrimOptions = {
 	 * The lower bound the tier-3 drop must not undershoot by dropping a
 	 * whole turn. When set, `dropOldestTurns` stops one step before the
 	 * remaining trimmable mass would dip below this floor; the
-	 * fall-through hands the surviving trimmable content off to the
-	 * summarize path so the drop tier never collapses the protected
-	 * floor. `undefined` or non-positive values disable the floor
+	 * fall-through returns the surviving messages as-is (the summarize
+	 * path was removed; this is the transient hold-untouched seam).
+	 * `undefined` or non-positive values disable the floor
 	 * (legacy behavior: drop until the trimmable total ≤
 	 * `summarizeMaxTokens`).
 	 */
 	dropFloorTokens?: number;
 	/**
 	 * A token count; the most-recent-N-tokens of trimmable content
-	 * protected from drop AND summarize. The recency slice is computed
+	 * protected from drop. The recency slice is computed
 	 * once at the top of `applyThreeTierTrim` and threaded through
 	 * every internal call; messages in the slice are treated as
 	 * protected (additive OR with the existing channels) and excluded
 	 * from the trimmable budget. `undefined` or non-positive values
 	 * disable recency protection (legacy behavior: every trimmable
-	 * message is a candidate for summarize or drop).
+	 * message is a candidate for drop).
 	 */
 	recencyFloor?: number;
-	/**
-	 * Fingerprints of messages that were summarized in prior context
-	 * events. Messages whose fingerprint is in this set are skipped by
-	 * `findOldestSummarizable` (not re-summarized), unless the escape
-	 * clause fires (total still over verbatim cap and no non-summarized
-	 * candidates remain). The wiring layer builds this set from
-	 * persisted state (`pi.appendEntry`) and threads it here.
-	 */
-	alreadySummarizedHashes?: ReadonlySet<string>;
+
 	/**
 	 * Tool-call IDs whose assistant `toolCall` blocks are protected
-	 * from drop AND summarize. The set is computed by the wiring
+	 * from drop. The set is computed by the wiring
 	 * layer at view time by walking every assistant message's
 	 * `toolCall` content blocks and matching `arguments.path`
 	 * against `preservedPatterns` (via the existing pure
@@ -204,18 +172,16 @@ export type TrimOptions = {
 	 * channels:
 	 *
 	 *   - A `toolResult` whose `toolCallId` is in this set is a
-	 *     protected message-level slot (per AC-2, AC-6). It is
-	 *     excluded from the budget, never summarized, and never
-	 *     dropped — including the carve-out of the dropped-turn
-	 *     slice in `dropOldestTurns`.
-	 *   - When an assistant turn falls in a dropped turn's range
-	 *     (AC-3) OR is rewritten by `summarizeOldestUntilUnder`
-	 *     (AC-4), the protected `toolCall` blocks (those whose
+	 *     protected message-level slot. It is
+	 *     excluded from the budget, never dropped — including the
+	 *     carve-out of the dropped-turn slice in `dropOldestTurns`.
+	 *   - When an assistant turn falls in a dropped turn's range,
+	 *     the protected `toolCall` blocks (those whose
 	 *     `id` is in this set) survive INSIDE the turn while
 	 *     `text`/`thinking` and unprotected `toolCall` blocks are
-	 *     dropped / rewritten. The pair is atomic in both
+	 *     dropped. The pair is atomic in both
 	 *     directions: an unprotected `toolCall` block that is
-	 *     dropped/summarized has its matching `toolResult` dropped
+	 *     dropped has its matching `toolResult` dropped
 	 *     with it (no orphan).
 	 *
 	 * Defaults to an empty set so the predicate shape is uniform
@@ -230,7 +196,7 @@ export type TrimOptions = {
 	 * `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`). Used by both
 	 * `approximateMessageTokens` and `approximateTextTokens` for
 	 * every internal token-count site (trimmable mass, protected
-	 * mass, system-prompt mass, the `[summa: …]` envelope tag).
+	 * mass, system-prompt mass).
 	 * The wiring layer resolves this from
 	 * `PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR` env var and
 	 * the `tokenEstimatorDivisor` JSON key per the existing env >
@@ -260,43 +226,17 @@ export type TrimOptions = {
 	systemPromptTokens?: number;
 };
 
-/** The return value. A fresh `messages` array (possibly shorter or with summarized text in place). */
+/** The return value. A fresh `messages` array (possibly shorter). */
 export type TrimResult = {
-	/** The messages that survive, in original order, with possible content rewrites. */
+	/** The messages that survive, in original order. */
 	messages: TrimmableMessage[];
-	/** Diagnostic counters (number of messages summarized, dropped, etc.). */
-	summarized: number;
+	/** Diagnostic counter (number of messages dropped). */
 	droppedTurns: number;
 	/**
 	 * Total tokens of the returned messages (including protected slots;
 	 * informational only).
 	 */
 	totalTokens: number;
-	/** Fingerprints of messages summarized in this trim pass. The wiring
-	 *  layer persists these via `pi.appendEntry` so the next context
-	 *  event can skip them. */
-	summarizedFingerprints: string[];
-	/**
-	 * True when the trim fired background summarizer promises that have
-	 * not yet resolved. The wiring layer uses this to manage the status
-	 * indicator span and to decide whether to await the pending promises
-	 * before the next context event.
-	 */
-	backgroundPending: boolean;
-	/**
-	 * Pending background summarizer promises. Each entry carries the
-	 * index, fingerprint, original message, and the promise that will
-	 * resolve to the summary text. The wiring layer awaits these to
-	 * build cache entries (summarized messages with `[summa:` envelope)
-	 * keyed by fingerprint. Present only when `backgroundPending` is
-	 * true.
-	 */
-	pendingSummaries?: Array<{
-		index: number;
-		fingerprint: string;
-		originalMessage: TrimmableMessage;
-		promise: Promise<string>;
-	}>;
 };
 
 // ─── Per-message token accounting (chars / divisor) ─────────────────────
@@ -360,9 +300,7 @@ export function approximateMessageTokens(
  *   - tool-result content (string or array of blocks)
  *   - any other shape: JSON.stringify as a last resort
  *
- * Exported for test introspection and for downstream consumers that
- * need to inspect the text content of a trimmed message (e.g. to
- * render the [summa: …] envelope).
+ * Exported for test introspection.
  */
 export function extractText(content: unknown): string {
 	if (typeof content === "string") return content;
@@ -383,101 +321,6 @@ export function extractText(content: unknown): string {
 		return JSON.stringify(content);
 	}
 	return String(content ?? "");
-}
-
-/**
- * Extract only the prose from a message's content for the summarizer
- * callback. Unlike `extractText` (which JSON.stringify-falls-back on
- * every non-text block and is used for token accounting), this
- * helper returns only the concatenation of `text`-typed content
- * blocks. Tool-call and tool-result blocks are skipped entirely —
- * feeding the raw tool-call JSON into summa's TextRank corrupts
- * the resulting summary.
- *
- * Pure: content in, string out. No I/O, no `process.*`. Used only
- * by the summarize path; `approximateMessageTokens` continues to
- * call the full-text `extractText` so budget math is unchanged.
- */
-function extractProseText(content: unknown): string {
-	if (typeof content === "string") return content;
-	if (Array.isArray(content)) {
-		let out = "";
-		for (const block of content) {
-			if (block && typeof block === "object" && "text" in block && typeof (block as { text: unknown }).text === "string") {
-				out += (block as { text: string }).text;
-			}
-			// Non-text blocks (toolCall, toolResult, …) are skipped,
-			// not JSON.stringified. They are structural — feeding
-			// them to summa would embed the raw JSON in the summary.
-		}
-		return out;
-	}
-	return "";
-}
-
-// ─── Already-summarized detection + fingerprinting ────────────────
-
-/**
- * Pure predicate: does this message already carry a summa envelope?
- * The envelope format is `[summa: ~N tokens originally → ~M tokens
- * summary]` placed at the start of the first text block's `text`
- * field. Detecting the leading `[summa: ~` lets the policy skip
- * re-summarizing a message that was already summarized in a prior
- * context event.
- *
- * Pure: no I/O, no `process.*`. Operates only on the message's
- * content shape. Exported so the wiring layer can test or surface
- * the predicate.
- */
-export function isAlreadySummarized(msg: TrimmableMessage): boolean {
-	if (Array.isArray(msg.content)) {
-		for (const block of msg.content) {
-			if (block && typeof block === "object" && "type" in block && (block as { type: unknown }).type === "text") {
-				const text = (block as { text?: unknown }).text;
-				if (typeof text === "string" && text.startsWith("[summa: ~")) return true;
-				return false;
-			}
-		}
-		return false;
-	}
-	return false;
-}
-
-/**
- * Pure extractor: produce a stable fingerprint for a message from
- * the first 200 characters of its first text-block content. String
- * content is used directly; array content walks to the first
- * `{ type: "text" }` block and uses its `text` field. Empty / no
- * text → empty string.
- *
- * The fingerprint is the dedup key the wiring layer persists via
- * `pi.appendEntry` so the next context event can skip messages
- * already summarized in a prior pass. The first 200 chars is a
- * short, stable proxy: summa summary length is bounded by the
- * configured word budget, so two distinct original messages can
- * collide only if their first 200 chars match — which is the
- * dedup fidelity the policy needs.
- *
- * Pure: no I/O, no `process.*`. Exported for the wiring layer and
- * for tests.
- */
-export function messageFingerprint(msg: TrimmableMessage): string {
-	let text: string | undefined;
-	if (typeof msg.content === "string") {
-		text = msg.content;
-	} else if (Array.isArray(msg.content)) {
-		for (const block of msg.content) {
-			if (block && typeof block === "object" && "type" in block && (block as { type: unknown }).type === "text") {
-				const t = (block as { text?: unknown }).text;
-				if (typeof t === "string") {
-					text = t;
-					break;
-				}
-			}
-		}
-	}
-	if (text === undefined) return "";
-	return text.slice(0, 200);
 }
 
 // ─── Protected-slot predicate ──────────────────────────────────────────
@@ -760,33 +603,26 @@ export function totalTrimmableTokens(
  * Apply the three-tier trim to a conversation message stream. Pure:
  * the input is not mutated; the return is a fresh array. Union-equals-
  * input invariant: every input message is either in the output
- * (verbatim, summarized in place, or protected) or in a dropped turn
- * (in which case the entire turn — user + assistant + tool + custom —
- * is removed).
+ * (verbatim or protected) or in a dropped turn (in which case the
+ * entire turn — user + assistant + tool + custom — is removed).
  *
  * The algorithm:
  *   1. Compute `totalTrimmableTokens` (subtracting protected slots).
  *   2. Tier selection:
  *      - total ≤ verbatimMaxTokens           → return messages as-is.
  *      - verbatimMaxTokens < total ≤ summarizeMaxTokens
- *                                            → summarize oldest non-
- *                                              protected trimmable
- *                                              messages in place until
- *                                              total ≤ verbatimMaxTokens.
+ *                                            → return messages as-is
+ *                                              (transient hold-untouched
+ *                                              behavior; Tier 3 catches
+ *                                              oversize if it grows
+ *                                              further).
  *      - total > summarizeMaxTokens          → hard-drop oldest whole
  *                                              turns until total ≤
  *                                              summarizeMaxTokens.
  *
- * Summarization rewrites `content` to a text block carrying a leading
- * tag `[summa: ~N tokens originally → ~M tokens summary]` plus the
- * summary body, so the LLM can see at view time that the message was
- * summarized and approximately how much was lost. The tag also makes
- * the trim visible in the conversation log for the agent's own
- * debugging.
- *
- * The summarizer callback is invoked once per message being
- * summarized; the policy does not batch — a single trim call
- * summarizes as many messages as it needs, oldest first.
+ * The summarize path was removed. Tier 2 is a transient hold-untouched
+ * seam; Tier 3 catches oversize on the next context event if the
+ * middle-band mass grows further.
  */
 export async function applyThreeTierTrim(
 	messages: ReadonlyArray<TrimmableMessage>,
@@ -794,27 +630,17 @@ export async function applyThreeTierTrim(
 ): Promise<TrimResult> {
 	const verbatimMax = options.verbatimMaxTokens ?? VERBATIM_TIER_MAX_TOKENS;
 	const summarizeMax = options.summarizeMaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
-	const summarizer = options.summarizer;
-	const summaWords = options.summaWords ?? SUMMA_WORDS;
 	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
 	const protectDispatch = options.protectDispatch ?? true;
 	const preservedPatterns = options.preservedPatterns ?? [];
 	const dropFloorTokens = options.dropFloorTokens;
 	const recencyFloor = options.recencyFloor;
-	const alreadySummarizedHashes = options.alreadySummarizedHashes ?? new Set<string>();
-	const backgroundSummarize = options.backgroundSummarize ?? false;
 	const protectedToolCallIds = options.protectedToolCallIds ?? new Set<string>();
 	const divisor = options.tokenEstimatorDivisor ?? TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
 	const systemPromptTokens = options.systemPromptTokens ?? 0;
 
 	// Compute the recency-protected slice once and thread it through
-	// every internal call. The slice is the operator's
-	// "most-recent-N-tokens of trimmable content" carve-out;
-	// messages in the slice are treated as protected (additive OR
-	// with the dispatch / pinned / preserved-paths channels). The
-	// slice is computed against the other protected-slot channels
-	// so already-protected messages are excluded — they are
-	// already subtracted from the budget by their own channels.
+	// every internal call.
 	const recencyProtectedIndices = computeRecencyProtectedIndices(
 		messages,
 		recencyFloor,
@@ -825,16 +651,7 @@ export async function applyThreeTierTrim(
 		divisor,
 	);
 
-	// Compute the protected-slot mass once. The protected-mass
-	// sum is the token count of every message `isProtectedSlot`
-	// recognizes, with the same divisor the trimmable-mass
-	// accounting uses. Subtracting this from the raw tier caps
-	// (alongside the system-prompt term) produces the effective
-	// caps — the budget reserves space for the protected mass
-	// AND the system prompt before comparing against the
-	// trimmable mass. The protected mass is constant within a
-	// single trim pass (protected slots survive every drop /
-	// summarize pass by design).
+	// Compute the protected-slot mass once.
 	let protectedMass = 0;
 	for (let i = 0; i < messages.length; i++) {
 		if (
@@ -854,23 +671,12 @@ export async function applyThreeTierTrim(
 	}
 
 	// Effective caps: the raw tier caps minus the protected mass
-	// and the system-prompt term. The `Math.max(0, …)` guard
-	// prevents a negative cap from entering the tier comparison
-	// (which would produce `NaN` / `Infinity` from the
-	// arithmetic). When `protectedMass + systemPromptTokens ≥
-	// tierNMax` the effective cap is 0 and the tier comparison
-	// fires the drop / summarize path against the trimmable
-	// mass; the trimmer trims all trimmable content and
-	// protected slots are still protected (existing protection
-	// holds — protected slots are never trimmed). When both
-	// `systemPromptTokens` and `protectedMass` are 0 the
-	// effective caps equal the raw caps and behavior is
-	// identical to the legacy trim (AC-6 no-regression).
+	// and the system-prompt term.
 	const effectiveVerbatimMax = Math.max(0, verbatimMax - systemPromptTokens - protectedMass);
 	const effectiveSummarizeMax = Math.max(0, summarizeMax - systemPromptTokens - protectedMass);
 
 	// First, decide the tier based on the trimmable total.
-	let total = totalTrimmableTokens(
+	const total = totalTrimmableTokens(
 		messages,
 		protectedCustomTypes,
 		protectDispatch,
@@ -881,13 +687,9 @@ export async function applyThreeTierTrim(
 	);
 
 	// Tier 3: hard-drop oldest whole turns until total ≤
-	// effectiveSummarizeMax. The "turn" is bounded by user
-	// messages: a turn is everything from one user message
-	// (exclusive of protected slots) up to (but not including)
-	// the next user message. We carve whole turns from the
-	// oldest end.
+	// effectiveSummarizeMax.
 	if (total > effectiveSummarizeMax) {
-		const { messages: dropped, droppedTurns, shouldFallThrough, droppedToolCallIds } = dropOldestTurns(
+		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
 			messages,
 			effectiveSummarizeMax,
 			protectedCustomTypes,
@@ -900,34 +702,15 @@ export async function applyThreeTierTrim(
 		);
 		// Drop-floor fall-through: when the next-oldest turn would
 		// push the trimmable total below `dropFloorTokens`, stop
-		// dropping and hand the surviving trimmable content off to
-		// the summarize path. The summarize path then trims the
-		// older half (trimmable messages OUTSIDE the recency
-		// window) down to effectiveSummarizeMax — the recency
-		// slice stays intact and the drop tier never collapses
-		// the floor.
+		// dropping and return the surviving messages as-is (Tier 2
+		// hold-untouched behavior). The summarize path was removed;
+		// this is the transient hold-untouched seam.
 		if (shouldFallThrough) {
-			const result = await summarizeOldestUntilUnder(
-				dropped,
-				effectiveSummarizeMax,
-				summarizer,
-				summaWords,
-				protectedCustomTypes,
-				protectDispatch,
-				preservedPatterns,
-				recencyProtectedIndices,
-				alreadySummarizedHashes,
-				backgroundSummarize,
-				protectedToolCallIds,
-				droppedToolCallIds,
-				divisor,
-			);
 			return {
-				messages: result.messages,
-				summarized: result.summarized,
+				messages: dropped,
 				droppedTurns,
 				totalTokens: totalTrimmableTokens(
-					result.messages,
+					dropped,
 					protectedCustomTypes,
 					protectDispatch,
 					preservedPatterns,
@@ -935,13 +718,10 @@ export async function applyThreeTierTrim(
 					protectedToolCallIds,
 					divisor,
 				),
-				summarizedFingerprints: result.summarizedFingerprints,
-				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
-				pendingSummaries: result.pendingSummaries,
 			};
 		}
 		// Re-check; we may have overshot (no trimmable turns left).
-		total = totalTrimmableTokens(
+		const postDropTotal = totalTrimmableTokens(
 			dropped,
 			protectedCustomTypes,
 			protectDispatch,
@@ -951,113 +731,31 @@ export async function applyThreeTierTrim(
 			divisor,
 		);
 		// If still over effectiveSummarizeMax (a single trimmable
-		// turn is larger than the tier ceiling), summarize that
-		// turn's oldest messages as a fallback. This is the only
-		// path where summarize fires from tier 3; tier 2's
-		// summarize path is the normal one. The
-		// `recencyProtectedIndices` set is index-relative to the
-		// ORIGINAL `messages` array — after the drop pass, the
-		// recency-slice messages may have shifted indices. We
-		// recompute the slice against the post-drop `dropped`
-		// array so the recency carve-out survives the drop pass.
-		if (total > effectiveSummarizeMax) {
-			const droppedRecencyIndices = computeRecencyProtectedIndices(
-				dropped,
-				recencyFloor,
-				protectedCustomTypes,
-				protectDispatch,
-				preservedPatterns,
-				protectedToolCallIds,
-				divisor,
-			);
-			const result = await summarizeOldestUntilUnder(
-				dropped,
-				effectiveSummarizeMax,
-				summarizer,
-				summaWords,
-				protectedCustomTypes,
-				protectDispatch,
-				preservedPatterns,
-				droppedRecencyIndices,
-				alreadySummarizedHashes,
-				backgroundSummarize,
-				protectedToolCallIds,
-				droppedToolCallIds,
-				divisor,
-			);
-			return {
-				messages: result.messages,
-				summarized: result.summarized,
-				droppedTurns,
-				totalTokens: totalTrimmableTokens(
-					result.messages,
-					protectedCustomTypes,
-					protectDispatch,
-					preservedPatterns,
-					droppedRecencyIndices,
-					protectedToolCallIds,
-					divisor,
-				),
-				summarizedFingerprints: result.summarizedFingerprints,
-				backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
-				pendingSummaries: result.pendingSummaries,
-			};
-		}
+		// turn is larger than the tier ceiling), return the dropped
+		// messages as-is. The summarize fallback was removed; Tier 3
+		// catches oversize on the next context event if it grows further.
 		return {
 			messages: dropped,
-			summarized: 0,
 			droppedTurns,
-			totalTokens: total,
-			summarizedFingerprints: [],
-			backgroundPending: false,
+			totalTokens: postDropTotal,
 		};
 	}
 
-	// Tier 2: summarize oldest non-protected trimmable messages until
-	// total ≤ effectiveVerbatimMax.
+	// Tier 2: hold middle-band messages untouched (transient behavior;
+	// Tier 3 catches oversize if it grows further).
 	if (total > effectiveVerbatimMax) {
-		const result = await summarizeOldestUntilUnder(
-			messages,
-			effectiveVerbatimMax,
-			summarizer,
-			summaWords,
-			protectedCustomTypes,
-			protectDispatch,
-			preservedPatterns,
-			recencyProtectedIndices,
-			alreadySummarizedHashes,
-			backgroundSummarize,
-			protectedToolCallIds,
-			new Set(),
-			divisor,
-		);
 		return {
-			messages: result.messages,
-			summarized: result.summarized,
+			messages: messages.slice(),
 			droppedTurns: 0,
-			totalTokens: totalTrimmableTokens(
-				result.messages,
-				protectedCustomTypes,
-				protectDispatch,
-				preservedPatterns,
-				recencyProtectedIndices,
-				protectedToolCallIds,
-				divisor,
-			),
-			summarizedFingerprints: result.summarizedFingerprints,
-			backgroundPending: backgroundSummarize && result.pendingSummaries !== undefined && result.pendingSummaries.length > 0,
-			pendingSummaries: result.pendingSummaries,
+			totalTokens: total,
 		};
 	}
 
 	// Tier 1: verbatim.
 	return {
 		messages: messages.slice(),
-		summarized: 0,
 		droppedTurns: 0,
 		totalTokens: total,
-		summarizedFingerprints: [],
-		backgroundPending: false,
 	};
 }
 
@@ -1133,10 +831,9 @@ function dropOldestTurns(
 	// protection is ON (the tail is "post-dispatch"); with protection
 	// OFF, any user message already anchored a turn above.
 	//
-	// Exception: a SINGLE trimmable message is left for the
-	// summarize-fallback path (the policy summarizes it instead of
-	// dropping it, since dropping the only trimmable content would
-	// leave the session empty). 2+ trimmable messages are bundled
+	// Exception: a SINGLE trimmable message is left untouched
+	// (dropping the only trimmable content would leave the session
+	// empty). 2+ trimmable messages are bundled
 	// into a synthetic trimmable turn and dropped whole.
 	if (turns.length === 0 && protectDispatch) {
 		// Find the dispatch (first user message with userTurnAge === 0).
@@ -1163,9 +860,8 @@ function dropOldestTurns(
 	// Drop-floor guard: when `dropFloorTokens` is set, stop one
 	// step before the next-oldest turn would push the remaining
 	// trimmable mass below the floor. The caller (applyThreeTierTrim)
-	// then hands the surviving trimmable content off to the
-	// summarize path so the drop tier never collapses the protected
-	// floor.
+	// then returns the surviving messages as-is (the summarize path
+	// was removed; this is the transient hold-untouched seam).
 	let remaining = totalMass;
 	const dropSet = new Set<number>();
 	let shouldFallThrough = false;
@@ -1197,8 +893,7 @@ function dropOldestTurns(
 	// scope, and a conditional "get it fresh" retrieval hint. The
 	// reminder is emitted ONCE per drop event (not per dropped turn)
 	// so a multi-turn drop is one model-facing note, not a sequence
-	// of per-turn envelopes. The reminder does NOT mirror the
-	// Tier-2 `[summa: …]` envelope grammar: no bracket tag, no
+	// of per-turn envelopes. The reminder carries no bracket tag, no
 	// ordinals, no token mass. The "get it fresh" clause is
 	// conditional ("if you need …"), not a directive.
 	const out: TrimmableMessage[] = [];
@@ -1298,318 +993,6 @@ function makeTurn(
 		tokens += approximateMessageTokens(messages[i], divisor);
 	}
 	return { start, end, tokens };
-}
-
-// ─── Internal: in-place summarization ──────────────────────────────────
-
-/**
- * Summarize the oldest non-protected trimmable messages in place until
- * the trimmable total is ≤ `cap`. Two modes:
- *
- *   - **sync** (`backgroundSummarize: false`, default): the summarizer
- *     callback is awaited for each candidate; the message content is
- *     rewritten in place with the `[summa: …]` envelope. Behavior is
- *     identical to the prior in-place implementation, expressed
- *     asynchronously.
- *   - **background** (`backgroundSummarize: true`): the summarizer
- *     callback is fired as an un-awaited promise; the message content
- *     is left untouched. A `pendingSummaries` entry is pushed for
- *     each fired promise, carrying the original fingerprint, index,
- *     message, and the promise. The loop terminates when an
- *     estimated total ≤ cap is reached; the estimate subtracts
- *     `(originalTokens − summaWords)` per fired promise (summa
- *     produces `summaWords` words ≈ `summaWords` tokens).
- *
- * The loop iterates oldest-first and stops as soon as the total is
- * under the cap OR no trimmable message remains to summarize.
- *
- * Already-summarized detection: each iteration calls
- * `findOldestSummarizable` with the skip flag ON. When the only
- * remaining candidates are already-summarized messages and the
- * total is still over the cap, the escape clause retries the
- * find with the skip flag OFF — the already-summarized message
- * gets a fresh summary rather than blocking progress.
- *
- * `summarizedFingerprints` is the dedup-key list the wiring layer
- * persists. Each entry is the ORIGINAL message fingerprint
- * (computed against the input array, before the content is
- * rewritten with the summa envelope) — using the original
- * fingerprint keeps the persisted key stable across re-summaries.
- */
-async function summarizeOldestUntilUnder(
-	messages: ReadonlyArray<TrimmableMessage>,
-	cap: number,
-	summarizer: ((text: string, words: number) => Promise<string>) | undefined,
-	summaWords: number,
-	protectedCustomTypes: ReadonlySet<string> = new Set(),
-	protectDispatch = true,
-	preservedPatterns: ReadonlyArray<string> = [],
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
-	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
-	backgroundSummarize: boolean = false,
-	protectedToolCallIds: ReadonlySet<string> = new Set(),
-	droppedToolCallIdsFromDropPass: ReadonlySet<string> = new Set(),
-	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
-): Promise<{
-	messages: TrimmableMessage[];
-	summarized: number;
-	summarizedFingerprints: string[];
-	pendingSummaries?: Array<{
-		index: number;
-		fingerprint: string;
-		originalMessage: TrimmableMessage;
-		promise: Promise<string>;
-	}>;
-}> {
-	// No summarizer wired: short-circuit. The pure policy never shells
-	// out; the wiring layer is required to pass a callback. Returning
-	// the input unchanged with no pending state is the safe no-op.
-	if (summarizer === undefined) {
-		return {
-			messages: messages.map((m) => m),
-			summarized: 0,
-			summarizedFingerprints: [],
-		};
-	}
-	const out = messages.map((m) => m);
-	let summarized = 0;
-	const summarizedFingerprints: string[] = [];
-	const pendingSummaries: Array<{
-		index: number;
-		fingerprint: string;
-		originalMessage: TrimmableMessage;
-		promise: Promise<string>;
-	}> = [];
-	// Pair-atomic: track `toolCall` block IDs that were dropped
-	// during the summarize rewrite (unprotected `toolCall` blocks
-	// inside an assistant message that was summarized). After the
-	// loop, drop any `toolResult` whose `toolCallId` is in this set
-	// so no `toolResult` survives with a dangling `toolCallId`. The
-	// set is also merged with `droppedToolCallIdsFromDropPass` (the
-	// unprotected IDs collected by `dropOldestTurns`) so a follow-up
-	// summarize-fallback pass also drops those `toolResult`s.
-	const droppedToolCallIds = new Set<string>(droppedToolCallIdsFromDropPass);
-	// Cursor: the next index we'll consider for summarization. Starts
-	// at 0 and is advanced past each summarized message so we never
-	// re-summarize the same message in the same pass (which would
-	// infinite-loop: the replacement content is small, but the
-	// message remains the "oldest" candidate and gets re-picked).
-	let cursor = 0;
-	// In background mode we never rewrite the messages in `out`, so
-	// the loop condition cannot observe the real trimmable total
-	// (it never decreases). An estimated total — starting from the
-	// real trimmable total and decrementing by `(originalTokens −
-	// summaWords)` per fired promise — drives the loop instead.
-	let estimatedTotal = totalTrimmableTokens(
-		out,
-		protectedCustomTypes,
-		protectDispatch,
-		preservedPatterns,
-		recencyProtectedIndices,
-		protectedToolCallIds,
-		divisor,
-	);
-	while (
-		(backgroundSummarize
-			? estimatedTotal > cap
-			: totalTrimmableTokens(out, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, divisor) > cap)
-	) {
-		// Find the oldest non-protected trimmable message at or
-		// after the cursor. Skip already-summarized by default.
-		let target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, true, protectedToolCallIds, divisor);
-		// Escape clause: when the only candidates are already-
-		// summarized messages and the total is still over the cap,
-		// retry with the skip flag lifted so an already-summarized
-		// message gets a fresh summary rather than blocking progress.
-		if (target === -1) {
-			target = findOldestSummarizable(out, protectedCustomTypes, protectDispatch, preservedPatterns, cursor, recencyProtectedIndices, alreadySummarizedHashes, false, protectedToolCallIds, divisor);
-			if (target === -1) break;
-		}
-		// Capture the ORIGINAL fingerprint before the content is
-		// replaced with the summa envelope. Using the original keeps
-		// the persisted key stable across re-summaries.
-		const fingerprint = messageFingerprint(messages[target]);
-		summarizedFingerprints.push(fingerprint);
-		const msg = out[target];
-		const original = extractProseText(msg.content);
-		const originalTokens = approximateMessageTokens(msg, divisor);
-		// Defensive bound: if the message is too small to benefit
-		// from summarization (summaWords ≥ originalTokens), bail
-		// rather than loop forever. Applies to both modes: in sync
-		// mode the replacement would not shrink the message; in
-		// background mode the estimated decrement would be ≤ 0.
-		if (summaWords >= originalTokens) break;
-		if (backgroundSummarize) {
-			// Fire the summarizer promise in the background; leave
-			// the message content as the original. The promise is
-			// caught so a rejection never crashes the trim path —
-			// the wiring layer sees a resolved `original` and
-			// treats the message as a no-op summary.
-			const promise = summarizer(original, summaWords).catch(() => original);
-			pendingSummaries.push({
-				index: target,
-				fingerprint,
-				originalMessage: msg,
-				promise,
-			});
-			// Update the estimated total: a summary is assumed to be
-			// `summaWords` tokens (summa produces N words ≈ N tokens).
-			estimatedTotal -= (originalTokens - summaWords);
-		} else {
-			let summary: string;
-			try {
-				summary = await summarizer(original, summaWords);
-			} catch {
-				summary = original;
-			}
-			const summaryText = summary.length > 0 ? summary : original;
-			const summaryTokens = approximateMessageTokens({ ...msg, content: summaryText }, divisor);
-			// Build the rewrite. For an assistant message whose
-			// content is a `toolCall`-bearing array, the rewrite is
-			// block-level: protected `toolCall` blocks survive
-			// inside the rewritten message, unprotected `toolCall`
-			// blocks are dropped (their IDs collected in
-			// `droppedToolCallIds` for the post-pass `toolResult`
-			// drop), and `text`/`thinking` blocks are replaced with
-			// the summa envelope. The non-array path is the
-			// existing wholesale replace (string content or
-			// toolResult/object content).
-			const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
-			if (msg.role === "assistant" && Array.isArray(msg.content)) {
-				const sourceContent = msg.content as Array<{ type: string; [k: string]: unknown }>;
-				const rewrittenContent: unknown[] = [];
-				for (const block of sourceContent) {
-					if (block && typeof block === "object" && (block as { type?: unknown }).type === "toolCall") {
-						const id = (block as { id?: unknown }).id;
-						if (typeof id === "string" && id.length > 0 && protectedToolCallIds.has(id)) {
-							rewrittenContent.push(block);
-						} else if (typeof id === "string" && id.length > 0) {
-							// Unprotected `toolCall` block — drop
-							// and add to `droppedToolCallIds` so the
-							// matching `toolResult` is dropped too.
-							droppedToolCallIds.add(id);
-						}
-						// toolCall block without a usable id is dropped
-						// without being added to `droppedToolCallIds`.
-						continue;
-					}
-					// Non-`toolCall` blocks (text, thinking) are
-					// dropped; the summa envelope below carries the
-					// rewritten prose. Block-level protection is
-					// exclusively for `toolCall` blocks; text and
-					// thinking blocks on the requesting turn are
-					// summarizeable.
-				}
-				// The summa envelope text-block sits at the head of
-				// the rewritten content array so the policy's
-				// `isAlreadySummarized` check still fires on
-				// subsequent passes.
-				rewrittenContent.unshift({ type: "text", text: `${tag}\n${summaryText}` });
-				out[target] = { ...msg, content: rewrittenContent };
-			} else {
-				// Existing wholesale replace path: non-array
-				// content (string, object) or non-assistant roles.
-				out[target] = {
-					...msg,
-					content: [{ type: "text", text: `${tag}\n${summaryText}` }],
-				};
-			}
-			summarized += 1;
-			// Advance the cursor past this message so we don't re-pick it.
-			cursor = target + 1;
-			// Defensive bound: if the summarizer returned a longer
-			// string (it shouldn't — summa is lossy), bail rather
-			// than loop forever. The bound fires AFTER `summarized`
-			// is incremented so a pathological no-progress
-			// summarizer is observably bounded (one rewrite fires,
-			// then the loop exits cleanly with `summarized === 1`).
-			if (summaryTokens >= originalTokens) break;
-			continue;
-		}
-		summarized += 1;
-		// Advance the cursor past this message so we don't re-pick it.
-		cursor = target + 1;
-	}
-	// Pair-atomic post-pass: drop any `toolResult` whose
-	// `toolCallId` is in `droppedToolCallIds` (collected during the
-	// rewrite AND forwarded from the tier-3 drop pass). The
-	// `toolResult` may sit in a later turn — the loop above only
-	// rewrites the assistant message that carried the dropped
-	// `toolCall` block, so the post-pass walks the output and
-	// drops the matching `toolResult` to keep the pair atomic in
-	// both directions.
-	if (droppedToolCallIds.size > 0) {
-		const finalOut: TrimmableMessage[] = [];
-		for (const m of out) {
-			if (m.role === "toolResult") {
-				const toolCallId = (m as { toolCallId?: unknown }).toolCallId;
-				if (
-					typeof toolCallId === "string" &&
-					toolCallId.length > 0 &&
-					droppedToolCallIds.has(toolCallId) &&
-					!protectedToolCallIds.has(toolCallId)
-				) {
-					continue;
-				}
-			}
-			finalOut.push(m);
-		}
-		// Background mode never mutates the message array in the
-		// loop; the post-pass post-processes the finalOut (not the
-		// original `out`) so the post-pass drop is consistent with
-		// the sync-mode behavior. The wiring layer's
-		// `result.messages` is what consumers see; we hand the
-		// cleaned array out instead of the rewritten-in-place `out`.
-		return {
-			messages: finalOut,
-			summarized,
-			summarizedFingerprints,
-			...(pendingSummaries.length > 0 ? { pendingSummaries } : {}),
-		};
-	}
-	return {
-		messages: out,
-		summarized,
-		summarizedFingerprints,
-		...(pendingSummaries.length > 0 ? { pendingSummaries } : {}),
-	};
-}
-
-/**
- * Find the index of the oldest non-protected trimmable message in the
- * array. A user message with `userTurnAge === 0` (the dispatch) is
- * protected; a `customType` in `protectedCustomTypes` is also protected.
- * Returns -1 if no candidate is found.
- *
- * When `skipAlreadySummarized` is `true` (default), messages that
- * already carry a summa envelope (`isAlreadySummarized`) or whose
- * fingerprint is in `alreadySummarizedHashes` are also skipped. The
- * `false` form is the escape clause: callers retry with the skip
- * lifted when the only remaining trimmable candidates are
- * already-summarized messages and the total is still over the
- * verbatim cap.
- */
-function findOldestSummarizable(
-	messages: ReadonlyArray<TrimmableMessage>,
-	protectedCustomTypes: ReadonlySet<string>,
-	protectDispatch: boolean,
-	preservedPatterns: ReadonlyArray<string> = [],
-	startFrom = 0,
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
-	alreadySummarizedHashes: ReadonlySet<string> = new Set(),
-	skipAlreadySummarized: boolean = true,
-	protectedToolCallIds: ReadonlySet<string> = new Set(),
-	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
-): number {
-	for (let i = startFrom; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds)) continue;
-		if (skipAlreadySummarized) {
-			if (isAlreadySummarized(messages[i])) continue;
-			if (alreadySummarizedHashes.has(messageFingerprint(messages[i]))) continue;
-		}
-		return i;
-	}
-	return -1;
 }
 
 // ─── Reasoning-block cap (count-based reasoning trim) ─────────────
@@ -1906,7 +1289,7 @@ export function applyIntercomKeepLast(
  *   keepLast ===  0  → drop every `subagent-notify` entry.
  *   keepLast  >  0   → keep the last `keepLast` entries.
  * Pure: no I/O, no `process.*`; the wiring layer coerces floats with
- * `Math.trunc` (summaWords precedent) and gates by the
+ * `Math.trunc` and gates by the
  * `resolveIntercomInstalled` extension probe.
  */
 export function applySubagentNotifyKeepLast(

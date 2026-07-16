@@ -13,7 +13,7 @@ import {
 	ENV,
 	DEFAULT_PROTECT_DISPATCH,
 	DEFAULT_LOOP_GUARD,
-	DEFAULT_ASYNC_MODE,
+	
 	DEFAULT_INTERCOM_KEEP_LAST,
 	type EnvRecord,
 } from "../config.ts";
@@ -389,114 +389,6 @@ describe("tier2MaxTokens", () => {
 
 	it("ENV.tier2MaxTokens is the documented namespace", () => {
 		assert.equal(ENV.tier2MaxTokens, "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS");
-	});
-});
-
-describe("summaWords", () => {
-	// --- parseConfigFile (file channel) ---
-
-	it("file parse: well-typed positive number is extracted", () => {
-		assert.equal(parseConfigFile({ summaWords: 100 }).summaWords, 100);
-	});
-
-	it("file parse: non-numeric value (string) is treated as absent", () => {
-		assert.equal(parseConfigFile({ summaWords: "100" }).summaWords, undefined);
-	});
-
-	it("file parse: zero is treated as absent (not a valid word cap)", () => {
-		assert.equal(parseConfigFile({ summaWords: 0 }).summaWords, undefined);
-	});
-
-	it("file parse: negative number is treated as absent", () => {
-		assert.equal(parseConfigFile({ summaWords: -50 }).summaWords, undefined);
-	});
-
-	it("file parse: NaN is treated as absent", () => {
-		assert.equal(parseConfigFile({ summaWords: Number.NaN }).summaWords, undefined);
-	});
-
-	it("file parse: Infinity is treated as absent", () => {
-		assert.equal(parseConfigFile({ summaWords: Number.POSITIVE_INFINITY }).summaWords, undefined);
-		assert.equal(parseConfigFile({ summaWords: Number.NEGATIVE_INFINITY }).summaWords, undefined);
-	});
-
-	it("file parse: missing key leaves the field undefined", () => {
-		assert.equal(parseConfigFile({ personalityPath: "/p" }).summaWords, undefined);
-	});
-
-	// --- resolveConfig (env wins over file) ---
-
-	it("resolveConfig: env wins over file", () => {
-		const cfg = resolveConfig({
-			file: { summaWords: 60 },
-			env: { [ENV.summaWords]: "100" } as EnvRecord,
-		});
-		assert.equal(cfg.summaWords, 100);
-	});
-
-	it("resolveConfig: empty-string env falls back to file", () => {
-		const cfg = resolveConfig({
-			file: { summaWords: 60 },
-			env: { [ENV.summaWords]: "" } as EnvRecord,
-		});
-		assert.equal(cfg.summaWords, 60);
-	});
-
-	it("resolveConfig: non-numeric env falls back to file", () => {
-		const cfg = resolveConfig({
-			file: { summaWords: 60 },
-			env: { [ENV.summaWords]: "lots" } as EnvRecord,
-		});
-		assert.equal(cfg.summaWords, 60);
-	});
-
-	it("resolveConfig: file-only returns the file value", () => {
-		const cfg = resolveConfig({ file: { summaWords: 80 } });
-		assert.equal(cfg.summaWords, 80);
-	});
-
-	it("resolveConfig: nothing configured leaves the field undefined", () => {
-		const cfg = resolveConfig({});
-		assert.equal(cfg.summaWords, undefined);
-	});
-
-	// --- env parse grammar ---
-
-	it("env parse: numeric string is coerced to number", () => {
-		const cfg = resolveConfig({
-			env: { [ENV.summaWords]: "120" } as EnvRecord,
-		});
-		assert.equal(cfg.summaWords, 120);
-		assert.equal(typeof cfg.summaWords, "number");
-	});
-
-	// --- ENV map ---
-
-	it("ENV.summaWords is the documented namespace", () => {
-		assert.equal(ENV.summaWords, "PI_CONTEXT_TRIMMER_SUMMA_WORDS");
-	});
-});
-
-describe("tier-threshold fields — per-field independence", () => {
-	it("file parse: one field malformed does not poison the others", () => {
-		const f = parseConfigFile({
-			tier1MaxTokens: 75_000,
-			tier2MaxTokens: "not-a-number",
-			summaWords: 80,
-		});
-		assert.equal(f.tier1MaxTokens, 75_000);
-		assert.equal(f.tier2MaxTokens, undefined);
-		assert.equal(f.summaWords, 80);
-	});
-
-	it("resolveConfig: env sets one field, file sets another, third is undefined", () => {
-		const cfg = resolveConfig({
-			file: { tier2MaxTokens: 200_000 },
-			env: { [ENV.tier1MaxTokens]: "75000" } as EnvRecord,
-		});
-		assert.equal(cfg.tier1MaxTokens, 75000);
-		assert.equal(cfg.tier2MaxTokens, 200_000);
-		assert.equal(cfg.summaWords, undefined);
 	});
 });
 
@@ -1045,237 +937,7 @@ describe("loopGuardHardBlock", () => {
 	});
 });
 
-
-// ─── asyncMode (the background-summarizer opt-out) ─────────────────────
-//
-// `asyncMode` is a boolean toggle. `true` (default) turns the
-// background (non-blocking) summarizer ON; `false` restores the
-// legacy synchronous behavior. The knob is exposed in BOTH
-// channels (env `PI_CONTEXT_TRIMMER_ASYNC_MODE` and the config-file
-// `asyncMode` field) per the tandem principle; precedence is
-// env > file > default. Badly-typed values are treated as absent
-// (the resolver falls through to the next precedence layer).
-
-describe("asyncMode — file channel (parseConfigFile)", () => {
-	it("file parse: true is accepted", () => {
-		assert.equal(parseConfigFile({ asyncMode: true }).asyncMode, true);
-	});
-
-	it("file parse: false is accepted", () => {
-		assert.equal(parseConfigFile({ asyncMode: false }).asyncMode, false);
-	});
-
-	it("file parse: badly-typed values are treated as absent", () => {
-		// Strings, numbers, null, undefined, and objects are
-		// all rejected — only the strict `true` or `false`
-		// boolean survives. The fallback chain (env > file >
-		// default) means a badly-typed value falls through to
-		// the next layer rather than crashing the resolver.
-		assert.equal(parseConfigFile({ asyncMode: "yes" }).asyncMode, undefined, "string 'yes' is rejected");
-		assert.equal(parseConfigFile({ asyncMode: 1 }).asyncMode, undefined, "number 1 is rejected (strict-boolean guard)");
-		assert.equal(parseConfigFile({ asyncMode: 0 }).asyncMode, undefined, "number 0 is rejected (strict-boolean guard)");
-		assert.equal(parseConfigFile({ asyncMode: null }).asyncMode, undefined, "null is rejected");
-		assert.equal(parseConfigFile({ asyncMode: undefined }).asyncMode, undefined, "undefined is rejected");
-		assert.equal(parseConfigFile({ asyncMode: {} }).asyncMode, undefined, "object is rejected");
-	});
-
-	it("file parse: missing key leaves the field undefined", () => {
-		assert.equal(parseConfigFile({ personalityPath: "/p" }).asyncMode, undefined);
-	});
-});
-
-describe("asyncMode — resolveConfig (precedence)", () => {
-	it("default: nothing configured → DEFAULT_ASYNC_MODE (true)", () => {
-		const cfg = resolveConfig({});
-		assert.equal(cfg.asyncMode, DEFAULT_ASYNC_MODE, "default asyncMode matches DEFAULT_ASYNC_MODE");
-		assert.equal(cfg.asyncMode, true, "DEFAULT_ASYNC_MODE is true (background ON by default)");
-	});
-
-	it("file override: asyncMode: false wins over the default", () => {
-		const cfg = resolveConfig({ file: { asyncMode: false } });
-		assert.equal(cfg.asyncMode, false, "file value (false) overrides the default (true)");
-	});
-
-	it("file override: asyncMode: true matches the default but is honored when set", () => {
-		const cfg = resolveConfig({ file: { asyncMode: true } });
-		assert.equal(cfg.asyncMode, true);
-	});
-
-	it("env override: PI_CONTEXT_TRIMMER_ASYNC_MODE=1 → true", () => {
-		const cfg = resolveConfig({ env: { [ENV.asyncMode]: "1" } as EnvRecord });
-		assert.equal(cfg.asyncMode, true, "env '1' forces asyncMode ON");
-	});
-
-	it("env override: PI_CONTEXT_TRIMMER_ASYNC_MODE=0 → false", () => {
-		const cfg = resolveConfig({ env: { [ENV.asyncMode]: "0" } as EnvRecord });
-		assert.equal(cfg.asyncMode, false, "env '0' forces asyncMode OFF");
-	});
-
-	it("env > file: env=0 wins over file=true", () => {
-		// When the operator sets both channels, env wins.
-		const cfg = resolveConfig({
-			file: { asyncMode: true },
-			env: { [ENV.asyncMode]: "0" } as EnvRecord,
-		});
-		assert.equal(cfg.asyncMode, false, "env '0' overrides file true");
-	});
-
-	it("env > file: env=1 wins over file=false", () => {
-		const cfg = resolveConfig({
-			file: { asyncMode: false },
-			env: { [ENV.asyncMode]: "1" } as EnvRecord,
-		});
-		assert.equal(cfg.asyncMode, true, "env '1' overrides file false");
-	});
-
-	it("env unset falls back to file value", () => {
-		const cfg = resolveConfig({
-			file: { asyncMode: false },
-			env: {},
-		});
-		assert.equal(cfg.asyncMode, false, "env unset → file value (false)");
-	});
-
-	it("non-'1'/'0' env value falls back to file value", () => {
-		// Only the strict "1" / "0" tokens are honored. Any other
-		// string (including "true", "yes", "on", an empty string)
-		// is treated as "no override" so the resolver falls
-		// through to the file / default layer.
-		const cfg = resolveConfig({
-			file: { asyncMode: false },
-			env: { [ENV.asyncMode]: "true" } as EnvRecord,
-		});
-		assert.equal(cfg.asyncMode, false, "env 'true' is not honored; file false wins");
-		const cfgEmpty = resolveConfig({
-			file: { asyncMode: false },
-			env: { [ENV.asyncMode]: "" } as EnvRecord,
-		});
-		assert.equal(cfgEmpty.asyncMode, false, "empty env string is treated as no override");
-	});
-
-	it("ENV.asyncMode is the documented namespace", () => {
-		assert.equal(ENV.asyncMode, "PI_CONTEXT_TRIMMER_ASYNC_MODE");
-	});
-});
-
-describe("DEFAULT_ASYNC_MODE", () => {
-	it("is the documented boolean constant (true — background ON by default)", () => {
-		assert.equal(DEFAULT_ASYNC_MODE, true);
-	});
-});
-
-// ─── reasoningBlockCap (the count-based reasoning trim) ───────────────
-//
-// `reasoningBlockCap` is the operator-configurable knob that controls
-// how many `type:"thinking"` content blocks the wiring layer keeps
-// per message stream (counted from the latest). Integer semantics:
-// `-1` = send all (passthrough), `0` = send none, any positive
-// integer is the count of blocks to keep. The knob is exposed in
-// BOTH channels (env `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` and
-// the `reasoningBlockCap` JSON key) per the tandem principle;
-// precedence is env > file > compile-time default (`1`).
-//
-// The new validator `isValidBlockCap` is file-private — the public
-// surface tests assert against is `parseConfigFile` and
-// `resolveConfig` (the contract surface the wiring reads). Badly-
-// typed values in either channel fall through to the next precedence
-// layer (the existing `parseConfigFile` rule — never throw).
-
-describe("reasoningBlockCap — file channel (parseConfigFile)", () => {
-	it("file parse: -1 (passthrough sentinel) is accepted", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: -1 }).reasoningBlockCap, -1);
-	});
-
-	it("file parse: 0 (send-none sentinel) is accepted", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: 0 }).reasoningBlockCap, 0);
-	});
-
-	it("file parse: 1 (the default) is accepted", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: 1 }).reasoningBlockCap, 1);
-	});
-
-	it("file parse: a positive integer is accepted", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: 3 }).reasoningBlockCap, 3);
-		assert.equal(parseConfigFile({ reasoningBlockCap: 100 }).reasoningBlockCap, 100);
-	});
-
-	it("file parse: value < -1 is treated as absent", () => {
-		// -2 and below fail `isValidBlockCap`'s `v >= -1` check
-		// and are treated as absent (the resolver falls through
-		// to the env / default layer).
-		assert.equal(parseConfigFile({ reasoningBlockCap: -2 }).reasoningBlockCap, undefined);
-		assert.equal(parseConfigFile({ reasoningBlockCap: -100 }).reasoningBlockCap, undefined);
-	});
-
-	it("file parse: a non-integer (float) is treated as absent", () => {
-		// `isValidBlockCap` requires `Number.isInteger`; floats
-		// fail that check (1.5 is the canonical "non-integer"
-		// case) and are treated as absent.
-		assert.equal(parseConfigFile({ reasoningBlockCap: 1.5 }).reasoningBlockCap, undefined);
-		assert.equal(parseConfigFile({ reasoningBlockCap: 0.5 }).reasoningBlockCap, undefined);
-		assert.equal(parseConfigFile({ reasoningBlockCap: -0.5 }).reasoningBlockCap, undefined);
-	});
-
-	it("file parse: non-numeric (string, boolean, null, object) is treated as absent", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: "1" }).reasoningBlockCap, undefined, "string '1' is rejected (the JSON channel does not coerce)");
-		assert.equal(parseConfigFile({ reasoningBlockCap: true }).reasoningBlockCap, undefined, "boolean true is rejected");
-		assert.equal(parseConfigFile({ reasoningBlockCap: null }).reasoningBlockCap, undefined, "null is rejected");
-		assert.equal(parseConfigFile({ reasoningBlockCap: { a: 1 } }).reasoningBlockCap, undefined, "object is rejected");
-	});
-
-	it("file parse: NaN is treated as absent", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: Number.NaN }).reasoningBlockCap, undefined);
-	});
-
-	it("file parse: Infinity (positive or negative) is treated as absent", () => {
-		assert.equal(parseConfigFile({ reasoningBlockCap: Number.POSITIVE_INFINITY }).reasoningBlockCap, undefined);
-		assert.equal(parseConfigFile({ reasoningBlockCap: Number.NEGATIVE_INFINITY }).reasoningBlockCap, undefined);
-	});
-
-	it("file parse: missing key leaves the field undefined", () => {
-		assert.equal(parseConfigFile({ personalityPath: "/p" }).reasoningBlockCap, undefined);
-	});
-});
-
 describe("reasoningBlockCap — resolveConfig (precedence)", () => {
-	// The wiring layer's contract is `cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT`
-	// — the resolver returns `undefined` when neither channel sets
-	// a value, and the wiring layer applies the compile-time
-	// default. The tests below assert the resolver's behavior; the
-	// wiring layer's default-applies behavior is covered in
-	// `integration.test.ts` (the end-to-end context-handler test).
-
-	it("env > file: env wins when both channels set a value", () => {
-		const cfg = resolveConfig({
-			file: { reasoningBlockCap: 3 },
-			env: { [ENV.reasoningBlockCap]: "5" } as EnvRecord,
-		});
-		assert.equal(cfg.reasoningBlockCap, 5, "env value 5 wins over file value 3");
-	});
-
-	it("env wins with -1 (passthrough sentinel)", () => {
-		const cfg = resolveConfig({
-			file: { reasoningBlockCap: 1 },
-			env: { [ENV.reasoningBlockCap]: "-1" } as EnvRecord,
-		});
-		assert.equal(cfg.reasoningBlockCap, -1, "env -1 wins over file 1 (passthrough sentinel is honored)");
-	});
-
-	it("env wins with 0 (send-none sentinel)", () => {
-		const cfg = resolveConfig({
-			file: { reasoningBlockCap: 1 },
-			env: { [ENV.reasoningBlockCap]: "0" } as EnvRecord,
-		});
-		assert.equal(cfg.reasoningBlockCap, 0, "env 0 wins over file 1 (send-none sentinel is honored)");
-	});
-
-	it("file-only: env unset, file sets a value → file value returned", () => {
-		const cfg = resolveConfig({
-			file: { reasoningBlockCap: 7 },
-		});
-		assert.equal(cfg.reasoningBlockCap, 7, "file-only returns the file value");
-	});
-
 	it("nothing configured: both unset → resolver returns undefined (wiring applies the compile-time default)", () => {
 		// The resolver does NOT apply a default itself — the
 		// wiring layer (index.ts) is what reads
@@ -1410,7 +1072,7 @@ describe("reasoningBlockCap — file parse: all-or-nothing per field", () => {
 // the `intercomKeepLast` JSON key) per the tandem principle;
 // precedence is env > file > compile-time default (`DEFAULT_INTERCOM_KEEP_LAST`
 // = `-1`, mirroring the `reasoningBlockCap` `-1` precedent). The
-// wiring layer coerces floats with `Math.trunc` (summaWords
+// wiring layer coerces floats with `Math.trunc`
 // precedent) before passing the value to the pure policy function.
 
 describe("intercomKeepLast — file channel (parseConfigFile)", () => {
@@ -1443,7 +1105,7 @@ describe("intercomKeepLast — file channel (parseConfigFile)", () => {
 		// `isValidBlockCap` requires `Number.isInteger`; floats
 		// fail that check and are treated as absent. The
 		// `Math.trunc` coercion lives at the wiring layer (per
-		// the summaWords precedent), not at the resolver.
+		// the integer-coercion precedent), not at the resolver.
 		assert.equal(parseConfigFile({ intercomKeepLast: 1.5 }).intercomKeepLast, undefined);
 		assert.equal(parseConfigFile({ intercomKeepLast: 0.5 }).intercomKeepLast, undefined);
 		assert.equal(parseConfigFile({ intercomKeepLast: -0.5 }).intercomKeepLast, undefined);
@@ -1649,7 +1311,7 @@ describe("intercomKeepLast — resolveConfig (precedence)", () => {
 // `subagentNotifyKeepLast` JSON key) per the tandem principle;
 // precedence is env > file > default fallthrough to the resolved
 // `intercomKeepLast` value. The wiring layer coerces floats with
-// `Math.trunc` (summaWords precedent) before passing the value to
+// `Math.trunc`  before passing the value to
 // the pure policy function.
 
 describe("subagentNotifyKeepLast — file channel (parseConfigFile)", () => {
@@ -1842,12 +1504,12 @@ describe("subagentNotifyKeepLast — resolveConfig (precedence)", () => {
 // `tokenEstimatorDivisor` is the operator-configurable knob that
 // controls the chars-per-token constant the policy uses for every
 // per-message token estimate (the trimmable mass, the protected mass,
-// the system-prompt mass, the `[summa: …]` envelope tag). The knob
+// the system-prompt mass, the knob
 // is exposed in BOTH channels (env
 // `PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR` and the
 // `tokenEstimatorDivisor` JSON key) per the tandem principle;
 // precedence is env > JSON > undefined. The wiring layer coerces
-// with `Math.trunc` to an integer (summaWords precedent) when
+// with `Math.trunc` to an integer  when
 // passing the value to the pure policy. The policy's
 // `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
 // fallback when neither channel sets a value.
@@ -1956,7 +1618,7 @@ describe("tokenEstimatorDivisor — resolveConfig (precedence)", () => {
 		// chain (env undefined → file value) returns the file
 		// value. The `parseNumberEnv` shape matches every other
 		// numeric knob in the file (tier1MaxTokens, tier2MaxTokens,
-		// summaWords, recencyFloor, loopGuardThreshold, etc.).
+		// recencyFloor, loopGuardThreshold, etc.).
 		const cfg = resolveConfig({
 			file: { tokenEstimatorDivisor: 4 },
 			env: { [ENV.tokenEstimatorDivisor]: "not-a-number" } as EnvRecord,

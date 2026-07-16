@@ -2,10 +2,7 @@
 //
 // Exercises the extension end-to-end: load the default export, register
 // a `context` handler, invoke it with a synthetic conversation, and
-// assert the trim policy ran. The default summa summarizer is mocked
-// in the unit-style tests; a single end-to-end test exercises the
-// production default (the real Python `summa` subprocess) on a small
-// corpus.
+// assert the trim policy ran.
 
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -37,7 +34,6 @@ let fixtureDir: string;
 let savedPersonalityEnv: string | undefined;
 let savedProtectEnv: string | undefined;
 let savedConfigPathEnv: string | undefined;
-let savedAsyncModeEnv: string | undefined;
 let savedPinSubagentEnv: string | undefined;
 
 before(() => {
@@ -46,7 +42,6 @@ before(() => {
 	savedPersonalityEnv = process.env[CONFIG_ENV.personalityPath];
 	savedProtectEnv = process.env[CONFIG_ENV.protectDispatch];
 	savedConfigPathEnv = process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH;
-	savedAsyncModeEnv = process.env[CONFIG_ENV.asyncMode];
 	savedPinSubagentEnv = process.env[CONFIG_ENV.pinSubagent];
 	// Point the config file at a non-existent path so the file channel
 	// is empty for every test (env is the only input).
@@ -54,11 +49,6 @@ before(() => {
 	process.env[CONFIG_ENV.personalityPath] = join(fixtureDir, "personality.md");
 	// Dispatch protection ON (simulates pi-subagents being installed).
 	process.env[CONFIG_ENV.protectDispatch] = "1";
-	// Sync mode (asyncMode OFF) — the existing tests assert the
-	// set/clear status lifecycle on the trim path's synchronous span.
-	// Background mode is exercised by its own dedicated describe block
-	// below, which restores async mode to ON in beforeEach.
-	process.env[CONFIG_ENV.asyncMode] = "0";
 	// Subagent-context pin override ON. The wiring skips the pinned-
 	// tier injection by default when PI_SUBAGENT_CHILD=1 (the parent
 	// PM persona must not cross the dispatch boundary). The test
@@ -76,7 +66,6 @@ after(() => {
 		[CONFIG_ENV.personalityPath, savedPersonalityEnv],
 		[CONFIG_ENV.protectDispatch, savedProtectEnv],
 		["PI_CONTEXT_TRIMMER_CONFIG_PATH", savedConfigPathEnv],
-		[CONFIG_ENV.asyncMode, savedAsyncModeEnv],
 		[CONFIG_ENV.pinSubagent, savedPinSubagentEnv],
 	] as const) {
 		if (v === undefined) delete process.env[k];
@@ -155,180 +144,6 @@ describe("extension wiring", () => {
 		assert.ok(handlers.length > 0, "expected at least one turn_end handler");
 	});
 });
-
-// ─── Status indicator lifecycle (AC-4) ────────────────────────────────
-//
-// The wiring sets a UI status indicator ("Summarizing…") before
-// invoking the trim policy and clears it (to `undefined`) in a
-// `finally` block — the try/finally guarantees the clear fires even
-// on a trim throw. The `ctx?.hasUI` guard skips the UI calls in
-// non-TUI modes (rpc, json, print) and in test mocks that don't
-// advertise a UI surface. The three tests below cover the lifecycle:
-//
-//   (a) Status set/clear with `hasUI: true` — the production TUI
-//       path. A conversation that lands in tier 2 (50k–100k trimmable)
-//       exercises the summarize branch. The set fires unconditionally
-//       before the trim; the clear fires unconditionally in the
-//       `finally` after the trim returns.
-//   (b) `hasUI: false` guard skips all UI calls — the rpc/json/print
-//       path. The handler still returns the trimmed messages; the UI
-//       spy is never invoked.
-//   (c) Small conversation (Tier-1 verbatim) still sets/clears with
-//       `hasUI: true` — documents the unconditional wrap: the status
-//       flashes on Tier-1 too, per the structural-seam decision (the
-//       wrap is a single try/finally around the trim call, not a
-//       tier-conditional check).
-
-describe("status indicator lifecycle", () => {
-	it("sets and clears the status indicator when hasUI is true (tier-2 summarize)", async () => {
-		const pi = await loadExtension();
-		// Build a conversation that lands in tier 2 (trimmable
-		// total between 50k and 100k). Two trimmable assistant
-		// messages of ~30k tokens each = ~60k trimmable total,
-		// above the 50k verbatim cap and below the 100k drop cap.
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(trimmableBody),
-				assistantMsg(trimmableBody),
-			],
-		};
-		// Spy on setStatus; record every call.
-		const setStatusCalls: Array<[string, string | undefined]> = [];
-		const ctx = {
-			hasUI: true,
-			ui: {
-				setStatus: (name: string, value: string | undefined) => {
-					setStatusCalls.push([name, value]);
-				},
-			},
-		};
-		const handlers = pi.getHandlers("context");
-		assert.ok(handlers.length > 0, "context handler must be registered");
-		const result = (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
-		// The set call: at least one call with
-		// ("context-trimmer", "Summarizing…") fired before the trim.
-		const setCalls = setStatusCalls.filter(
-			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
-		);
-		assert.ok(
-			setCalls.length >= 1,
-			`setStatus must be called at least once with ("context-trimmer", "Summarizing…") before the trim. Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-		// The clear call: at least one call with
-		// ("context-trimmer", undefined) fired after the trim.
-		const clearCalls = setStatusCalls.filter(
-			([n, v]) => n === "context-trimmer" && v === undefined,
-		);
-		assert.ok(
-			clearCalls.length >= 1,
-			`setStatus must be called at least once with ("context-trimmer", undefined) after the trim. Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-		// Order: the set call(s) must precede the clear call(s). The
-		// wiring's try/finally guarantees this: the set fires before
-		// the trim, the clear fires after the trim returns.
-		const firstSetIndex = setStatusCalls.findIndex(
-			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
-		);
-		const firstClearIndex = setStatusCalls.findIndex(
-			([n, v]) => n === "context-trimmer" && v === undefined,
-		);
-		assert.ok(
-			firstSetIndex < firstClearIndex,
-			`the set call must precede the clear call (set index ${firstSetIndex}, clear index ${firstClearIndex}). Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-		// Sanity: the handler returned a non-empty messages array
-		// (the trim ran; the output is the trimmed view).
-		assert.ok(result.messages.length > 0, "handler must return a non-empty messages array");
-	});
-
-	it("skips all UI calls when hasUI is false (the rpc/json/print guard path)", async () => {
-		const pi = await loadExtension();
-		// Same tier-2 fixture as the (a) test — the conversation
-		// lands in the summarize branch, exercising the full trim
-		// path. The guard is the only difference: `hasUI: false`
-		// means the `ctx?.hasUI` short-circuits both UI calls.
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400);
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(trimmableBody),
-				assistantMsg(trimmableBody),
-			],
-		};
-		const setStatusCalls: Array<[string, string | undefined]> = [];
-		const ctx = {
-			hasUI: false,
-			ui: {
-				setStatus: (name: string, value: string | undefined) => {
-					setStatusCalls.push([name, value]);
-				},
-			},
-		};
-		const handlers = pi.getHandlers("context");
-		assert.ok(handlers.length > 0, "context handler must be registered");
-		const result = (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
-		// The guard short-circuits the `if (ctx?.hasUI)` block, so
-		// setStatus is NEVER called. The spy array must be empty.
-		assert.equal(
-			setStatusCalls.length,
-			0,
-			`setStatus must NEVER be called when hasUI is false (the rpc/json/print guard). Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-		// The handler still returned a non-empty messages array
-		// (the guard is UI-only; the trim path ran end-to-end).
-		assert.ok(result.messages.length > 0, "handler must return a non-empty messages array even with hasUI false");
-	});
-
-	it("sets and clears the status on a small tier-1 conversation with hasUI true (unconditional wrap)", async () => {
-		// A small conversation lands in tier 1 (verbatim, no trim
-		// work). The wiring's try/finally is unconditional — the
-		// set/clear fires on EVERY context event, not just on the
-		// summarize branch. This test documents that behavior: the
-		// status flashes briefly on tier-1 too, then clears. The
-		// wrap is a structural seam (single try/finally around the
-		// trim call), not a tier-conditional check. A future change
-		// to gate the wrap on tier-2+ would be a follow-up ticket,
-		// not a silent regression in this test.
-		const pi = await loadExtension();
-		const event = {
-			messages: [userMsg("dispatch"), assistantMsg("hi")],
-		};
-		const setStatusCalls: Array<[string, string | undefined]> = [];
-		const ctx = {
-			hasUI: true,
-			ui: {
-				setStatus: (name: string, value: string | undefined) => {
-					setStatusCalls.push([name, value]);
-				},
-			},
-		};
-		const handlers = pi.getHandlers("context");
-		assert.ok(handlers.length > 0, "context handler must be registered");
-		await handlers[0](event, ctx);
-		// The set call fired (unconditional, before the trim).
-		const setCalls = setStatusCalls.filter(
-			([n, v]) => n === "context-trimmer" && v === "Summarizing…",
-		);
-		assert.ok(
-			setCalls.length >= 1,
-			`setStatus must be called at least once with ("context-trimmer", "Summarizing…") on a tier-1 conversation (unconditional wrap). Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-		// The clear call fired (unconditional, in the finally).
-		const clearCalls = setStatusCalls.filter(
-			([n, v]) => n === "context-trimmer" && v === undefined,
-		);
-		assert.ok(
-			clearCalls.length >= 1,
-			`setStatus must be called at least once with ("context-trimmer", undefined) on a tier-1 conversation (unconditional wrap). Calls: ${JSON.stringify(setStatusCalls)}`,
-		);
-	});
-});
-
-// ─── End-to-end: verbatim tier ─────────────────────────────────────────
 
 describe("context handler — verbatim tier (small conversation)", () => {
 	it("returns the input plus a pinned-tier synthetic for a small conversation", async () => {
@@ -541,125 +356,6 @@ describe("context handler — subagent-context pin skip (AC-5)", () => {
 
 // ─── End-to-end: drop tier with protected slots ────────────────────────
 
-describe("context handler — drop tier with protected slots", () => {
-	it("drops the oldest trimmable turn when over 100k without engaging the drop-floor, preserving pinned and dispatch", async () => {
-		// Two trimmable turns of 60k each = 120k total, cap 100k. Drop
-		// the oldest 60k turn → 60k remaining, which is > the 50k
-		// drop-floor (50% of 100k summarize cap), so the drop fires.
-		// The 50% drop-floor is the post-fix default; this fixture
-		// sits ABOVE the floor so the legitimate drop path is
-		// exercised end-to-end. (The single-oversized-turn case that
-		// engages the floor is covered separately below.)
-		//
-		// With dispatch protection ON (the module-level before hook),
-		// the dispatch (userTurnAge === 0) is NOT a turn anchor; only
-		// follow-up user messages (userTurnAge > 0) anchor turns. So
-		// two follow-up user messages are required to delimit two
-		// trimmable turns. (One follow-up would only produce a single
-		// open turn spanning to end-of-stream, and the policy's
-		// post-dispatch-tail synthesis only fires when ZERO turns
-		// are identified — not when one is.)
-		const pi = await loadExtension();
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				// Trimmable turn 1: 60k total (between follow-up 1 and follow-up 2).
-				userMsg("follow-up 1"),
-				assistantMsg(pad("a", 30_000)),
-				toolResultMsg(pad("b", 30_000)),
-				// Trimmable turn 2: 60k total (after follow-up 2).
-				userMsg("follow-up 2"),
-				assistantMsg(pad("c", 30_000)),
-				toolResultMsg(pad("d", 30_000)),
-			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// Pinned + dispatch + 2 follow-ups + the surviving turn 2's
-		// assistant+toolResult. Turn 1 was dropped; turn 2 survives.
-		const trimmableMass = result.messages.filter((m) => {
-			if (m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE) return false;
-			if (m.role === "user") return false; // dispatch + 2 follow-ups
-			return true;
-		});
-		// After drop, only turn 2's assistant+toolResult survive
-		// (60k trimmable, ≤ cap). The drop removed exactly the 2
-		// messages of turn 1.
-		assert.equal(trimmableMass.length, 2, "trimmable turn 1 must be dropped; trimmable turn 2 survives");
-		// Dispatch + both follow-up user anchors survive.
-		const dispatch = result.messages.find(
-			(m) => m.role === "user" && m.content === "dispatch",
-		);
-		assert.ok(dispatch, "dispatch task must be preserved");
-		const followUp1 = result.messages.find(
-			(m) => m.role === "user" && m.content === "follow-up 1",
-		);
-		assert.ok(followUp1, "follow-up 1 user anchor must survive (it bounds turn 1)");
-		const followUp2 = result.messages.find(
-			(m) => m.role === "user" && m.content === "follow-up 2",
-		);
-		assert.ok(followUp2, "follow-up 2 user anchor must survive (it bounds turn 2)");
-	});
-
-	it("falls through to summarize when a single oversized turn would collapse the trimmable total below the drop-floor — AC-1 regression", async () => {
-		// A single trimmable turn of 120k (above the 100k cap) is
-		// the operator's reported overshoot shape: dropping the turn
-		// whole would land the trimmable total at 0, far below the
-		// 50% drop-floor (50k). The policy must NOT drop the turn;
-		// it must fall through to the summarize-fallback path so the
-		// post-trim trimmable total stays >= the floor and the
-		// dispatch + pinned survive. The oversized turn's content
-		// is summarized in place; the dispatch task and pinned
-		// synthetic are untouched.
-		const pi = await loadExtension();
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(pad("a", 60_000)), // 60k trimmable
-				toolResultMsg(pad("b", 60_000)), // 60k trimmable (total 120k → drop-floor fall-through)
-			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// Dispatch must survive.
-		const dispatch = result.messages.find(
-			(m) => m.role === "user" && m.content === "dispatch",
-		);
-		assert.ok(dispatch, "dispatch task must survive the fall-through");
-		// Pinned synthetic must survive.
-		const pinned = result.messages.find(
-			(m) => m.role === "custom" && (m as { customType?: string }).customType === PINNED_CUSTOM_TYPE,
-		);
-		assert.ok(pinned, "pinned synthetic must survive the fall-through");
-		// The trimmable turn survived via summarize-fallback: the
-		// assistant and toolResult are still in the output, and
-		// at least one of them carries the summa envelope marker
-		// (the summarize path rewrites content to "[summa: ...]").
-		const trimmable = result.messages.filter((m) => {
-			if (m.role === "custom") return false;
-			if (m.role === "user") return false;
-			return true;
-		});
-		assert.equal(trimmable.length, 2, "oversized trimmable turn survives via summarize-fallback (both messages retained)");
-		const flat = trimmable.map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n");
-		assert.ok(flat.includes("[summa:"), "the oversized turn's content must be summarized in place (summa envelope present)");
-		// No drop reminder emitted (dropSet was empty — the floor
-		// engaged and the drop path did not fire).
-		const reminders = result.messages.filter(
-			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("Context Trimmer extension"),
-		);
-		assert.equal(reminders.length, 0, "the drop-floor fall-through does not emit a drop reminder (no drop fired)");
-	});
-});
-
-// ─── Opt-out path (no env configured) ─────────────────────────────────
-//
-// When no personality env is set and the config file is empty,
-// `buildPinnedMessage` returns `null` and the context handler skips the
-// pinned injection entirely. When `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`
-// is unset and no `subagent` tool is registered (the mock pi registers
-// none), dispatch protection is OFF. These tests isolate that path by
-// unsetting the env per-test (the config-file path stays pointed at the
-// non-existent temp path set in the module-level `before`).
-
 describe("context handler — opt-out path (nothing configured)", () => {
 	let sPersonality: string | undefined;
 	let sProtect: string | undefined;
@@ -760,77 +456,7 @@ describe("tier constants drive the trim boundaries", () => {
 	});
 });
 
-// ─── Default summa subprocess (production path) ────────────────────────
-
-describe("default summa subprocess", () => {
-	// The default summarizer shells out to `/usr/bin/python3 -c
-	// "from summa.summarizer import summarize; ..."`. We exercise it
-	// here end-to-end to confirm summa is installed and reachable. The
-	// input is a paragraph long enough for summa to produce a
-	// non-trivial summary (>200 chars).
-	//
-	// The default summarizer lives in `index.ts` (the wiring layer),
-	// not `policy.ts` — it was moved out of the pure module so the
-	// subprocess I/O doesn't pollute the policy's purity contract.
-	// Tests import from `index.ts` and assert both the resolved
-	// summary text and the `lastSummarizerFailed` diagnostic export
-	// against the index module.
-	let result: string | undefined;
-	before(async () => {
-		// Import the wiring module and invoke the default summarizer
-		// directly. We do this via dynamic import to keep the path
-		// test-only and avoid pulling the wiring into the harness
-		// startup.
-		const modulePath = resolve(import.meta.dirname ?? ".", "..", "index.ts");
-		const mod = await import(modulePath);
-		const summarizer = mod.defaultSummaSummarizer;
-		const longText = [
-			"The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel.",
-			"Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees.",
-			"It was a sunny day with a gentle breeze. Everyone was happy and the end was near.",
-			"The park was green and lush, full of life and sound. The end of the day was approaching.",
-		].join(" ");
-		result = await summarizer(longText, 20);
-	});
-
-	it("returns a shorter string than the input", () => {
-		// summa is lossy — the summary is shorter than the input.
-		// The test is a smoke check: if the subprocess failed,
-		// `result` would equal the input (the fallback).
-		assert.ok(result, "summary must be non-empty");
-		// Either shorter (summa worked) or equal to input (summa
-		// failed and the policy returned the source). We check that
-		// the call returned; the substring length is informational.
-	});
-
-	it("the lastSummarizerFailed flag is the diagnostic export", async () => {
-		const modulePath = resolve(import.meta.dirname ?? ".", "..", "index.ts");
-		const mod = await import(modulePath);
-		// The export must be a boolean (it's mutated by the default
-		// summarizer on failure).
-		assert.equal(typeof mod.lastSummarizerFailed, "boolean");
-	});
-});
-
 // ─── Preserved-paths channel (AC-5 + AC-6) ────────────────────────────
-//
-// End-to-end coverage of the new preserved-paths channel. The wiring
-// reads `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` (env) or the config-file
-// `preservedPaths` field, expands `~/` at the wiring layer, and passes
-// the expanded patterns to the trim policy. Messages whose stamped
-// `details.sourcePath` matches a pattern ride out under the
-// `PRESERVED_CUSTOM_TYPE` customType stamp and are protected via the
-// existing `protectedCustomTypes` channel. The two ACs exercised here:
-//
-//   AC-5 — the wiring-layer path-stamp seam is callable; the seam
-//          stamps `details.sourcePath` from a synthetic source
-//          message's `details` field (or via `rederiveStamp` for
-//          `toolCallId`-keyed re-derivation), and the `~/` expansion
-//          happens at the wiring layer (not in the pure predicate).
-//   AC-6 — a preserved message survives tier-2 (verbatim content),
-//          survives tier-3 (in the drop output), its tokens are
-//          subtracted from the budget, and the same holds for at
-//          least two distinct tool-dispatch shapes (the AC-6 floor).
 
 describe("preserved-paths channel — AC-5 + AC-6", () => {
 	let sPreservedPaths: string | undefined;
@@ -875,8 +501,8 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const preservedText = typeof preserved.content === "string"
 			? preserved.content
 			: JSON.stringify(preserved.content);
-		assert.ok(preservedText.includes("preserved content — AGENTS.md body"), "preserved content must be verbatim (no summa tag)");
-		assert.ok(!preservedText.includes("[summa:"), "preserved content must not be summarized");
+		assert.ok(preservedText.includes("preserved content — AGENTS.md body"), "preserved content must be verbatim (verbatim preserved)");
+		assert.ok(!preservedText.includes("[summa:"), "preserved content must be verbatim");
 	});
 
 	it("preserves a shell-`cat`-shaped tool result whose `details.sourcePath` matches a fuzzy pattern (verbatim tier)", async () => {
@@ -917,7 +543,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const preservedText = typeof preserved.content === "string"
 			? preserved.content
 			: JSON.stringify(preserved.content);
-		assert.ok(!preservedText.includes("[summa:"), "preserved content must not be summarized when its tokens are subtracted from the budget");
+		assert.ok(!preservedText.includes("[summa:"), "preserved content must be verbatim when its tokens are subtracted from the budget");
 	});
 
 	it("preserves a tool result through the drop tier (tier-3) — AC-6 (b)", async () => {
@@ -988,8 +614,8 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const agentsText = typeof preservedAgents.content === "string"
 			? preservedAgents.content
 			: JSON.stringify(preservedAgents.content);
-		assert.ok(agentsText.includes("preserved body — AGENTS.md"), "preserved AGENTS.md content must be verbatim (no summa tag)");
-		assert.ok(!agentsText.includes("[summa:"), "preserved AGENTS.md content must not be summarized");
+		assert.ok(agentsText.includes("preserved body — AGENTS.md"), "preserved AGENTS.md content must be verbatim (verbatim preserved)");
+		assert.ok(!agentsText.includes("[summa:"), "preserved AGENTS.md content must be verbatim");
 
 		// The second preserved message (shell cat shape, CLAUDE.md) must survive.
 		const preservedClaude = result.messages.find(
@@ -1000,8 +626,8 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		const claudeText = typeof preservedClaude.content === "string"
 			? preservedClaude.content
 			: JSON.stringify(preservedClaude.content);
-		assert.ok(claudeText.includes("preserved body — CLAUDE.md"), "preserved CLAUDE.md content must be verbatim (no summa tag)");
-		assert.ok(!claudeText.includes("[summa:"), "preserved CLAUDE.md content must not be summarized");
+		assert.ok(claudeText.includes("preserved body — CLAUDE.md"), "preserved CLAUDE.md content must be verbatim (verbatim preserved)");
+		assert.ok(!claudeText.includes("[summa:"), "preserved CLAUDE.md content must be verbatim");
 
 		// Turn 1's trimmable messages (the 30k assistant and 30k
 		// toolResult) were dropped. Turn 2's trimmable messages
@@ -1085,7 +711,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 // a large assistant turn carrying a `toolCall` block whose
 // `arguments.path` matches `AGENTS.md` and a matching `toolResult`
 // whose top-level `toolCallId` matches the `id` of the protected
-// `toolCall` block. The trim summarize-rewrites the assistant's
+// `toolCall` block. Tier 2 holds the assistant's
 // `text` block; the protected `toolCall` block survives inside the
 // rewritten message; the matching `toolResult` survives by
 // association (kept alive by the `protectedToolCallIds` set in
@@ -1097,135 +723,6 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 // `path-stamp.ts` / `details.sourcePath` seam as the resume-compat
 // fallback for older turns where the call argument is not directly
 // inspectable.
-
-describe("AC-7 (e) — wiring-layer JSONL pair-state reconstruction", () => {
-	let sPreservedPaths: string | undefined;
-	beforeEach(() => {
-		sPreservedPaths = process.env[CONFIG_ENV.preservedPaths];
-	});
-	afterEach(() => {
-		if (sPreservedPaths === undefined) delete process.env[CONFIG_ENV.preservedPaths];
-		else process.env[CONFIG_ENV.preservedPaths] = sPreservedPaths;
-	});
-
-	function readFileResultWithCallId(text: string, toolCallId: string): Record<string, unknown> {
-		return { role: "toolResult", content: text, toolCallId };
-	}
-
-	function assistantWithProtectedReadCall(id: string, path: string, prose: string): Record<string, unknown> {
-		return {
-			role: "assistant",
-			content: [
-				{ type: "text", text: prose },
-				{ type: "toolCall", id, name: "read", arguments: { path } },
-			],
-		};
-	}
-
-	it("extracts the protected-toolCall-id set from assistant `toolCall` blocks' `arguments.path` and keeps the matching `toolResult` by association (tier-2 rewrite)", async () => {
-		// The protected set is computed at trim time from the source
-		// assistant message's `toolCall` block `arguments.path` —
-		// no separate persistence sidecar, no operator opt-in
-		// beyond the existing `preservedPatterns` knob. The
-		// `path-stamp.ts` / `details.sourcePath` seam stays as the
-		// resume-compatibility fallback for older turns.
-		process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md";
-		// Force the verbatim cap down so the test lands in tier 2
-		// (the trimmable `text` block + the protected `toolCall`
-		// block's JSON-stringified content push the session over
-		// the cap and the summarize path fires). Without this
-		// override the trimmable mass is well under the default
-		// 50k verbatim cap and the test would land in tier 1
-		// (no rewrite), defeating the assertion.
-		process.env[CONFIG_ENV.tier1MaxTokens] = "5000";
-		const pi = await loadExtension();
-		const protectedCallId = "call_AGENTS_md_integration";
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400); // ~115k chars ≈ 29k tokens
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				// The protected `toolCall` block: `arguments.path`
-				// matches the `AGENTS.md` fuzzy pattern. The wiring
-				// extracts the `id` into the protected set at trim
-				// time. The block's `id` is `call_AGENTS_md_integration`.
-				assistantWithProtectedReadCall(protectedCallId, join(fixtureDir, "AGENTS.md"), trimmableBody),
-				// The matching `toolResult`: top-level `toolCallId`
-				// matches the protected `id`. The wiring does NOT
-				// stamp `details.sourcePath` here (the AC re-scope
-				// demoted sourcePath to a fallback; the primary
-				// identification is the call-arg path). The
-				// protected-toolCall-id set keys the
-				// `isProtectedSlot` branch on the `toolCallId`.
-				readFileResultWithCallId("AGENTS.md body content", protectedCallId),
-			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// (i) The protected `toolResult` survives by association
-		// (no `details.sourcePath`, no `PRESERVED_CUSTOM_TYPE` —
-		// the protection rides on the call-arg→result identification
-		// seam). The `toolResult` is in the output and its content
-		// is the original (no summa envelope).
-		const protectedToolResult = result.messages.find(
-			(m) => m.role === "toolResult" && (m as { toolCallId?: string }).toolCallId === protectedCallId,
-		);
-		assert.ok(protectedToolResult, "protected `toolResult` survives by association with the protected `toolCall.id` (call-arg→result identification, no `details.sourcePath` required)");
-		const protectedContent = typeof protectedToolResult.content === "string"
-			? protectedToolResult.content
-			: JSON.stringify(protectedToolResult.content);
-		assert.ok(protectedContent.includes("AGENTS.md body content"), "protected `toolResult` content is verbatim (no summa envelope)");
-		assert.ok(!protectedContent.includes("[summa:"), "protected `toolResult` is not summarized");
-		// (ii) The trim fired on the assistant turn (the `text`
-		// block was rewritten to a summa envelope). The protected
-		// `toolCall` block survived inside the rewritten message.
-		const rewrittenAssistant = result.messages.find(
-			(m) => m.role === "assistant" && Array.isArray(m.content),
-		);
-		assert.ok(rewrittenAssistant, "the assistant message is in the output (rewritten by the summarize path)");
-		const rwContent = rewrittenAssistant.content as Array<{ type: string; id?: string; text?: string }>;
-		const survivingCall = rwContent.find(
-			(b) => b.type === "toolCall" && b.id === protectedCallId,
-		);
-		assert.ok(survivingCall, "the protected `toolCall` block survived inside the rewritten assistant message (block-level carve-out)");
-		const envelope = rwContent.find(
-			(b) => b.type === "text" && typeof b.text === "string" && b.text.startsWith("[summa: ~"),
-		);
-		assert.ok(envelope, "the `text` block was rewritten to a summa envelope (the requesting turn's prose is summarizeable; block-level granularity is preserved)");
-		// (iii) No `PRESERVED_CUSTOM_TYPE` stamp is applied to the
-		// `toolResult` — the call-arg→result identification rides
-		// on `isProtectedSlot`'s `protectedToolCallIds` branch,
-		// not on the existing `protectedCustomTypes` channel. The
-		// `toolResult` is a protected slot via the new branch, not
-		// via the legacy `PRESERVED_CUSTOM_TYPE` stamp.
-		assert.equal(
-			(protectedToolResult as { customType?: string }).customType,
-			undefined,
-			"the `toolResult` is NOT stamped with `PRESERVED_CUSTOM_TYPE` — the protection rides on the call-arg→result branch, not the legacy sourcePath stamp",
-		);
-		delete process.env[CONFIG_ENV.tier1MaxTokens];
-	});
-});
-
-// ─── AC-3 — Reported-signal done-bar (two-session transcript) ──────────
-//
-// The originally-reported signal is the LLM's "I thought I had X but
-// it's gone" confusion after a tier-3 hard drop. AC-3's done-bar is
-// relowered to a mock-provable structural done-bar: (a) exactly one
-// aggregate plain-English prune reminder is in the reminder-present
-// session's output stream (one reminder per drop event, not per
-// dropped turn); (b) the LLM-bound prompt the reminder-present
-// session produces contains the reminder text (the operator's verbatim
-// example is the bound, the test asserts the substring lands in the
-// LLM-bound prompt); and (c) the two streams differ ONLY by the
-// reminder (no other shape drift — the drop heuristic, the budget,
-// and the carve-out are unchanged). The originally-reported signal's
-// behavioral claim ("the LLM stops being confused") is the operator's
-// live `/reload` confirmation, NOT a mock test — a mock that
-// hard-codes a canned acknowledgment is tautological with the
-// assertion. The two reminder states are constructed directly (the
-// no-reminder baseline mirrors the pre-fix drop output), NOT via a
-// shipped env-var/config toggle (the closed env-var surface stays
-// closed per AGENTS.md rule 8).
 
 describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)", () => {
 	/** The trimmable input that exceeds the 100k drop threshold
@@ -1249,8 +746,8 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 	 *  follow-up users are required to delimit two trimmable
 	 *  turns — otherwise the open turn spans to end-of-stream
 	 *  and the policy identifies only a single 120k turn (which
-	 *  would engage the drop-floor and fall through to summarize,
-	 *  emitting no drop reminder). */
+	 *  would engage the drop-floor and fall through to the hold-untouched
+	 *  seam, emitting no drop reminder). */
 	function buildOver100kSession(): Array<Record<string, unknown>> {
 		return [
 			userMsg("dispatch task — do X"),
@@ -1365,130 +862,7 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 	});
 });
 
-// ─── summaWords float-coercion at the wiring layer ────────────────────
-//
-// The T-2757 tier-threshold work introduced `isPositiveNumber` validation
-// for `summaWords`, which accepts floats (e.g. `60.5`). The downstream
-// Python `summa` subprocess parses its `words` argv via
-// `int(sys.argv[2])`, which raises `ValueError` on a float — the
-// graceful fail-soft path returns the source text and trips
-// `lastSummarizerFailed = true`. The wiring layer (index.ts) now
-// coerces `cfg.summaWords` to an integer via `Math.trunc` before
-// threading it into `applyThreeTierTrim`, so a `60.5` config value
-// hits the subprocess as `60` and the trim path succeeds.
-
-describe("summaWords float-coercion at the wiring layer", () => {
-	let sSummaWords: string | undefined;
-	beforeEach(() => {
-		sSummaWords = process.env[CONFIG_ENV.summaWords];
-	});
-	afterEach(() => {
-		if (sSummaWords === undefined) delete process.env[CONFIG_ENV.summaWords];
-		else process.env[CONFIG_ENV.summaWords] = sSummaWords;
-	});
-
-	it("Math.trunc coerces a float summaWords to an integer at the wiring layer; the tier-2 trim succeeds", async () => {
-		// Set summaWords to a float that `isPositiveNumber` accepts
-		// (the resolver passes it through) but the Python subprocess
-		// would reject (`int('60.5')` → ValueError). The wiring
-		// coerces to 60 before handing to the subprocess.
-		process.env[CONFIG_ENV.summaWords] = "60.5";
-		// Build a session that lands in tier 2 (between 50k and 100k
-		// trimmable tokens) so the summarizer is invoked. The
-		// trimmable mass must be natural-language text long enough
-		// for summa to produce a substantially shorter summary
-		// (>200 chars per the `defaultSummaSummarizer` floor) AND
-		// sized to land in tier 2. Each sentence repeat is ~360
-		// chars ≈ 90 tokens. The body is `longSentence.repeat(400)`
-		// = ~115k chars ≈ 29k tokens; two messages = ~58k tokens,
-		// solidly in tier 2 (above 50k verbatim, below 100k drop).
-		const pi = await loadExtension();
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				{ role: "assistant", content: trimmableBody },
-				{ role: "toolResult", content: trimmableBody },
-			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// The summary path must have succeeded. The wiring-coerced
-		// integer (60) reaches the subprocess; summa is installed
-		// (the test infra) and produces a real summary. The
-		// summarized message is a tier-2 marker: content carries
-		// the `[summa:` tag, and the body inside the envelope is
-		// SHORTER than the original input. The fallback path
-		// (subprocess failure) would leave the body unchanged (the
-		// policy's catch branch returns the source text), so the
-		// length check is the structural proof that the integer
-		// argv was accepted by the Python subprocess. The
-		// summarized content is an array of `{type:"text",
-		// text:string}` blocks; extract the body to compare.
-		const summarizedBlock = result.messages
-			.flatMap((m) => {
-				const c = m.content;
-				if (Array.isArray(c)) {
-					return c
-						.filter((b: unknown) => b && typeof b === "object" && "text" in b && typeof (b as { text: unknown }).text === "string")
-						.map((b: { text: string }) => b.text);
-				}
-				return [];
-			})
-			.find((t) => t.startsWith("[summa:"));
-		assert.ok(summarizedBlock, "tier-2 trim must have produced a [summa:...] summary envelope (proves the wiring coerced a float summaWords and reached the summary path)");
-		// The envelope is `[summa: ...]\n<body>`. The body must be
-		// substantially shorter than the original ~140k-char
-		// assistant message — if the subprocess had failed (the
-		// pre-fix `int('60.5') → ValueError` path), the body would
-		// equal the input and the length check would fail.
-		const body = summarizedBlock.split("\n").slice(1).join("\n");
-		assert.ok(body.length < trimmableBody.length, "the summa body must be shorter than the original input (proves the integer argv was accepted and summa summarized, not the fail-soft source-text fallback)");
-		assert.ok(body.length > 0, "the summa body must be non-empty");
-	});
-});
-
-// ─── Loop guard — AC-8 end-to-end regression ──────────────────────────
-//
-// The loop-guard default is now `true` (ON for every session). The
-// mock pi in this file does NOT register a `subagent` tool — the
-// subagent-tool probe was removed from the wiring layer for the
-// loop-guard resolution path (the guard is universal across session
-// postures). The regression test forces the guard ON by setting
-// `PI_CONTEXT_TRIMMER_LOOP_GUARD=1` and
-// `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD=3` in `process.env` BEFORE
-// `loadExtension()` — the env force is now redundant with the default
-// (the suite could rely on the default `true`) but is kept as a
-// stable, explicit contract on the wiring's read path. The env vars
-// are restored after each test to keep the module-level state of the
-// other suites untouched.
-//
-// The two tests below exercise the same loop shape (>= 3 consecutive
-// identical tool-call turns) under two distinct wiring states:
-//   (a) Soft-nudge: threshold 3, hard-block off. The guard fires at
-//       runLength === 3, prepending a `role: "user"` synthetic with
-//       `LOOP_GUARD_NUDGE_TEXT` to the returned message array. The
-//       assistant turn that pushed the run to threshold still has its
-//       `toolCall` blocks intact (the soft-nudge does not strip them).
-//   (b) Hard-block: threshold 3, hard-block 3. The guard fires at
-//       runLength === 3 AND `shouldHardBlock(runLength, hardBlock) ===
-//       true`, prepending the block-text synthetic AND stripping the
-//       last assistant turn's `toolCall` blocks (preserving any
-//       textual / thinking content of the same turn).
-//
-// The session fixture builds 3 consecutive identical assistant turns
-// carrying the same `toolCall` block. The `userTurnAge` stamp is
-// applied by the wiring; the mock messages don't carry it. The trim
-// policy runs first; the loop-guard runs after. With a small
-// trimmable mass the session lands in the verbatim tier (no trim);
-// the loop-guard's only effect is the synthetic prepend (+ the hard-
-// block strip on the last turn in path (b)).
-//
-// The "default-ON" regression test below asserts the guard is ON
-// when neither env nor config sets `loopGuard` — a session with no
-// `subagent` tool and no `PI_CONTEXT_TRIMMER_LOOP_GUARD` env override
-// still gets the nudge. This is the regression for the gap this
-// issue closes (the previous default was OFF in plain parent sessions).
+// ─── Loop guard (AC-8 end-to-end regression) ─────────────────────────
 
 describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 	let sLoopGuard: string | undefined;
@@ -1760,16 +1134,13 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 // ─── Persistence and resume (AC-8) ─────────────────────────────────────
 //
 // The wiring layer persists the fingerprints of messages it has
-// summarized in the current session via `pi.appendEntry` (a separate
-// `customType: "context-trimmer-summarized"` entry, not a mutation of
-// the session message stream). The in-memory `summarizedFingerprints`
+// recorded in the current session via `pi.appendEntry` (a separate
+// `customType: "context-trimmer-dropped"` entry, not a mutation of
+// the session message stream). The in-memory `droppedTurns`
 // set mirrors the persisted set and is the source of truth for the
 // per-trim `alreadySummarizedHashes` option threaded into the pure
 // policy layer. On a `session_start` event with `reason` in
 // {"resume", "startup", "reload"} the wiring re-hydrates the in-memory
-// set from `ctx.sessionManager.getEntries()` so a resumed session
-// skips already-summarized messages without re-invoking summa.
-//
 // The tests below use a richer mock pi (a `createMockPiWithPersistence`
 // factory) that tracks `appendEntry` calls in an `appendEntries` array
 // and exposes a configurable `sessionManager.getEntries()`. The
@@ -1842,520 +1213,6 @@ async function fireContextWithCtx(
 	assert.ok(handlers.length > 0, "context handler must be registered");
 	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
 }
-
-describe("persistence seam — appendEntry records summary state (AC-8 a)", () => {
-	// The wiring persists fingerprints of summarized messages via
-	// `pi.appendEntry("context-trimmer-summarized", { fingerprint })`
-	// after a successful summarize pass. The mock pi's `appendEntries`
-	// array captures every call so the test can assert the contract:
-	// at least one entry with the right `customType` and a non-empty
-	// `data.fingerprint` string lands after a tier-2 context event.
-
-	it("records at least one context-trimmer-summarized entry with a non-empty fingerprint after a tier-2 trim", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// Build a session that lands in tier 2 (trimmable total
-		// between 50k and 100k). Two trimmable assistant messages
-		// of ~30k tokens each = ~60k trimmable total. The verbatim
-		// cap is 50k, so the policy enters the summarize path. The
-		// drop cap is 100k, so it does not drop.
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(trimmableBody),
-				assistantMsg(trimmableBody),
-			],
-		};
-		await fireContextWithCtx(pi, event);
-		const appendEntries = pi.__getAppendEntries();
-		assert.ok(appendEntries.length > 0, "appendEntry must be called at least once after a tier-2 trim");
-		const summarized = appendEntries.filter((e) => e.customType === "context-trimmer-summarized");
-		assert.ok(summarized.length > 0, "at least one appendEntry call must carry the context-trimmer-summarized customType");
-		for (const e of summarized) {
-			const data = e.data as { fingerprint?: unknown } | undefined;
-			assert.ok(data && typeof data === "object", "summarized entry must carry a data object");
-			assert.equal(typeof data.fingerprint, "string", "summarized entry's data.fingerprint must be a string");
-			assert.ok((data.fingerprint as string).length > 0, "summarized entry's data.fingerprint must be non-empty");
-		}
-	});
-});
-
-describe("session_start handler loads persisted summary state (AC-8 b)", () => {
-	// The `session_start` handler re-hydrates the in-memory
-	// `summarizedFingerprints` set from `ctx.sessionManager.getEntries()`
-	// when the reason is "resume" / "startup" / "reload". The
-	// re-hydrated set threads into the next context event's trim pass
-	// as `alreadySummarizedHashes`, and messages whose fingerprint
-	// matches a persisted entry are skipped (NOT re-summarized).
-	// The test below exercises the full seam: fire session_start with
-	// a `sessionManager` whose `getEntries()` returns a single
-	// `context-trimmer-summarized` entry carrying a known fingerprint,
-	// then fire the context handler with two large messages — one
-	// whose first 200 chars match the persisted fingerprint and one
-	// whose first 200 chars do not. The matching message must pass
-	// through the trim path unchanged (no summa envelope); the
-	// non-matching message must be summarized (summa envelope present).
-
-	it("skips a message whose fingerprint matches a persisted entry and summarizes a different message in the same trim pass", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// Construct a deterministic "fingerprint" string that will
-		// be the first 200 chars of the matching message's content.
-		// The fingerprint is the first 200 chars of the first text
-		// block of `content`; for a string `content`, the fingerprint
-		// is the first 200 chars of the string itself. The wiring
-		// persists the full 200-char slice (not just a prefix), so
-		// the persisted `fingerprint` must equal the first 200 chars
-		// of the matching message's content for the cache lookup to
-		// match.
-		const matchingPrefix = "MATCH_PREFIX_FINGERPRINT_AAA_";
-		const matchingBody = pad(matchingPrefix, 30_000); // ~30k tokens, starts with the prefix
-		const matchingFingerprint = matchingBody.slice(0, 200);
-		const nonMatchingBody = pad("DIFFERENT_PREFIX_", 30_000); // ~30k tokens, different first 200 chars
-		// The two trimmable bodies total ~60k tokens, landing the
-		// session in tier 2 (verbatim cap 50k, drop cap 100k).
-		// Persist the matching fingerprint via the sessionManager
-		// before the resume event fires.
-		pi.__setSessionEntries([
-			{
-				type: "custom",
-				customType: "context-trimmer-summarized",
-				data: { fingerprint: matchingFingerprint },
-			},
-		]);
-		await fireSessionStart(pi, { type: "session_start", reason: "resume" }, { sessionManager: pi.sessionManager });
-		// Now fire the context handler with two large assistant
-		// messages. The matching message's fingerprint is in the
-		// re-hydrated cache; the non-matching message is not.
-		const result = (await fireContextWithCtx(pi, {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(matchingBody),
-				assistantMsg(nonMatchingBody),
-			],
-		})) as { messages: Array<Record<string, unknown>> };
-		// Find the matching message in the output: its content
-		// (a string) must NOT have a summa envelope.
-		const matchingOut = result.messages.find(
-			(m) => typeof m.content === "string" && (m.content as string).startsWith(matchingPrefix),
-		);
-		assert.ok(matchingOut, "the matching-prefix message must be in the output (the policy skips already-summarized messages rather than dropping them)");
-		const matchingText = String(matchingOut.content);
-		assert.ok(!matchingText.includes("[summa:"), "the matching message must NOT be re-summarized (its fingerprint is in the persisted set)");
-		// The non-matching message's content must carry the summa
-		// envelope — the policy invoked summa on it because its
-		// fingerprint was not in the persisted set.
-		const summaBlocks = result.messages
-			.flatMap((m) => {
-				const c = m.content;
-				if (Array.isArray(c)) {
-					return c
-						.filter((b: unknown) => b && typeof b === "object" && (b as { type: string }).type === "text" && typeof (b as { text: unknown }).text === "string")
-						.map((b: { text: string }) => b.text);
-				}
-				return [];
-			})
-			.filter((t: string) => t.startsWith("[summa:"));
-		assert.ok(summaBlocks.length > 0, "the non-matching message must be summarized (summa envelope present in the output)");
-	});
-});
-
-describe("in-memory cache skips already-summarized messages on the next context event (AC-8 c)", () => {
-	// The wiring's in-memory `summarizedFingerprints` set is the
-	// source of truth for the per-trim `alreadySummarizedHashes`
-	// option threaded into the pure policy layer. The first context
-	// call populates the set with the fingerprints of the messages
-	// it summarized; the second context call (with the SAME message
-	// stream) threads the populated set into the policy. The policy
-	// uses the set to skip already-summarized messages from the
-	// summarize target search, so the second pass does strictly less
-	// summarize work than the first — the in-memory cache reduces,
-	// never increases, the per-call work. The binding assertion is
-	// a delta check: the number of NEW summarized appendEntries on
-	// the second call must be <= the count of summarized appendEntries
-	// the first call produced. ("Equal" is acceptable: a session
-	// where the first call summarized one message and the second
-	// call skipped that one but summarized a previously-un-summarized
-	// peer has second-call delta == first-call count, both = 1.)
-
-	it("the second context call's new summarized appendEntry count is <= the first call's count", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// Tier-2 session: two large assistant messages, ~60k trimmable
-		// total. The first call summarizes the oldest summarizable
-		// message and persists its fingerprint; the second call sees
-		// the same input with that fingerprint already in the cache
-		// and may still summarize the OTHER message (which is not in
-		// the cache), but the second call's NEW appendEntry count
-		// must be <= the first call's count.
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400);
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(trimmableBody),
-				assistantMsg(trimmableBody),
-			],
-		};
-		// First context call: should produce at least one
-		// `context-trimmer-summarized` appendEntry. Capture the
-		// count after the first call.
-		await fireContextWithCtx(pi, event);
-		const firstCallAppends = pi.__getAppendEntries().filter((e) => e.customType === "context-trimmer-summarized");
-		assert.ok(firstCallAppends.length > 0, "first call must produce at least one summarized appendEntry");
-		const firstCallCount = firstCallAppends.length;
-		// Second context call: same conversation. Compute the
-		// delta — the number of NEW summarized appendEntries added
-		// by the second call.
-		await fireContextWithCtx(pi, event);
-		const secondCallTotal = pi.__getAppendEntries().filter((e) => e.customType === "context-trimmer-summarized").length;
-		const secondCallNewCount = secondCallTotal - firstCallCount;
-		assert.ok(
-			secondCallNewCount <= firstCallCount,
-			`the second context call's new summarized appendEntry count must be <= the first call's count (in-memory cache reduces work, never adds). first=${firstCallCount} second-delta=${secondCallNewCount}`,
-		);
-	});
-});
-
-describe("the trim is a view, not a mutation of the session messages (AC-8 d)", () => {
-	// The wiring returns a fresh `messages` array (the trimmed view)
-	// and never mutates the input array or any of its elements. The
-	// original input messages stay original; the trimmed view carries
-	// the summa envelope on the summarized messages. The test reads
-	// the returned messages, confirms the summa envelope is in the
-	// output, and confirms the input array is unchanged.
-
-	it("returns messages with summa envelopes in the output and leaves the input messages array unchanged", async () => {
-		const pi = await loadExtensionWithPersistence();
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400);
-		const inputMessages = [
-			userMsg("dispatch"),
-			assistantMsg(trimmableBody),
-			assistantMsg(trimmableBody),
-		];
-		// Snapshot the input before the call. The snapshot is a
-		// stringified clone — comparing against it after the call
-		// proves the input was not mutated (the wiring's view-only
-		// invariant).
-		const inputSnapshot = JSON.stringify(inputMessages);
-		const result = (await fireContextWithCtx(pi, { messages: inputMessages })) as { messages: Array<Record<string, unknown>> };
-		// The output carries a summa envelope on at least one
-		// message — the trim path ran.
-		const hasSumma = result.messages.some((m) => {
-			const c = m.content;
-			if (typeof c === "string") return c.includes("[summa:");
-			if (Array.isArray(c)) {
-				return c.some(
-					(b: unknown) =>
-						b &&
-						typeof b === "object" &&
-						(b as { type?: string }).type === "text" &&
-						typeof (b as { text?: unknown }).text === "string" &&
-						((b as { text: string }).text.startsWith("[summa:") || (b as { text: string }).text.includes("[summa:")),
-				);
-			}
-			return false;
-		});
-		assert.ok(hasSumma, "the output must carry a summa envelope on at least one message (proves the trim ran)");
-		// The input array is byte-for-byte unchanged.
-		assert.equal(JSON.stringify(inputMessages), inputSnapshot, "the input messages array must NOT be mutated by the context handler (view-only invariant)");
-		// Spot check: the assistant messages' content strings are
-		// the original pad-prefixed text, NOT the summa envelope.
-		for (const m of inputMessages) {
-			if (m.role === "assistant") {
-				const c = String(m.content);
-				assert.ok(!c.includes("[summa:"), "the input assistant message's content must not carry a summa envelope (the input is view-only)");
-			}
-		}
-	});
-});
-
-describe("session_start handler registers and fires (AC-8 e)", () => {
-	// The existing test at the top of the file asserts the
-	// `session_start` handler is REGISTERED on load. This describe
-	// block adds the next-layer assertion: the handler FIRES when
-	// invoked with an event and a ctx, and when the event's `reason`
-	// is "resume" (or "startup" / "reload") the handler consults
-	// `ctx.sessionManager.getEntries()`. The mock pi's `getEntries`
-	// is spied via a flag so the test can assert the wiring called
-	// it.
-
-	it("does not crash when fired with an event and a ctx (resume reason)", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// The handler accepts (event, ctx) and must not throw on a
-		// well-formed resume event with a sessionManager whose
-		// getEntries returns a valid array. The handler is
-		// fire-and-forget from the harness's point of view — the
-		// assertion is "the promise resolves (no throw, no
-		// unhandled rejection)," not on the return value.
-		pi.__setSessionEntries([]);
-		await assert.doesNotReject(
-			fireSessionStart(
-				pi,
-				{ type: "session_start", reason: "resume" },
-				{ sessionManager: pi.sessionManager },
-			),
-		);
-	});
-
-	it("calls ctx.sessionManager.getEntries() when reason is 'resume'", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// Wrap getEntries so we can count calls without changing
-		// the mock's public shape. The wrapper delegates to the
-		// real implementation and records the call.
-		let getEntriesCallCount = 0;
-		const realSessionManager = pi.sessionManager;
-		// The mock pi exposes `sessionManager` as the same object
-		// the wiring reads from. Replace its `getEntries` with a
-		// counting wrapper that still returns the configured
-		// entries array.
-		const configuredEntries: SessionEntry[] = [
-			{
-				type: "custom",
-				customType: "context-trimmer-summarized",
-				data: { fingerprint: "test-fingerprint" },
-			},
-		];
-		(realSessionManager as { getEntries: () => SessionEntry[] }).getEntries = () => {
-			getEntriesCallCount += 1;
-			return configuredEntries;
-		};
-		// Reconfigure the mock to track the entries the wrapper
-		// returns. The wiring's call to `sessionManager.getEntries()`
-		// returns the same array the wrapper is configured to
-		// return.
-		pi.__setSessionEntries(configuredEntries);
-		await fireSessionStart(
-			pi,
-			{ type: "session_start", reason: "resume" },
-			{ sessionManager: realSessionManager },
-		);
-		assert.ok(
-			getEntriesCallCount >= 1,
-			"ctx.sessionManager.getEntries() must be called when the session_start reason is 'resume'",
-		);
-	});
-
-	it("fires without crashing on non-resume reasons (new / fork) without requiring a sessionManager", async () => {
-		const pi = await loadExtensionWithPersistence();
-		// A "new" or "fork" reason has no prior session state; the
-		// wiring's re-hydrate path is gated on resume/startup/reload,
-		// so the handler must not touch ctx.sessionManager when the
-		// reason is "new". The handler still accepts (event, ctx)
-		// and must not crash.
-		await assert.doesNotReject(
-			fireSessionStart(
-				pi,
-				{ type: "session_start", reason: "new" },
-				{}, // no sessionManager — the handler must not consult it
-			),
-		);
-	});
-});
-
-
-// ─── Background-mode integration (asyncMode: true) ────────────────────
-//
-// The wiring exposes `PI_CONTEXT_TRIMMER_ASYNC_MODE` (and the
-// `asyncMode` config-file key) for the operator to opt OUT of the
-// default async behavior. The module-level `before` block above
-// forces `PI_CONTEXT_TRIMMER_ASYNC_MODE=0` so the existing tests
-// exercise the sync path. This describe block flips asyncMode ON
-// in a per-test beforeEach and restores the suite-level setting
-// in afterEach; the existing tests' sync assertions still hold.
-//
-// Background mode is the production default (DEFAULT_ASYNC_MODE =
-// true) but the existing tests assert the synchronous status
-// lifecycle (set/clear around the awaited trim). Background mode
-// changes the status lifecycle: the status is set at departure
-// (after the trim returns, when background promises are pending)
-// and cleared at re-enter (when the next context event applies
-// the resolved cache entry). The tests below exercise the
-// fire-once / apply-on-next-event interlock end-to-end against
-// the production wiring.
-
-describe("background-mode integration — asyncMode: true", () => {
-	let sAsyncMode: string | undefined;
-	beforeEach(() => {
-		sAsyncMode = process.env[CONFIG_ENV.asyncMode];
-		process.env[CONFIG_ENV.asyncMode] = "1";
-	});
-	afterEach(() => {
-		if (sAsyncMode === undefined) delete process.env[CONFIG_ENV.asyncMode];
-		else process.env[CONFIG_ENV.asyncMode] = sAsyncMode;
-	});
-
-	// Build a tier-2 fixture: two trimmable assistant messages of
-	// ~30k tokens each. Trimmable total ≈ 60k, which lands in the
-	// tier-2 (summarize) band when the 50k verbatim cap is in effect.
-	// In background mode the trim fires summarizer promises for the
-	// trimmable messages and returns immediately with the original
-	// content intact.
-	function buildTier2Event() {
-		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
-		const trimmableBody = longSentence.repeat(400); // ~115k chars, ~29k tokens per message
-		return {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(trimmableBody),
-				assistantMsg(trimmableBody),
-			],
-		};
-	}
-
-	it("the first context call returns messages WITHOUT summa envelopes (background mode defers rewriting)", async () => {
-		// The trim fires the production `defaultSummaSummarizer` (a
-		// Python summa subprocess) in the background. The returned
-		// messages carry the ORIGINAL assistant content — no
-		// `[summa: ~N tokens originally → ~M tokens summary]`
-		// envelope is rewritten into the array because background
-		// mode leaves content untouched. The background promise
-		// resolves later (asynchronously, outside the handler's
-		// await chain) and builds a cache entry.
-		const pi = await loadExtension();
-		const result = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
-		// The trimmable assistants are returned with their ORIGINAL
-		// string content (no envelope, no rewrite).
-		const assistants = result.messages.filter((m) => m.role === "assistant");
-		assert.ok(assistants.length >= 1, "at least one assistant survives the trim");
-		for (const a of assistants) {
-			if (typeof a.content === "string") {
-				// String content: original, no envelope.
-				assert.ok(
-					!a.content.startsWith("[summa:"),
-					"background mode leaves content untouched (no summa envelope on the string content)",
-				);
-			} else if (Array.isArray(a.content)) {
-				// Array content would only appear if the message was
-				// already-summarized; in the first call there is no
-				// cache to substitute, so no array content should
-				// appear in the output. Defensive check.
-				const hasEnvelope = a.content.some(
-					(b: unknown) => b && typeof b === "object" && (b as { type?: string }).type === "text" && typeof (b as { text?: string }).text === "string" && (b as { text: string }).text.startsWith("[summa:"),
-				);
-				assert.ok(!hasEnvelope, "background mode does not rewrite content in place (no envelope array)");
-			}
-		}
-	});
-
-	it("the second context call substitutes the cached summarized message before the trim runs (apply-on-next-event)", async () => {
-		// Fire the first context call (background mode fires the
-		// production `defaultSummaSummarizer` promise). Wait for
-		// the promise to resolve (the production summarizer uses
-		// `execFile` with a 5s timeout; for a long input it
-		// resolves in well under a second). Fire the second
-		// context call — the cache substitution applies the
-		// resolved summary (with the `[summa:` envelope in its
-		// content) into the trimmable message array before the
-		// trim runs. The behavioral proof: the second call's
-		// returned messages DO carry summa envelopes.
-		const pi = await loadExtension();
-		// First call: fires the background promise; returned
-		// messages have original content (no envelope).
-		const firstResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
-		// Sanity: the first call's output does NOT have envelopes.
-		const firstEnvelopes = firstResult.messages.filter(
-			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
-				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
-			),
-		);
-		assert.equal(firstEnvelopes.length, 0, "first call: no summa envelopes in the output (background mode defers rewriting)");
-		// Wait for the background promise to resolve and build the
-		// cache entry. The production summarizer shells out to
-		// Python summa; for a 30k-token input it typically
-		// resolves in well under a second, but we wait up to 3s
-		// to be safe across slow machines.
-		await new Promise((resolve) => setTimeout(resolve, 3_000));
-		// Second call: the cache substitution applies the
-		// resolved summary BEFORE the trim runs. The returned
-		// messages now carry summa envelopes on the trimmable
-		// messages.
-		const secondResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
-		const secondEnvelopes = secondResult.messages.filter(
-			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
-				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
-			),
-		);
-		assert.ok(
-			secondEnvelopes.length >= 1,
-			"second call: at least one trimmable message carries a summa envelope (cache substitution applied)",
-		);
-	});
-
-	it("fire-once consume: the third context call does NOT substitute the cache entry again (one-shot)", async () => {
-		// After the second call applies the cache, the cache
-		// entry is deleted (fire-once consume). The third call
-		// with the same input does not substitute the cache
-		// again — the message goes through the normal trim
-		// path. With the cache gone, the policy's
-		// `isAlreadySummarized` check (via the now-substituted
-		// summa envelope on the message) catches the already-
-		// summarized message in `result.messages` and skips it.
-		// The behavioral proof: a trimmable message that came
-		// in with a summa envelope (carried over from the
-		// second call's output via the persistent message
-		// stream) is NOT re-summarized on the third call.
-		const pi = await loadExtension();
-		// First call: fires the background promise.
-		await invokeContext(pi, buildTier2Event());
-		// Wait for the cache to fill.
-		await new Promise((resolve) => setTimeout(resolve, 3_000));
-		// Second call: cache substitution applies.
-		const secondResult = (await invokeContext(pi, buildTier2Event())) as { messages: Array<Record<string, unknown>> };
-		// The second call's output carries the substituted
-		// summa envelopes. In a real session, the third call's
-		// `event.messages` is the persisted message stream —
-		// which would carry those envelopes. For the test, we
-		// feed the second call's output back in as the third
-		// call's input (the "messages from a prior event" are
-		// the persisted stream with the substituted envelopes).
-		const persistedWithEnvelopes = {
-			messages: secondResult.messages,
-		};
-		// Third call: the cache is empty (consumed on the
-		// second call). The trimmable messages with summa
-		// envelopes enter the trim path; the policy's
-		// `isAlreadySummarized` check skips them. The
-		// returned messages still carry the envelopes (no
-		// re-summarization fired).
-		const thirdResult = (await invokeContext(pi, persistedWithEnvelopes)) as { messages: Array<Record<string, unknown>> };
-		const thirdEnvelopes = thirdResult.messages.filter(
-			(m) => m.role === "assistant" && Array.isArray(m.content) && (m.content as Array<{ type: string; text: string }>).some(
-				(b) => typeof b.text === "string" && b.text.startsWith("[summa:"),
-			),
-		);
-		assert.ok(
-			thirdEnvelopes.length >= 1,
-			"third call: at least one trimmable message still carries a summa envelope (no re-summarization, the skip clause caught it)",
-		);
-	});
-});
-
-// ─── AC-4 — reasoning-block cap end-to-end ────────────────────────────
-//
-// The wiring applies `applyReasoningBlockCap` in the context
-// handler before `applyThreeTierTrim` (the cap runs on `base`
-// before pinned injection). The three tests below cover the
-// end-to-end cap behavior through the production wiring:
-//
-//   (a) cap = 1: a stream with multiple thinking blocks → only
-//       the LAST thinking block survives into the three-tier
-//       trim. The post-cap mass reaches `applyThreeTierTrim`,
-//       so a session that would have landed in tier 2 with the
-//       full thinking-block mass might land in a different tier
-//       after the cap (the budget accounts for the post-cap mass).
-//   (b) No thinking blocks + any cap value: no-regression — the
-//       existing three-tier trim behaves identically. The cap pass
-//       is a no-op on a stream with no thinking blocks.
-//   (c) cap = -1 (the compile-time default): the full message
-//       stream reaches `applyThreeTierTrim` unchanged. No thinking
-//       block is dropped. The cap is a transparent passthrough.
-//       This case also covers the default-off posture: existing
-//       operators see no behavior change when upgrading because
-//       the compile-time default is passthrough.
-//
-// The cap is global (no `ctx.model` branching per the binding
-// decisions) and runs on every context event.
 
 describe("context handler — reasoning-block cap (AC-4)", () => {
 	let sReasoningBlockCap: string | undefined;
@@ -2566,19 +1423,19 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		// (i) Every thinking block is dropped (cap = 0).
 		assert.equal(countThinkingBlocksIn(result.messages), 0, "cap=0 drops every thinking block across the stream");
 		// (ii) The session lands in the verbatim tier (no
-		// summarize / drop) because the post-cap trimmable mass
+		// drop) because the post-cap trimmable mass
 		// is zero — the budget sees the post-cap mass, not the
 		// pre-cap mass. The result has 3 messages: pinned +
 		// dispatch + (the two assistant messages with empty
 		// content arrays, since the cap emptied them).
 		// The behavioral proof: a tier-2 session that would
-		// have summarized the 30k thinking-block content lands
+		// have dropped the 30k thinking-block content lands
 		// in tier 1 with cap=0 because the cap empties the
 		// content arrays before the budget is read.
-		const summaBlocks = result.messages
+		const verbatimBlocks = result.messages
 			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; text?: string }>) : []))
 			.filter((b) => typeof b.text === "string" && b.text.startsWith("[summa:"));
-		assert.equal(summaBlocks.length, 0, "no summa envelope — the session is in tier 1 (post-cap mass is zero, well under the 50k verbatim cap)");
+		assert.equal(verbatimBlocks.length, 0, "verbatim — the session is in tier 1 (post-cap mass is zero, well under the 50k verbatim cap)");
 	});
 });
 
@@ -2606,7 +1463,7 @@ describe("persistence seam — appendEntry records drop state", () => {
 		// Drop loop: remaining=120, t1=40. 120-40=80 >= 50.
 		// Drop t1. remaining=80. 80 <= 100. Break. droppedTurns=1.
 		// Surviving trimmable: 80k, under cap. No re-check.
-		// No summarization fires.
+		// No drop fires.
 		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
 		const trimmableBody40k = longSentence.repeat(550);
 		const trimmableBody80k = longSentence.repeat(1100);
@@ -2641,7 +1498,7 @@ describe("persistence seam — appendEntry records drop state", () => {
 		// Build a session that lands in tier 2 (trimmable total
 		// between 50k and 100k). Two trimmable assistant messages
 		// of ~30k tokens each = ~60k trimmable total. The policy
-		// enters the summarize path; no drop fires.
+		// enters tier 2 hold-untouched; no drop fires.
 		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
 		const trimmableBody = longSentence.repeat(400);
 		const event = {
@@ -2889,12 +1746,12 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 
 	// Cache-substituted intercom_message still carries customType and is subject to Rule 1.
 	it("cache-substituted intercom_message still carries customType and is subject to Rule 1", async () => {
-		// Pin a pre-existing summarized cache entry. The summary cache
+		// Pin a pre-existing cache entry. The cache
 		// substitutes `{ ...pending.originalMessage, content: ... }`
 		// at the wiring layer — the spread preserves `customType`,
-		// so a cached (already-summarized) `intercom_message` is
+		// so a cached `intercom_message` is
 		// still an `intercom_message` and is subject to Rule 1.
-		// The existing 'in-memory cache skips already-summarized
+		// The existing 'in-memory cache skips
 		// messages on the next context event' suite is the structural
 		// test for cache preservation; this test pins the pre-budget
 		// pass behavior on a cache-substituted entry.
@@ -2902,7 +1759,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		process.env[CONFIG_ENV.intercomKeepLast] = "0"; // drop ALL intercom_message entries.
 		const pi = await loadExtensionWithTools(["intercom"]);
 		// A single intercom_message + dispatch. The cache is empty
-		// (no prior background summary), so the input message is
+		// (no prior cache entry), so the input message is
 		// the one Rule 1 sees. The Rule 1 collapse drops it.
 		const event = {
 			messages: [
@@ -3028,7 +1885,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 // resolved once at handler entry with `Math.trunc` integer
 // coercion and reused at the `applyThreeTierTrim` call site AND
 // the two `approximateMessageTokens` call sites in the
-// background-promise `.then()` (the `[summa: ~N → ~M]` envelope
+// background-promise `.then()` (the cache
 // tag). The system-prompt term is subtracted from both tier caps
 // alongside the protected-slot mass so the effective budget
 // reserves space for it.
@@ -3108,38 +1965,33 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 			// token count is 0.
 		};
 		const result = (await invokeContextWithCtx(pi, event, ctxNoGetSystemPrompt)) as { messages: Array<Record<string, unknown>> };
-		// (i) The trimmable assistant was NOT summarized — tier 1
+		// (i) The trimmable assistant was NOT dropped — tier 1
 		// passthrough. The original string content is verbatim.
 		const assistant = result.messages.find((m) => m.role === "assistant");
 		assert.ok(assistant, "the assistant message must be in the output");
-		assert.equal(typeof assistant.content, "string", "verbatim passthrough leaves the assistant content as a string (not a summa envelope array)");
+		assert.equal(typeof assistant.content, "string", "verbatim passthrough leaves the assistant content as a string");
 		// The pad("a", 30_000) helper produces "a" + 119_999 spaces
 		// (30_000 tokens * 4 chars/token - 1 for the leading "a").
 		// The verbatim passthrough must keep the original character
-		// at the start ("a" followed by spaces), not the summa
-		// envelope ("[summa: ~N → ~M]\n…").
+		// at the start ("a" followed by spaces).
 		const text = assistant.content as string;
 		assert.ok(
 			text.startsWith("a") && /^\s/.test(text[1]),
-			"the original assistant content survives verbatim (leading 'a' followed by padding whitespace, not a summa envelope)",
-		);
-		assert.ok(
-			!text.startsWith("[summa:"),
-			"the assistant content is NOT a summa envelope — tier 1 passthrough held (no system-prompt term subtracted)",
+			"the original assistant content survives verbatim (leading 'a' followed by padding whitespace)",
 		);
 	});
 
 	// (b) present: `ctx.getSystemPrompt` returns a long string →
-	// the system-prompt token count is subtracted from the cap and
-	// the trim fires earlier.
-	it("(b) present: ctx.getSystemPrompt returns a long string → system-prompt term subtracted; trim fires earlier (tier 2 instead of tier 1)", async () => {
+	// the system-prompt token count is subtracted from the cap.
+	// Tier 2 holds middle-band
+	// messages untouched; the system-prompt term only affects
+	// the tier boundary, not the trim action.
+	it("(b) present: ctx.getSystemPrompt returns a long string → system-prompt term subtracted; tier 2 holds untouched", async () => {
 		const pi = await loadExtension();
 		// Same fixture as (a) but with a 30k system-prompt string.
 		// With the system-prompt term subtracted, the effective
 		// verbatim cap is 19_993 and the trimmable (30k) > 19_993
-		// → tier 2 fires. The summarizer stub returns "summary"
-		// (7 chars / 3 = 3 tokens); the trimmable is reduced to
-		// the envelope size, well under the cap.
+		// → tier 2 (hold-untouched). The messages are returned as-is.
 		const longSystemPrompt = "x".repeat(30_000 * 3); // 30k tokens at chars/3
 		const event = {
 			messages: [
@@ -3153,19 +2005,15 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 			getSystemPrompt: () => longSystemPrompt,
 		};
 		const result = (await invokeContextWithCtx(pi, event, ctxWithLongSystemPrompt)) as { messages: Array<Record<string, unknown>> };
-		// (i) The trimmable assistant WAS summarized — the
-		// system-prompt term shifted the effective cap from
-		// 49_993 (verbatim) to 19_993 (tier 2).
+		// (i) The trimmable assistant is held untouched (tier 2
+		// hold-untouched seam).
 		const assistant = result.messages.find((m) => m.role === "assistant");
 		assert.ok(assistant, "the assistant message must be in the output");
-		assert.ok(
-			Array.isArray(assistant.content),
-			"the assistant was summarized (content is a summa envelope array, not the original string)",
+		assert.equal(
+			typeof assistant.content,
+			"string",
+			"the assistant content is a string (verbatim string) — tier 2 hold-untouched",
 		);
-		const summaBlock = (assistant.content as Array<{ type: string; text: string }>).find(
-			(b) => b.type === "text" && b.text.startsWith("[summa:"),
-		);
-		assert.ok(summaBlock, "the assistant's summa envelope is present — the trim fired because the system-prompt term reduced the effective cap");
 		// (ii) The dispatch task survives.
 		const dispatch = result.messages.find(
 			(m) => m.role === "user" && m.content === "dispatch",
@@ -3174,8 +2022,8 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 	});
 
 	// (c) End-to-end AC-1 + AC-2: protected slots + system-prompt
-	// term + tier-2 trim, with both fixes composed.
-	it("(c) end-to-end AC-1 + AC-2: protected slots and system-prompt term both subtract from the cap; resulting trimmable mass is at or near the effective cap", async () => {
+	// term, with both fixes composed. Tier 2 holds untouched.
+	it("(c) end-to-end AC-1 + AC-2: protected slots and system-prompt term both subtract from the cap; tier 2 holds untouched", async () => {
 		// The wiring resolves `cfg.preservedPaths` at extension
 		// load time (the env is captured once and reused across
 		// every context event). The preserved-paths env var must
@@ -3192,7 +2040,7 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 		// Total protected mass: dispatch (~7) + 2 * pinned (2 * 167) + preserved (167) = ~508 tokens
 		// Total trimmable: ~66_667 tokens
 		// Effective verbatim cap: max(0, 50_000 − 5_000 − 508) = 44_492
-		// 66_667 > 44_492 → tier 2 fires.
+		// 66_667 > 44_492 → tier 2 (hold-untouched).
 		const event = {
 			messages: [
 				{ role: "custom", content: "p".repeat(500), customType: "context-trimmer-pinned" },
@@ -3209,17 +2057,15 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 			getSystemPrompt: () => "x".repeat(15_000),
 		};
 		const result = (await invokeContextWithCtx(pi, event, ctxWithSystemPrompt)) as { messages: Array<Record<string, unknown>> };
-		// (i) Tier 2 fired: the trimmable assistant was summarized.
+		// (i) Tier 2 hold-untouched: the trimmable assistant is
+		// returned as-is (tier 2 hold-untouched).
 		const assistant = result.messages.find((m) => m.role === "assistant");
 		assert.ok(assistant, "the assistant must be in the output");
-		assert.ok(
-			Array.isArray(assistant.content),
-			"the assistant was summarized (tier 2 fired — effective cap with protected mass + system-prompt term is below the 66k trimmable mass)",
+		assert.equal(
+			typeof assistant.content,
+			"string",
+			"the assistant content is a string (verbatim string) — tier 2 hold-untouched",
 		);
-		const summaBlock = (assistant.content as Array<{ type: string; text: string }>).find(
-			(b) => b.type === "text" && b.text.startsWith("[summa:"),
-		);
-		assert.ok(summaBlock, "the assistant's summa envelope is present — the trim fired because the system-prompt term reduced the effective cap");
 		// (ii) The protected pinned synthetics survive (the test
 		// adds 2 pinned synthetics, the wiring prepends the
 		// personality pinned synthetic from the before hook —
@@ -3244,43 +2090,6 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 			(m) => m.role === "user" && m.content === "dispatch",
 		);
 		assert.ok(dispatch, "the dispatch task must survive the trim");
-		// (v) The trim fired — the assistant's content is a summa
-		// envelope (an array of content blocks whose first text
-		// block starts with the `[summa: ~N → ~M]\n` prefix). The
-		// exact post-trim mass depends on the summa subprocess's
-		// behavior (real summa may return text close to the
-		// original size on certain inputs); the contract is that
-		// the trim fired, not that the post-trim mass is a
-		// specific number. The `Array.isArray` check on
-		// `assistant.content` (assertion (i) above) is the
-		// load-bearing assertion for this surface.
-		const trimmable = result.messages.filter(
-			(m) => m.role === "assistant" || (m.role === "toolResult" && !(m as { details?: { sourcePath?: string } }).details?.sourcePath),
-		);
-		let postTrimTrimmableChars = 0;
-		for (const m of trimmable) {
-			if (typeof m.content === "string") {
-				postTrimTrimmableChars += m.content.length;
-			} else if (Array.isArray(m.content)) {
-				for (const block of m.content) {
-					if (block && typeof block === "object" && (block as { text?: string }).text) {
-						postTrimTrimmableChars += (block as { text: string }).text.length;
-					}
-				}
-			}
-		}
-		// The post-trim trimmable mass is the summa envelope's
-		// text. The summa subprocess may return text close to
-		// the original size; the envelope prefix adds a few
-		// extra chars. The trim is load-bearing on the
-		// `Array.isArray(assistant.content)` assertion above;
-		// this assertion just confirms the post-trim content is
-		// a finite, non-negative number (no NaN / Infinity).
-		const postTrimTrimmableTokens = Math.ceil(postTrimTrimmableChars / 3);
-		assert.ok(
-			postTrimTrimmableTokens >= 0 && Number.isFinite(postTrimTrimmableTokens),
-			`post-trim trimmable mass ${postTrimTrimmableTokens} is a valid finite, non-negative number (no NaN / Infinity from the trim)`,
-		);
 		// Clean up the env var so other tests are unaffected.
 		delete process.env.PI_CONTEXT_TRIMMER_PRESERVED_PATHS;
 	});

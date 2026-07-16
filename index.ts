@@ -4,15 +4,15 @@
 // budget:
 //
 //   0–50k trimmable tokens  → verbatim, no action.
-//   50k–100k                → in-place summa-summarize the oldest
-//                              non-protected trimmable messages until
-//                              back under 50k.
+//   50k–100k                → hold middle-band messages untouched
+//                              (transient behavior; Tier 3 catches
+//                              oversize if it grows further).
 //   100k+                   → hard-drop the oldest whole turns
 //                              (user+assistant+tool+custom) until
 //                              back under 100k.
 //
 // Subagent protected inputs (subagent-only, excluded from the
-// 50k/100k budget, never summarized, never dropped):
+// 50k/100k budget, never dropped):
 //
 //   1. The agent def / pinned-tier synthetic. In this implementation
 //      the agent def travels as a `customType: "context-trimmer-pinned"`
@@ -50,10 +50,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, existsSync } from "node:fs";
-import { execFile } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { promisify } from "node:util";
 import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
@@ -69,7 +67,6 @@ import {
 	keepLatestSubagentToolResult,
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
-	messageFingerprint,
 	REASONING_BLOCK_CAP_DEFAULT,
 	SUMMARIZE_TIER_MAX_TOKENS,
 	shouldHardBlock,
@@ -243,82 +240,6 @@ function extractProtectedToolCallIds(
 	return out;
 }
 
-// ─── Default async summarizer (summa subprocess, non-blocking) ────────
-
-const execFileAsync = promisify(execFile);
-
-/** Diagnostic flag: did the last defaultSummaSummarizer call fail? */
-let lastSummarizerFailed = false;
-
-/**
- * Wraps an async summarizer function with a promise-chain
- * serialization gate that ensures only one invocation runs at a
- * time. When multiple calls arrive concurrently (the policy fires
- * them without await in background mode), each call waits for the
- * previous one to complete before starting its own work. The gate
- * is promise-based (not a blocking mutex), so the event loop stays
- * responsive.
- *
- * Exported for testability: the AC-5 concurrent-invocation
- * tracking test wraps a non-self-serializing tracking stub with
- * this wrapper to verify the "one in flight" invariant at the
- * policy layer.
- */
-export function serializeSummarizer<T extends (...args: any[]) => Promise<string>>(fn: T): T {
-	let gate: Promise<void> = Promise.resolve();
-	const wrapped = async (...args: any[]): Promise<string> => {
-		const prev = gate;
-		let release: () => void;
-		gate = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		await prev;
-		try {
-			return await fn(...args);
-		} finally {
-			release!();
-		}
-	};
-	return wrapped as T;
-}
-
-/**
- * The default production summarizer: shells out to Python `summa`
- * asynchronously via `execFile` (non-blocking — the event loop is
- * not stalled while summa runs). On error (summa missing, input too
- * short, timeout, etc.) returns the source text unchanged so the
- * trim path stays total-bounded; the diagnostic is exposed via the
- * `lastSummarizerFailed` export. Tests pass their own `summarizer`
- * and never hit this path.
- *
- * Serialization: the `execFileAsync` call is wrapped in the
- * `serializeSummarizer` gate, ensuring only one summa subprocess
- * runs at a time. The policy fires summarizer calls without await
- * (background mode); the serialization is the callback's
- * responsibility, not the policy's.
- */
-const defaultSummaSummarizer = serializeSummarizer(async (text: string, words: number): Promise<string> => {
-	if (!text || text.length < 200) return text;
-	const script =
-		"import sys\n" +
-		"from summa.summarizer import summarize\n" +
-		"text = sys.argv[1]\n" +
-		"n = int(sys.argv[2])\n" +
-		"out = summarize(text, language='english', words=n)\n" +
-		"sys.stdout.write(out or text)\n";
-	try {
-		const { stdout } = await execFileAsync("/usr/bin/python3", ["-c", script, text, String(words)], {
-			encoding: "utf-8",
-			timeout: 5_000,
-		});
-		lastSummarizerFailed = false;
-		return stdout || text;
-	} catch {
-		lastSummarizerFailed = true;
-		return text;
-	}
-});
-
 // ─── Extension entry point ─────────────────────────────────────────────
 
 /**
@@ -348,31 +269,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const pinnedTier = createPinnedTier({
 		personalityPath: cfg.personalityPath,
 	});
-
-	// Persisted summary-fingerprint cache. Scoped to this extension
-	// factory invocation (one per pi runtime). The cache mirrors the
-	// `customType: "context-trimmer-summarized"` entries persisted in
-	// the session — `pi.appendEntry` writes them after a successful
-	// summarize pass, and the `session_start` handler (resume /
-	// startup / reload) re-populates this set from
-	// `sessionManager.getEntries()`. The cache is the source of truth
-	// for the per-trim `alreadySummarizedHashes` option threaded into
-	// the pure policy layer; without it, the skip clause
-	// cannot fire across context events (pi-core's `emitContext`
-	// discards the trimmed view via `structuredClone` each call).
-	const summarizedFingerprints = new Set<string>();
-
-	// Background-summarizer cache: keyed by message fingerprint,
-	// stores the summarized `TrimmableMessage` (with the `[summa:`
-	// envelope in its content) produced by a background `summa`
-	// promise from a prior context event. On the next context event
-	// the wiring layer substitutes cached entries into the trimmable
-	// message array BEFORE the trim runs, so the skip check
-	// (`isAlreadySummarized`) sees the envelope and skips the
-	// already-summarized message. Fire-once: each substituted entry
-	// is deleted from the cache after substitution — a fingerprint
-	// never re-fires on a later context event.
-	const summaryCache = new Map<string, TrimmableMessage>();
 
 	// Subagent-context pin decision. Resolved once at load — the
 	// inputs (the `PI_SUBAGENT_CHILD` env var + the resolved
@@ -477,31 +373,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (event, ctx) => {
 		pinnedTier.refresh();
-		// Re-hydrate the persisted summary-fingerprint cache on
-		// resume / startup / reload. The session file already
-		// carries the `customType: "context-trimmer-summarized"`
-		// entries; this read pulls them into the in-memory set so
-		// the next context event's trim pass can skip those
-		// messages. "new" and "fork" create a fresh session with
-		// no prior summary state — the cache stays empty.
-		if (event?.reason === "resume" || event?.reason === "startup" || event?.reason === "reload") {
-			try {
-				const sessionManager = ctx?.sessionManager;
-				if (sessionManager && typeof sessionManager.getEntries === "function") {
-					const entries = sessionManager.getEntries();
-					for (const entry of entries) {
-						if (entry && entry.type === "custom" && entry.customType === "context-trimmer-summarized") {
-							const data = entry.data;
-							if (data && typeof data === "object" && "fingerprint" in data && typeof (data as { fingerprint: unknown }).fingerprint === "string") {
-								summarizedFingerprints.add((data as { fingerprint: string }).fingerprint);
-							}
-						}
-					}
-				}
-			} catch {
-				// Best-effort: degrade to no skip on read failure
-			}
-		}
 	});
 
 	pi.on("turn_end", async () => {
@@ -606,33 +477,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				customType: typeof m.customType === "string" ? m.customType : undefined,
 			};
 		});
-		// Cache substitution: replace messages whose fingerprint is in
-		// the background-summary cache with the summarized version.
-		// This runs BEFORE the trim so the skip check
-		// (`isAlreadySummarized`) sees the `[summa:` envelope and
-		// skips the already-summarized message. Fire-once: each
-		// substituted cache entry is deleted after substitution — a
-		// fingerprint never re-fires on a later context event.
-		//
-		// Status lifecycle coupling: when the cache applies (i.e. a
-		// background summary from a prior context event has resolved
-		// in the meantime), the status that was set at departure on
-		// the prior handler invocation is cleared at re-enter here.
-		// The status is set before the prior handler returned; the
-		// cache fulfillment and the status clear are two halves of
-		// the same span.
-		let cacheApplied = false;
-		for (let i = 0; i < base.length; i++) {
-			const fp = messageFingerprint(base[i]);
-			if (summaryCache.has(fp)) {
-				base[i] = summaryCache.get(fp)!;
-				summaryCache.delete(fp);
-				cacheApplied = true;
-			}
-		}
-		if (cacheApplied && ctx?.hasUI) {
-			ctx.ui.setStatus("context-trimmer", undefined);
-		}
 		// When a trimmable message's source path matches a preserved
 		// pattern, stamp it with the `PRESERVED_CUSTOM_TYPE` so the
 		// existing `protectedCustomTypes` channel protects it. The
@@ -661,11 +505,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		//   (a) the additive-OR `isProtectedSlot` branch for the
 		//       matching `toolResult` messages (kept by association,
 		//       excluded from the budget, never dropped/summarized),
-		//   (b) the block-level carve-out in `dropOldestTurns` and
-		//       `summarizeOldestUntilUnder` (the protected
-		//       `toolCall` block survives inside the rewritten
+		//   (b) the block-level carve-out in `dropOldestTurns` (the protected
+		//       `toolCall` block survives inside the dropped
 		//       assistant message; `text`/`thinking` and unprotected
-		//       `toolCall` blocks are dropped/summarized).
+		//       `toolCall` blocks are dropped).
 		// Computed BEFORE the pre-budget collapse passes and the
 		// reasoning-block cap so the set reflects the assistant
 		// messages as the model emitted them (the cap / pre-budget
@@ -741,23 +584,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// with `~/` expanded at the wiring layer to the operator's
 		// home directory (the pure predicate receives the expanded
 		// pattern; it never reads `os.homedir()` itself).
-		// Coerce `summaWords` to an integer at the wiring layer. The
-		// downstream Python `summa` subprocess parses its `words` argv
-		// via `int(sys.argv[2])`, which raises ValueError on a float
-		// (e.g. `60.5` from a config-file value with a trailing
-		// `.0` or a deliberately fractional cap). `isPositiveNumber`
-		// accepts floats (it's a Number.isFinite check), so the
-		// resolver can hand a float through the env>JSON>default
-		// precedence — the policy guards the integer contract, not
-		// the resolver. `Math.trunc` is the integer-coercion
-		// primitive: it preserves a deliberate `60.0` as `60` (the
-		// rejected Option A — silently dropping the value via a
-		// stricter `isPositiveInteger` predicate — would have lost
-		// the operator's setting), strips a deliberate `60.5` to
-		// `60`, and returns `NaN` for non-finite inputs. When
-		// `cfg.summaWords` is `undefined` (the default path), the
-		// `?? DEFAULT` fallback in `applyThreeTierTrim` still wins.
-		const summaWordsInt = cfg.summaWords !== undefined ? Math.trunc(cfg.summaWords) : undefined;
 		// Drop-floor: a percentage of the effective summarize cap,
 		// resolved to a token count at the wiring layer (the policy
 		// receives the resolved numeric `dropFloorTokens`, not the
@@ -772,116 +598,22 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// to the policy unchanged in shape. Per AC-3 the compile-time
 		// default is `undefined` (off; recency protection is operator
 		// opt-in), so the policy's `recencyFloor <= 0 || undefined`
-		// guard treats the default as a no-op. `Math.trunc` matches
-		// the existing `summaWords` integer-coercion primitive.
+		// guard treats the default as a no-op.
 		const recencyFloorTokens = cfg.recencyFloor !== undefined ? Math.trunc(cfg.recencyFloor) : undefined;
-		// Status lifecycle. The status spans the synchronous summa
-		// work, OR the background-departure-to-background-resolved
-		// span. The two halves are not concurrent: sync mode never
-		// fires the background path; background mode never sets the
-		// sync span. The `ctx?.hasUI` guard skips UI calls in
-		// non-TUI modes (rpc, json, print) and in test mocks that
-		// pass `{}` as ctx (where `hasUI` is `undefined`, falsy).
-		//
-		// Sync mode: set before the trim (covers the awaited
-		// `defaultSummaSummarizer` calls inside the policy), clear
-		// after the trim returns. The clear runs in the same tick
-		// so the visible "Summarizing…" span tracks the actual work.
-		//
-		// Background mode: set AFTER the trim returns — the
-		// background promises have already been fired by the time
-		// the policy returns, and the trim itself did not block
-		// waiting for them. The status is cleared at re-enter
-		// (above, in the cache-substitution step) when the next
-		// context event applies the resolved cache entry.
-		const backgroundMode = cfg.asyncMode === true;
-		if (!backgroundMode && ctx?.hasUI) {
-			ctx.ui.setStatus("context-trimmer", "Summarizing…");
-		}
 		const result = await applyThreeTierTrim(withPinned, {
-			summarizer: defaultSummaSummarizer,
-			backgroundSummarize: backgroundMode,
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
-			summaWords: summaWordsInt,
 			dropFloorTokens,
 			recencyFloor: recencyFloorTokens,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
-			alreadySummarizedHashes: summarizedFingerprints,
 			protectedToolCallIds,
 			tokenEstimatorDivisor,
 			systemPromptTokens,
 		});
-		if (!backgroundMode && ctx?.hasUI) {
-			ctx.ui.setStatus("context-trimmer", undefined);
-		}
-		// Background-promise handling. When the policy fires
-		// summarizer promises in the background (backgroundMode
-		// true), each pending promise will resolve to the summary
-		// text. Attach a `.then()` to each so the resolved summary
-		// builds a cache entry (a `TrimmableMessage` with the
-		// `[summa: ~N tokens originally → ~M tokens summary]` envelope
-		// in its content) keyed by the ORIGINAL message's
-		// fingerprint. The next context event's cache-substitution
-		// step will find the entry and substitute the summarized
-		// version into the trimmable message array, where the
-		// policy's `isAlreadySummarized` skip check sees the
-		// envelope and skips the message. The `.catch()` is
-		// best-effort: a rejected promise yields no cache entry,
-		// and the original message is re-evaluated on the next
-		// context event.
-		if (result.pendingSummaries && result.pendingSummaries.length > 0) {
-			for (const pending of result.pendingSummaries) {
-				pending.promise
-					.then((summaryText) => {
-						const originalTokens = approximateMessageTokens(pending.originalMessage, tokenEstimatorDivisor);
-						const summaryTokens = approximateMessageTokens({ ...pending.originalMessage, content: summaryText }, tokenEstimatorDivisor);
-						const tag = `[summa: ~${originalTokens} tokens originally → ~${summaryTokens} tokens summary]`;
-						const summarized: TrimmableMessage = {
-							...pending.originalMessage,
-							content: [{ type: "text", text: `${tag}\n${summaryText}` }],
-						};
-						summaryCache.set(pending.fingerprint, summarized);
-					})
-					.catch(() => {
-						// Best-effort: no cache entry on rejection;
-						// the message will be re-evaluated on the
-						// next context event.
-					});
-			}
-		}
 		// Persist the fingerprints of messages summarized in this
 		// pass. The pure policy emits `summarizedFingerprints` as
-		// the ORIGINAL-message fingerprints (computed before the
-		// content was rewritten with the summa envelope) so the
-		// persisted key matches the fingerprint the policy will
-		// recompute on the next context event. `pi.appendEntry`
-		// writes a separate `customType: "context-trimmer-summarized"`
-		// entry — it does NOT mutate the session message stream.
-		// The trim is a view, not a mutation; the persisted
-		// messages stay original. The try/catch degrades silently
-		// when `pi.appendEntry` is unavailable (tests, minimal
-		// mocks); the in-memory set still updates so the same-
-		// process skip still works.
-		if (result.summarizedFingerprints.length > 0) {
-			const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
-			if (typeof appendEntry === "function") {
-				for (const fingerprint of result.summarizedFingerprints) {
-					summarizedFingerprints.add(fingerprint);
-					try {
-						appendEntry("context-trimmer-summarized", { fingerprint });
-					} catch {
-						// Best-effort: degrade silently
-					}
-				}
-			} else {
-				for (const fingerprint of result.summarizedFingerprints) {
-					summarizedFingerprints.add(fingerprint);
-				}
-			}
-		}
 		// Persisted drop marker: when the tier-3 drop path fired
 		// (any non-zero `droppedTurns`), write a
 		// `context-trimmer-dropped` entry carrying the count and a
@@ -909,16 +641,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
 		// signature → the run resets on the next invocation).
 		const out: TrimmableMessage[] = applyLoopGuard(result.messages);
-		// Background-mode status: set at departure when there are
-		// pending summaries (so the user sees a "Summarizing…" hint
-		// while the background subprocess runs), clear at re-enter
-		// when the cache substitution applies on the next context
-		// event. The set happens AFTER the trim returns because the
-		// background promises have already been fired by then and
-		// the trim itself is not blocking on them.
-		if (backgroundMode && result.backgroundPending && ctx?.hasUI) {
-			ctx.ui.setStatus("context-trimmer", "Summarizing…");
-		}
 		// Cast back to the session message shape and return. The
 		// pinned message rides out at the top (when injected); the rest
 		// are the trimmed trimmable messages. The double-cast mirrors the
@@ -1001,4 +723,4 @@ function safeGetAllTools(pi: ExtensionAPI): Array<{ name?: string }> {
 }
 
 // Export config helpers for tests / introspection.
-export { ENV as CONFIG_ENV, DEFAULT_CONFIG_PATH, CONFIG_PATH_ENV, defaultSummaSummarizer, lastSummarizerFailed };
+export { ENV as CONFIG_ENV, DEFAULT_CONFIG_PATH, CONFIG_PATH_ENV };

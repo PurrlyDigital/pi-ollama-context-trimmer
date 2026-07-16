@@ -11,10 +11,10 @@ Every time the LLM is about to be called, the extension inspects the message str
 | Tier | Range | Action |
 |------|-------|--------|
 | Verbatim | 0–50k trimmable tokens | No action; the full message stream is sent. |
-| Summarize | 50k–100k | The oldest non-protected trimmable messages are rewritten in place with a Python `summa` summary, tagged `[summa: ~N tokens originally → ~M tokens summary]`, until the total is back under 50k. |
-| Drop | 100k+ | The oldest whole trimmable turns (assistant + toolResult + custom between two user messages) are hard-dropped until the total is back under 100k. If a single oversized trimmable turn remains, it is summarized as a fallback. |
+| Hold | 50k–100k | Middle-band messages are held untouched (transient behavior; Tier 3 catches oversize if it grows further). |
+| Drop | 100k+ | The oldest whole trimmable turns (assistant + toolResult + custom between two user messages) are hard-dropped until the total is back under 100k. |
 
-Subagent protected inputs are **never** counted in the budget, **never** summarized, **never** dropped:
+Subagent protected inputs are **never** counted in the budget, **never** dropped:
 
 1. **The agent def / pinned-tier synthetic** — travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option. This protection applies whenever the pinned synthetic is injected (i.e. when at least one pinned surface is configured).
 2. **The dispatch instructions** — the first user message (identified by `userTurnAge === 0`). The trim policy subtracts its tokens from the cap total so a session whose only over-budget contributor is the dispatch does not trigger a trim. **This protection only applies when the `pi-subagents` extension is installed** — the dispatch concept only exists in a subagent session, so a plain parent session leaves the first user prompt treated as ordinary trimmable content. Detection is automatic (see Config); default is ON when pi-subagents is present.
@@ -25,13 +25,6 @@ The extension also injects a **pinned-tier message** on every LLM call: the agen
 
 - **Node.js 20+** (for the extension runtime; tests need 22+ for the test runner)
 - **Pi coding agent** installed (`pi --version` should print a version)
-- **Python 3 + summa** for the summarize tier. `summa` is a Python package; it is **not** an npm dependency and is not bundled.
-
-  ```bash
-  pip install summa
-  ```
-
-  The extension shells out to `/usr/bin/python3` and imports `from summa.summarizer import summarize`. If summa is missing, the summarize path falls back to the source text (the trim path stays total-bounded and never throws).
 
 ## Installation
 
@@ -50,12 +43,12 @@ The extension is global — once installed, every Pi session (parent and subagen
 ## How the protected inputs are wired
 
 - The agent def travels as a **synthetic `custom` message** (`customType: "context-trimmer-pinned"`) prepended to the per-LLM-call view. The trim policy's `protectedCustomTypes` option matches that customType and excludes the synthetic from the budget.
-- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from summary and drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
+- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
 - A session that contains ONLY the dispatch + the pinned synthetic + a single short trimmable message (e.g. a freshly dispatched subagent) never enters the trim path: the trimmable mass is under 50k, so the messages are returned verbatim.
 
 ## Loop guard
 
-Defense-in-depth alongside the trim. The trim bounds **context size** (drop / summarize over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
+Defense-in-depth alongside the trim. The trim bounds **context size** (drop / hold-untouched over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
 
 The guard is **ON by default for every session** (every session posture — parent and subagent). The previous subagent-only `"auto"` posture was dropped because behavioral-loop detection is the same concern whether the model is in a parent or a subagent session. Operators opt out with `"loopGuard": false` in the config file, or `PI_CONTEXT_TRIMMER_LOOP_GUARD=0` in the environment. The previous `"auto"` value is no longer accepted — it is treated as absent and the resolver falls through to the default `true`.
 
@@ -96,7 +89,7 @@ Reasoning blocks are content blocks of shape `{ type: "thinking"; thinking: stri
 
 ## Pre-budget collapse
 
-Three transcript-entry categories accumulate outside the three-tier budget: `intercom_message` custom entries (full subagent output delivered via the intercom channel), `subagent-notify` custom entries (status notifications), and `toolResult` entries from the `subagent` tool (full subagent dispatch echoes). The trimmer collapses them on a separate, extension-gated pre-budget pass that runs **before** the three-tier budget computation, so the downstream protected-slot, recency-slice, path-stamp, reasoning-cap, loop-guard, and fingerprint/summary-cache paths see the already-collapsed stream.
+Three transcript-entry categories accumulate outside the three-tier budget: `intercom_message` custom entries (full subagent output delivered via the intercom channel), `subagent-notify` custom entries (status notifications), and `toolResult` entries from the `subagent` tool (full subagent dispatch echoes). The trimmer collapses them on a separate, extension-gated pre-budget pass that runs **before** the three-tier budget computation, so the downstream protected-slot, recency-slice, path-stamp, reasoning-cap, and loop-guard paths see the already-collapsed stream.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
@@ -114,7 +107,6 @@ The trim policy's three tier caps live as compile-time constants in `policy.ts` 
 |----------|---------|---------|
 | `VERBATIM_TIER_MAX_TOKENS` | `50_000` | Trimmable totals at or below this are returned verbatim. |
 | `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this fall into the drop tier. |
-| `SUMMA_WORDS` | `60` | Word budget for each summa in-place summary. |
 
 The pinned tier exposes one constant in `pinned-tier.ts`:
 
@@ -138,7 +130,6 @@ Create `~/.pi/agent/context-trimmer.json`:
   "preservedPaths": ["AGENTS.md", "~/secrets/keys.md"],             // falls back to no paths preserved
   "tier1MaxTokens": 50000,                                          // falls back to VERBATIM_TIER_MAX_TOKENS
   "tier2MaxTokens": 100000,                                         // falls back to SUMMARIZE_TIER_MAX_TOKENS
-  "summaWords": 60,                                                 // falls back to SUMMA_WORDS
   "loopGuard": true,                                                // true (default) | false
   "loopGuardThreshold": 3,                                          // falls back to 3 (consecutive identical tool-call turns)
   "loopGuardHardBlock": 10,                                         // falls back to off; positive int enables hard-block
@@ -148,9 +139,9 @@ Create `~/.pi/agent/context-trimmer.json`:
 }
 ```
 
-All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. `loopGuard` accepts `true` (default — ON for every session) or `false` to opt out; the previous `"auto"` sentinel is no longer accepted (a `"auto"` value in the file is treated as absent and the resolver falls through to the default `true`). The three tier-threshold fields (`tier1MaxTokens`, `tier2MaxTokens`, `summaWords`) follow the same env-over-file-over-default precedence the other fields already document, with the compile-time constants in `policy.ts` as the final default. Each threshold value must be a positive finite number — non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent (the resolver falls back to the other channel / defaults), matching the existing "badly-typed values are treated as absent" rule. `reasoningBlockCap` is an integer in `[-1, ∞)`: `-1` is the passthrough sentinel (the default — every block survives), `0` means "send no reasoning blocks", and any positive integer is the count of blocks to keep from the latest. Non-integer, less than `-1`, `NaN`, and `Infinity` are all treated as absent; the resolver falls through to the env / default layer (`-1`). `intercomKeepLast` is the count-based knob for the Rule 1 pre-budget collapse: integer in `[-1, ∞)`, same validation rules as `reasoningBlockCap`. The default is `-1` (passthrough — every `intercom_message` entry survives). The Rule 1 pass is gated on the `intercom` tool being registered; without the gating extension, the rule is inert regardless of the knob's value. `subagentNotifyKeepLast` is the count-based knob for the Rule 2b pre-budget collapse (recency hardtrim for `subagent-notify` custom entries): integer in `[-1, ∞)`, same validation rules as `intercomKeepLast`. The default is the resolved `intercomKeepLast` value (env > JSON > `DEFAULT_INTERCOM_KEEP_LAST` = `-1` passthrough) — when `subagentNotifyKeepLast` is unset in both channels, the effective value equals the resolved `intercomKeepLast`. The Rule 2b pass is gated on the `intercom` tool being registered (same gate as Rules 1 and 2); without the gating extension, the rule is inert regardless of the knob's value. The pass runs after `dedupSubagentNotify` (dedup first, then recency trim on the deduped stream). The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent.
+All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when `pi-subagents` is installed), or `true` / `false` to force. `loopGuard` accepts `true` (default — ON for every session) or `false` to opt out; the previous `"auto"` sentinel is no longer accepted (a `"auto"` value in the file is treated as absent and the resolver falls through to the default `true`). The two tier-threshold fields (`tier1MaxTokens`, `tier2MaxTokens`) follow the same env-over-file-over-default precedence the other fields already document, with the compile-time constants in `policy.ts` as the final default. Each threshold value must be a positive finite number — non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent (the resolver falls back to the other channel / defaults), matching the existing "badly-typed values are treated as absent" rule. `reasoningBlockCap` is an integer in `[-1, ∞)`: `-1` is the passthrough sentinel (the default — every block survives), `0` means "send no reasoning blocks", and any positive integer is the count of blocks to keep from the latest. Non-integer, less than `-1`, `NaN`, and `Infinity` are all treated as absent; the resolver falls through to the env / default layer (`-1`). `intercomKeepLast` is the count-based knob for the Rule 1 pre-budget collapse: integer in `[-1, ∞)`, same validation rules as `reasoningBlockCap`. The default is `-1` (passthrough — every `intercom_message` entry survives). The Rule 1 pass is gated on the `intercom` tool being registered; without the gating extension, the rule is inert regardless of the knob's value. `subagentNotifyKeepLast` is the count-based knob for the Rule 2b pre-budget collapse (recency hardtrim for `subagent-notify` custom entries): integer in `[-1, ∞)`, same validation rules as `intercomKeepLast`. The default is the resolved `intercomKeepLast` value (env > JSON > `DEFAULT_INTERCOM_KEEP_LAST` = `-1` passthrough) — when `subagentNotifyKeepLast` is unset in both channels, the effective value equals the resolved `intercomKeepLast`. The Rule 2b pass is gated on the `intercom` tool being registered (same gate as Rules 1 and 2); without the gating extension, the rule is inert regardless of the knob's value. The pass runs after `dedupSubagentNotify` (dedup first, then recency trim on the deduped stream). The file is read once at extension load; restart pi to pick up an edit. Unknown keys are ignored; badly-typed values are treated as absent.
 
-`preservedPaths` is an optional list of patterns whose matching tool-result messages are protected from summary and drop and whose tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match — it matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match; the `~/` form is expanded to your home directory (e.g. `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`). When `preservedPaths` is unset, no paths are preserved; when set, the patterns above are protected from the trim budget.
+`preservedPaths` is an optional list of patterns whose matching tool-result messages are protected from drop and whose tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match — it matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match; the `~/` form is expanded to your home directory (e.g. `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`). When `preservedPaths` is unset, no paths are preserved; when set, the patterns above are protected from the trim budget.
 
 ### Environment variables (override the file)
 
@@ -158,10 +149,9 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 |---------|--------|
 | `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` | Absolute path to a personality/voice file pinned verbatim on every LLM call. Unset/empty → falls back to the file, then no personality section. |
 | `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` | `1` forces dispatch protection ON, `0` forces OFF. Unset/other → falls back to the file, then `"auto"`. |
-| `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` | Comma-separated list of path patterns whose matching tool-result messages are protected from summary and drop. Bare filenames are fuzzy matches (e.g. `AGENTS.md` matches any AGENTS.md); patterns beginning with `/` or `~/` are absolute matches (e.g. `~/secrets/keys.md` matches that one file). Unset/empty → falls back to the file, then no paths preserved. |
+| `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` | Comma-separated list of path patterns whose matching tool-result messages are protected from drop. Bare filenames are fuzzy matches (e.g. `AGENTS.md` matches any AGENTS.md); patterns beginning with `/` or `~/` are absolute matches (e.g. `~/secrets/keys.md` matches that one file). Unset/empty → falls back to the file, then no paths preserved. |
 | `PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS` | Positive finite number; the verbatim-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `VERBATIM_TIER_MAX_TOKENS` (`50_000`). |
 | `PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS` | Positive finite number; the summarize-tier cap (tokens). Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMARIZE_TIER_MAX_TOKENS` (`100_000`). |
-| `PI_CONTEXT_TRIMMER_SUMMA_WORDS` | Positive finite number; the per-summary word cap passed to summa. Unset/empty/non-numeric/zero/negative → falls back to the file, then `SUMMA_WORDS` (`60`). |
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD` | `1` forces the loop guard ON, `0` forces OFF. Unset/other (including the previous `"auto"` sentinel) → falls back to the file, then the default `true` (ON for every session, independent of `pi-subagents` presence). |
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD` | Positive integer; the soft-nudge threshold (consecutive identical tool-call turns before the wiring layer injects a nudge). Unset/empty/non-numeric/zero/negative → falls back to the file, then `3`. |
 | `PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK` | Positive integer; the hard-block threshold (consecutive identical tool-call turns before the wiring layer strips the tool calls and forces a text-only continuation). Unset → falls back to the file, then off. Values below the soft-nudge threshold are clamped up to the soft-nudge threshold so the hard-block cannot fire before the soft-nudge. |
@@ -170,9 +160,7 @@ All fields are optional. `protectDispatch` accepts `"auto"` (default — ON when
 | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` | Integer in `[-1, ∞)`. The count of `subagent-notify` custom entries (counted from the latest) to keep per message stream. `-1` is the passthrough (every entry survives), `0` sends none, any positive integer is the count. The pass is gated on the `intercom` tool being registered (same gate as Rules 1 and 2); without the gating extension, the rule is inert regardless of the knob. The pass runs after `dedupSubagentNotify` (dedup first, then recency trim on the deduped stream). Unset/empty/non-integer/less than `-1`/non-numeric → falls back to the file, then the resolved `intercomKeepLast` value (env > JSON > `DEFAULT_INTERCOM_KEEP_LAST` = `-1` passthrough). |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
-When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The three trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
-
-The summarize callback can be overridden per-call by passing a `summarizer` option to `applyThreeTierTrim` (this is the test seam — production wires `defaultSummaSummarizer`, which is a Python `summa` subprocess). The `defaultSummaSummarizer` exports a diagnostic flag `lastSummarizerFailed` (let-binding) that flips to `true` if the subprocess errors; consumers can read it after a trim call to surface a warning to the user.
+When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely (the wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing). The two trim-policy thresholds follow the same env-over-file-over-default precedence as every other field — the compile-time constants in `policy.ts` are the final fallback when neither channel sets a value, so the pre-existing behaviour is preserved for operators who configure nothing.
 
 ## How the token count is computed
 
@@ -182,14 +170,14 @@ The trimmable total is the sum of per-message tokens **minus** the protected-slo
 
 ## Development
 
-Run the test suite (441 tests, ~1s on a modern laptop):
+Run the test suite (316 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
 npm test
 ```
 
-The test runner is `tsx --test` (NOT `node --test` on `.ts` — native type-stripping without `"type": "module"` thrashes the CPU). Tests use a deterministic in-process `summarizer` stub; the integration test in `integration.test.ts` exercises the production default summa subprocess on a small corpus.
+The test runner is `tsx --test` (NOT `node --test` on `.ts` — native type-stripping without `"type": "module"` thrashes the CPU). Tests use deterministic in-process stubs.
 
 Project structure:
 
