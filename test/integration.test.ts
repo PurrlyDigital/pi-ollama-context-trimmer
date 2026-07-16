@@ -502,7 +502,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 			? preserved.content
 			: JSON.stringify(preserved.content);
 		assert.ok(preservedText.includes("preserved content — AGENTS.md body"), "preserved content must be verbatim (verbatim preserved)");
-		assert.ok(!preservedText.includes("[summa:"), "preserved content must be verbatim (no summa envelope)");
+		assert.ok(!preservedText.includes("[summa:"), "preserved content must be verbatim");
 	});
 
 	it("preserves a shell-`cat`-shaped tool result whose `details.sourcePath` matches a fuzzy pattern (verbatim tier)", async () => {
