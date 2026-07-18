@@ -398,6 +398,20 @@ function notifyMsg(label: string, sessionValue: string): TrimmableMessage {
 	};
 }
 
+/**
+ * Build a production-shaped subagent-notify fixture with NO `details`
+ * key, matching the wire shape from `sendCompletion` in pi-subagents.
+ * The content header follows the format
+ * `"{taskKind} {status}: **{agent}**{taskInfo?}"`.
+ */
+function notifyNoDetails(agent: string): TrimmableMessage {
+	return {
+		role: "custom",
+		customType: "subagent-notify",
+		content: `Background task completed: **${agent}**`,
+	} as TrimmableMessage;
+}
+
 /** Build an intercom_message fixture. */
 function intercomMsg(label: string): TrimmableMessage {
 	return {
@@ -693,6 +707,36 @@ describe("dedupSubagentNotify", () => {
 		const snapshot = JSON.stringify(messages);
 		dedupSubagentNotify(messages);
 		assert.equal(JSON.stringify(messages), snapshot, "input messages array must not be mutated");
+	});
+
+	it("purity: dedupSubagentNotify source has no process.*, node:fs, node:os, or other I/O", async () => {
+		const src = dedupSubagentNotify.toString();
+		assert.ok(!src.includes("process."), "dedupSubagentNotify must not reference process.*");
+		assert.ok(!src.includes("node:fs"), "dedupSubagentNotify must not import node:fs");
+		assert.ok(!src.includes("node:os"), "dedupSubagentNotify must not import node:os");
+		assert.ok(!src.includes("fetch("), "dedupSubagentNotify must not perform network I/O");
+		assert.ok(!src.includes("readFile"), "dedupSubagentNotify must not perform filesystem I/O");
+	});
+});
+
+describe("dedupSubagentNotify — production-shaped (no-details) records", () => {
+	it("duplicate pair of no-details records: dedup drops the second (content-header identity)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyNoDetails("test-agent"),
+			notifyNoDetails("test-agent"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 1, "duplicate no-details pair is collapsed to one");
+		assert.equal(out[0].content, "Background task completed: **test-agent**");
+	});
+
+	it("different content-header agents: each entry is a distinct run (no dedup)", async () => {
+		const messages: TrimmableMessage[] = [
+			notifyNoDetails("agent-alpha"),
+			notifyNoDetails("agent-beta"),
+		];
+		const out = dedupSubagentNotify(messages);
+		assert.equal(out.length, 2, "different agents in content header → both survive");
 	});
 
 	it("purity: dedupSubagentNotify source has no process.*, node:fs, node:os, or other I/O", async () => {
