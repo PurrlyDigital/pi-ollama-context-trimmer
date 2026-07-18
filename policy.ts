@@ -1330,34 +1330,66 @@ export function applySubagentNotifyKeepLast(
 /**
  * Run-identity key for `subagent-notify` entries. The stable
  * identifier that distinguishes one delivery from a redelivery of
- * the same run is the entry's `details.sessionValue` when present
- * (the per-run-stable session file / share URL), falling back to a
- * fingerprint of the `details` payload (agent / status / resultPreview /
- * taskInfo) when `sessionValue` is absent. Entries with no usable
- * `details` payload fall back to the entry's stream index — the
- * dedup is then a no-op for that entry (every occurrence is treated
- * as a distinct run).
+ * the same run.
+ *
+ * Priority chain (first match wins):
+ *   1. `details.sessionValue` — fast-path override when the producer
+ *      attaches a per-run-stable session file / share URL.
+ *   2. `details` fingerprint — deterministic hash of the `details`
+ *      payload (agent / status / resultPreview / taskInfo), for
+ *      callers that attach `details` without `sessionValue`.
+ *   3. Content-header parse — extracts the agent name from the
+ *      formatted content header (the `**agent**` segment), matching
+ *      the production wire shape from `sendCompletion` which carries
+ *      no `details` field.
+ *   4. `__idx__:<index>` — last-resort fallback; every entry is
+ *      treated as a distinct run (dedup is a no-op for that entry).
  */
 function subagentNotifyRunId(msg: TrimmableMessage, index: number): string {
 	const details = msg.details as Record<string, unknown> | undefined;
-	if (!details || typeof details !== "object") return `__idx__:${index}`;
-	const sessionValue = details.sessionValue;
-	if (typeof sessionValue === "string" && sessionValue.length > 0) {
-		return `sessionValue:${sessionValue}`;
-	}
-	const fpParts: string[] = [];
-	const fields = ["agent", "status", "resultPreview", "taskInfo"] as const;
-	for (const f of fields) {
-		const v = details[f];
-		if (v === undefined || v === null) continue;
-		try {
-			fpParts.push(`${f}=${JSON.stringify(v)}`);
-		} catch {
-			fpParts.push(`${f}=<unserializable>`);
+	if (details && typeof details === "object") {
+		const sessionValue = details.sessionValue;
+		if (typeof sessionValue === "string" && sessionValue.length > 0) {
+			return `sessionValue:${sessionValue}`;
+		}
+		const fpParts: string[] = [];
+		const fields = ["agent", "status", "resultPreview", "taskInfo"] as const;
+		for (const f of fields) {
+			const v = details[f];
+			if (v === undefined || v === null) continue;
+			try {
+				fpParts.push(`${f}=${JSON.stringify(v)}`);
+			} catch {
+				fpParts.push(`${f}=<unserializable>`);
+			}
+		}
+		if (fpParts.length > 0) {
+			return `fingerprint:${fpParts.join("|")}`;
 		}
 	}
-	if (fpParts.length === 0) return `__idx__:${index}`;
-	return `fingerprint:${fpParts.join("|")}`;
+	// Content-header parse: extract the agent name from the formatted
+	// content header (the `**agent**` segment). This matches the
+	// production wire shape from `sendCompletion` which carries no
+	// `details` field. The content format is:
+	//   "{taskKind} {status}: **{agent}**{taskInfo?}"
+	// e.g. "Background task completed: **test-agent**"
+	const contentAgent = extractContentAgent(msg.content as string | undefined);
+	if (contentAgent !== null) {
+		return `content:${contentAgent}`;
+	}
+	return `__idx__:${index}`;
+}
+
+/**
+ * Extract the agent name from a `subagent-notify` content header.
+ * The content format is `"{taskKind} {status}: **{agent}**{taskInfo?}"`.
+ * Returns the agent name (text between the first pair of `**` markers)
+ * or `null` when no `**...**` segment is found.
+ */
+function extractContentAgent(content: string | undefined): string | null {
+	if (typeof content !== "string") return null;
+	const match = content.match(/\*\*([^*]+)\*\*/);
+	return match ? match[1].trim() : null;
 }
 
 /**
@@ -1368,12 +1400,16 @@ function subagentNotifyRunId(msg: TrimmableMessage, index: number): string {
  * Non-`subagent-notify` entries are preserved untouched. No knob —
  * duplicates are always noise.
  *
- * Run identity: `details.sessionValue` (the per-run-stable session
- * file / share URL) when present, else a deterministic fingerprint
- * of `details` (`agent` + `status` + `resultPreview` + `taskInfo`).
- * Entries with neither signal fall back to their stream index and
- * are not deduped against other entries (each is treated as a
- * distinct run).
+ * Run identity priority chain:
+ *   1. `details.sessionValue` — fast-path override when the producer
+ *      attaches a per-run-stable session file / share URL.
+ *   2. `details` fingerprint — deterministic hash of the `details`
+ *      payload (`agent` + `status` + `resultPreview` + `taskInfo`).
+ *   3. Content-header parse — extracts the agent name from the
+ *      formatted content header (the `**agent**` segment), matching
+ *      the production wire shape from `sendCompletion`.
+ *   4. `__idx__:<index>` — last-resort fallback; each entry is
+ *      treated as a distinct run (dedup is a no-op for that entry).
  */
 export function dedupSubagentNotify(messages: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
 	const total = messages.length;
