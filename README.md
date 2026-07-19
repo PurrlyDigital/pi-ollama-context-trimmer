@@ -156,17 +156,28 @@ The default is passthrough. Set the env var or JSON key to `0` to send none. Set
 
 ## Pre-budget collapse
 
-Three transcript-entry categories accumulate outside the three-tier budget: `intercom_message` custom entries (full subagent output delivered via the intercom channel), `subagent-notify` custom entries (status notifications), and `toolResult` entries from the `subagent` tool (full subagent dispatch echoes). The trimmer collapses them on a separate, extension-gated pre-budget pass that runs **before** the three-tier budget computation, so the downstream protected-slot, recency-slice, path-stamp, reasoning-cap, and loop-guard paths see the already-collapsed stream.
+Three transcript-entry categories accumulate outside the three-tier budget.
+
+The first category is `intercom_message` custom entries. These are full subagent outputs delivered via the intercom channel.
+
+The second category is `subagent-notify` custom entries. These are status notifications.
+
+The third category is `toolResult` entries from the `subagent` tool. These are full subagent dispatch echoes.
+
+The trimmer collapses them on a separate pass. The pass is extension-gated. The pass runs before the three-tier budget computation. The downstream paths then see the already-collapsed stream.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
-| 1 | `intercom_message` (`role: "custom"`, `customType: "intercom_message"`) | `intercom` tool registered (pi-intercom) | Recency hardtrim — keep the last N by stream order, drop the rest. Integer semantics: `-1` = keep all (passthrough — default), `0` = keep none, positive N = keep last N. |
-| 2 | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Dedup — keep the first occurrence of each run identity in stream order; drop subsequent duplicates. No operator knob; duplicates are always noise. Run identity priority: `details.sessionValue` → `details` fingerprint → content-header agent name → stream index. |
-| 3 | `toolResult:subagent` (`role: "toolResult"`, `toolName: "subagent"`) | `subagent` tool registered (pi-subagents) | Latest-only — drop every such entry except the last by stream order. No operator knob. |
+| 1 | `intercom_message` (`role: "custom"`, `customType: "intercom_message"`) | `intercom` tool registered (pi-intercom) | Recency hardtrim. Keep the last N by stream order. Drop the rest. Integer semantics: `-1` keeps all (passthrough, default). `0` keeps none. A positive N keeps the last N. |
+| 2 | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Dedup. Keep the first occurrence of each run identity in stream order. Drop subsequent duplicates. There is no operator knob. Duplicates are always noise. Run identity priority: `details.sessionValue`, then `details` fingerprint, then content-header agent name, then stream index. |
+| 2b | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Recency hardtrim. Keep the last N by stream order. Drop the rest. Integer semantics: `-1` keeps all (passthrough). `0` keeps none. A positive N keeps the last N. When unset, the effective value defaults to the resolved `intercomKeepLast`. The pass runs after `dedupSubagentNotify`: dedup first, then recency trim on the deduped stream. |
+| 3 | `toolResult:subagent` (`role: "toolResult"`, `toolName: "subagent"`) | `subagent` tool registered (pi-subagents) | Latest-only. Drop every such entry except the last by stream order. There is no operator knob. |
 
-> **Surface split:** Chain and parallel completions emit on **both** `subagent-notify` (display notification, governed by `subagentNotifyKeepLast`) and, when an intercom target is set, `intercom_message` (grouped result, governed by `intercomKeepLast`). The two knobs compose independently — see the `subagentNotifyKeepLast` defaulting paragraph below and the env-var rows for `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` / `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST`.
+> **Surface split.** Chain and parallel completions emit on both `subagent-notify` and, when an intercom target is set, `intercom_message`. The `subagent-notify` surface is a display notification governed by `subagentNotifyKeepLast`. The `intercom_message` surface is a grouped result governed by `intercomKeepLast`. The two knobs compose independently. See the `subagentNotifyKeepLast` defaulting paragraph below for the env-var and JSON-key rows.
 
-Each pass is skipped entirely (no array allocation, no scan) when its gating extension is not present. The pinned synthetic is never at risk — it is injected AFTER the pre-budget window, matching the existing `applyReasoningBlockCap` invariant. A session without the gating extension sees no behavior change on any of the three rules.
+Each pass is skipped entirely when its gating extension is not present. Skipped means no array allocation and no scan. A session without the gating extension sees no behavior change on any of the rules.
+
+The pre-budget collapse runs before the reasoning-block cap. The pre-budget collapse runs before pinned injection. The pre-budget collapse runs before the three-tier trim. The pinned synthetic is never at risk. It is injected after the pre-budget window, matching the existing `applyReasoningBlockCap` invariant.
 
 ## Config
 
