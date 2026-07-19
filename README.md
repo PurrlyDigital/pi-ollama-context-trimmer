@@ -16,7 +16,7 @@ Ollama bills per request and GPU time. The extension is built for that model.
 
 ## What it does
 
-Every time the LLM is about to be called, the extension inspects the message stream and applies a three-tier trim:
+On every LLM call, the extension inspects the message stream. It applies a three-tier trim.
 
 | Tier | Range | Action |
 |------|-------|--------|
@@ -26,10 +26,15 @@ Every time the LLM is about to be called, the extension inspects the message str
 
 Subagent protected inputs are **never** counted in the budget, **never** dropped:
 
-1. **The agent def / pinned-tier synthetic** — travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option. This protection applies whenever the pinned synthetic is injected (i.e. when at least one pinned surface is configured).
-2. **The dispatch instructions** — the first user message (identified by `userTurnAge === 0`). The trim policy subtracts its tokens from the cap total so a session whose only over-budget contributor is the dispatch does not trigger a trim. **This protection only applies when the `pi-subagents` extension is installed** — the dispatch concept only exists in a subagent session, so a plain parent session leaves the first user prompt treated as ordinary trimmable content. Detection is automatic (see Config); default is ON when pi-subagents is present.
+**The agent def / pinned-tier synthetic** travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it via the `protectedCustomTypes` option. This protection applies whenever the pinned synthetic is injected.
 
-The extension also injects a **pinned-tier message** on every LLM call: the agent's `personality.md` content (when configured). The injection is reconstructed on every `context` event from the file system; it is not persisted in the session file. **The pinned surface is optional and opt-in** — the extension ships no default path, and when personality is not configured the pinned-tier injection is skipped entirely (no empty placeholder is prepended). See Config below.
+**The dispatch instructions** are the first user message, stamped with `userTurnAge === 0`. The trim policy subtracts its tokens from the cap total. This protection only applies when the `pi-subagents` extension is installed. Without pi-subagents, the first user prompt is ordinary trimmable content. Detection is automatic (see Config). The default is ON when pi-subagents is present.
+
+The extension also injects a **pinned-tier message** on every LLM call. The injection is the agent's `personality.md` content (when configured).
+
+The injection is reconstructed on every `context` event from the file system. It is not persisted in the session file.
+
+**The pinned surface is optional and opt-in.** The extension ships no default path. When personality is not configured, the pinned-tier injection is skipped entirely. No empty placeholder is prepended. See Config below.
 
 ## Prerequisites
 
