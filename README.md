@@ -65,27 +65,65 @@ The extension is global. Once installed, every Pi session (parent and subagent) 
 
 ## Loop guard
 
-Defense-in-depth alongside the trim. The trim bounds **context size** (drop / hold-untouched over-budget trimmable mass); the loop guard bounds **behavioral repetition** — a model re-emitting the same tool calls regardless of context. Where the trim reacts to token mass, the loop guard reacts to consecutive identical assistant tool-call turns: at the configured threshold the wiring layer injects a soft nudge, and at the configured hard-block threshold (when set) it strips the offending tool calls and forces a text-only continuation.
+The loop guard is defense-in-depth alongside the trim. The two mechanisms guard different failure modes.
 
-The guard is **ON by default for every session** (every session posture — parent and subagent). The previous subagent-only `"auto"` posture was dropped because behavioral-loop detection is the same concern whether the model is in a parent or a subagent session. Operators opt out with `"loopGuard": false` in the config file, or `PI_CONTEXT_TRIMMER_LOOP_GUARD=0` in the environment. The previous `"auto"` value is no longer accepted — it is treated as absent and the resolver falls through to the default `true`.
+The trim bounds **context size**. It drops or holds over-budget trimmable mass.
+
+The loop guard bounds **behavioral repetition**. A model can re-emit the same tool calls regardless of context size.
+
+The trim reacts to token mass. The loop guard reacts to consecutive identical assistant tool-call turns. At the configured threshold the guard injects a soft nudge. At the configured hard-block threshold the guard strips the offending tool calls. It then forces a text-only continuation.
+
+The guard is **ON by default for every session**. The default covers every session posture. Parent sessions are covered. Subagent sessions are covered.
+
+The previous subagent-only `"auto"` posture was dropped. Behavioral-loop detection is the same concern in either posture. It does not need a subagent-only path.
+
+Operators opt out with `"loopGuard": false` in the config file. Operators can also opt out with `PI_CONTEXT_TRIMMER_LOOP_GUARD=0` in the environment.
+
+The previous `"auto"` value is no longer accepted. A resolver sees `"auto"` and treats it as absent. The resolver then falls through to the default `true`.
 
 ### How it detects
 
-Each assistant turn's `toolCall` content blocks are fingerprinted as `(toolName, deterministically-sorted-keys args)`. Object key order in the arguments is normalized away (it is an artifact of model serialization, not of the call's identity); array element order is preserved (it is part of the call's identity). A turn's fingerprint is the sorted conjunction of every `toolCall` block's individual fingerprint; a multi-tool-call turn matches the run signature iff every one of its calls matches.
+Each assistant turn's `toolCall` content blocks are fingerprinted. The fingerprint shape is `(toolName, deterministically-sorted-keys args)`.
 
-A run is the trailing sequence of consecutive assistant turns whose fingerprints are identical. A **no-tool-call** (reasoning-only) assistant turn yields a distinct fingerprint (a `__no_tool_calls__` signature) so the run resets naturally — the model thinking without re-calling a tool is not a behavioral loop. The guard is therefore scoped to **behavioral** loops, not **reasoning-only** loops.
+Object key order in the arguments is normalized away. It is an artifact of model serialization. It is not part of the call's identity.
 
-A **flat input-token co-signal** is computed over the last few assistant turns' input-token counts: when every sample is within a small tolerance of the smallest sample, the signal is "flat." Flat input tokens indicate the model is not progressing on new material; the co-signal is informational and is used to strengthen the nudge text when present (the model receives a single additional sentence noting the flat count).
+Array element order is preserved. It is part of the call's identity.
+
+A turn's fingerprint is the sorted conjunction of every `toolCall` block's individual fingerprint. A multi-tool-call turn matches the run signature when every one of its calls matches.
+
+A run is the trailing sequence of consecutive assistant turns. Each turn in the run has an identical fingerprint.
+
+A **no-tool-call** (reasoning-only) assistant turn yields a distinct fingerprint. The fingerprint carries the `__no_tool_calls__` signature. The distinct fingerprint resets the run naturally.
+
+The model thinking without re-calling a tool is not a behavioral loop. The guard is therefore scoped to **behavioral** loops. Reasoning-only loops are out of scope.
+
+A **flat input-token co-signal** is also computed. The signal covers the last few assistant turns' input-token counts. The signal is "flat" when every sample is within a small tolerance of the smallest.
+
+Flat input tokens indicate the model is not progressing on new material. The co-signal is informational. It is used to strengthen the nudge text when present. The model receives one additional sentence noting the flat count.
 
 ### How it intervenes
 
-When the run length crosses the configured threshold (default 3), the wiring layer prepends a `role: "user"` synthetic to the LLM-bound view, naming the repetition and pointing the model at the results already in context. The injection rides the same channel as the pinned-tier synthetic and the tier-3 prune reminder. The nudge is non-directive — it is a status note, not a command.
+When the run length crosses the configured threshold, the wiring layer acts. The default threshold is 3.
 
-When a **hard-block** threshold is configured (default: off) AND the run length meets or exceeds it, the wiring layer additionally strips the last assistant turn's `toolCall` blocks from the message stream (preserving any textual / thinking content of the same turn) and prepends a `role: "user"` block-notice synthetic. The hard-block path is a strict superset of the soft-nudge path — when both fire, only the block text is emitted, and the model must proceed via text (the tool calls are gone). Re-injection is idempotent: stripping the tool calls breaks the fingerprint on the next turn, so the run resets and the guard goes quiet until the model re-establishes it.
+The wiring layer prepends a `role: "user"` synthetic to the LLM-bound view. The synthetic names the repetition. It points the model at the results already in context.
+
+The injection rides the same channel as the pinned-tier synthetic. It also rides the same channel as the tier-3 prune reminder.
+
+The nudge is non-directive. It is a status note. It is not a command.
+
+When a **hard-block** threshold is configured, the wiring layer can also take a stronger action. The default is off. When the run length meets or exceeds the hard-block threshold, the stronger path runs.
+
+The hard-block path strips the last assistant turn's `toolCall` blocks from the message stream. The strip preserves any textual content of the same turn. The strip also preserves any thinking content of the same turn.
+
+The hard-block path prepends a `role: "user"` block-notice synthetic. The synthetic replaces the soft-nudge synthetic when both fire.
+
+The hard-block path is a strict superset of the soft-nudge path. When both fire, only the block text is emitted. The model must then proceed via text because the tool calls are gone.
+
+Re-injection is idempotent. Stripping the tool calls breaks the fingerprint on the next turn. The run then resets. The guard goes quiet. The guard stays quiet until the model re-establishes the run.
 
 ### Scope boundary
 
-The guard detects **behavioral** loops via tool-call signatures. **Reasoning-only** loops (the model re-reasoning without a tool call) are out of scope — a no-tool-call turn yields a distinct fingerprint and resets the run naturally, no special case required.
+The guard detects **behavioral** loops via tool-call signatures. **Reasoning-only** loops are out of scope. A no-tool-call turn yields a distinct fingerprint. The distinct fingerprint resets the run naturally. No special case is required.
 
 ## Reasoning block cap
 
