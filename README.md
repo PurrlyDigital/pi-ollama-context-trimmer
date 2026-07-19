@@ -57,9 +57,11 @@ The extension is global. Once installed, every Pi session (parent and subagent) 
 
 ## How the protected inputs are wired
 
-- The agent def travels as a **synthetic `custom` message** (`customType: "context-trimmer-pinned"`) prepended to the per-LLM-call view. The trim policy's `protectedCustomTypes` option matches that customType and excludes the synthetic from the budget.
-- The dispatch task is the **first user message** in the stream. The wiring layer stamps `userTurnAge === 0` on it; the trim policy's `isProtectedSlot` predicate reads that stamp and exempts the message from drop. The dispatch's tokens are also subtracted from the cap total. **This only happens when dispatch protection is enabled** — which defaults to ON when the `pi-subagents` extension is installed (override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`, see Config). In a plain parent session with no subagent tool, the first user prompt is treated as ordinary trimmable content.
-- A session that contains ONLY the dispatch + the pinned synthetic + a single short trimmable message (e.g. a freshly dispatched subagent) never enters the trim path: the trimmable mass is under 50k, so the messages are returned verbatim.
+- **The agent def** travels as a synthetic `custom` message prepended to the per-LLM-call view carrying `customType: "context-trimmer-pinned"`. The trim policy's `protectedCustomTypes` option matches that customType. The match excludes the message from the trim budget. The injection is rebuilt on every `context` event from the file system. The synthetic, never persisted in the session file, is protected on every injection regardless of other settings.
+
+- **The dispatch task** is the first user message in the stream, stamped with `userTurnAge === 0`. The trim policy's `isProtectedSlot` predicate reads the stamp, exempting the message from drop. Its tokens are subtracted from the cap total. The protection is ON by default when the `pi-subagents` extension is installed (detection is automatic, see Config). The operator can override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`. In a plain parent session, the first user prompt is ordinary trimmable content.
+
+- **A freshly-dispatched subagent's session** holds the dispatch, the pinned synthetic, and a single short trimmable message. The trimmable mass is under 50k. The trim path is skipped, returning the messages verbatim.
 
 ## Loop guard
 
