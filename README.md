@@ -127,20 +127,32 @@ The guard detects **behavioral** loops via tool-call signatures. **Reasoning-onl
 
 ## Reasoning block cap
 
-Some reasoning-capable models surface a `type:"thinking"` content block on assistant messages — the model's intermediate "chain of thought" that the provider may or may not bill or pass through. The cap is a count-based gate on those blocks: keep the LAST N reasoning blocks (counted from the latest) and drop the rest before the three-tier trim runs.
+Reasoning-capable models surface a `type:"thinking"` content block on assistant messages. The block is the model's intermediate chain of thought.
 
-The cap is a count of blocks, not a measurement of tokens. The trim budget accounts for the post-cap mass, so dropping reasoning blocks at the cap shrinks the budget the three-tier trim needs to satisfy.
+The provider may or may not bill for these blocks. The provider may or may not pass them through.
+
+The cap is a count-based gate on those blocks. It keeps the LAST N reasoning blocks, counted from the latest. It drops the rest.
+
+The cap runs before the three-tier trim. Dropped reasoning blocks are never seen by the trim.
+
+The cap is a count of blocks. The cap is not a measurement of tokens.
+
+The trim budget accounts for the post-cap mass. Dropping reasoning blocks shrinks the budget the three-tier trim needs to satisfy.
 
 | Cap value | Effect |
 |-----------|--------|
-| `-1` (default) | Passthrough — keep every reasoning block. The default is passthrough so existing operators see no behavior change when upgrading; opt in to a cap by setting the env var or JSON key. |
+| `-1` (default) | Passthrough. Keep every reasoning block. The default is passthrough. The default ensures no behavior change on upgrade. Existing operators see no change. Opt in by setting the env var or JSON key. |
 | `0` | Send no reasoning blocks. |
-| `1` | Keep only the last reasoning block; drop all earlier ones. |
+| `1` | Keep only the last reasoning block. Drop all earlier ones. |
 | any positive integer | Keep the last N reasoning blocks. |
 
-The cap runs unconditionally on every context event (no per-model branching). The wiring layer applies the cap to the `base` message stream before pinned injection, so the pinned synthetic is never at risk of being dropped.
+The cap runs unconditionally. It runs on every context event. There is no per-model branching.
 
-Reasoning blocks are content blocks of shape `{ type: "thinking"; thinking: string }` on assistant messages. The default is passthrough; set the env var or JSON key to `0` (send none) or a positive integer to opt in to a cap.
+The wiring layer applies the cap to the `base` message stream. The cap runs before pinned injection. The pinned synthetic is never at risk of being dropped.
+
+Reasoning blocks are content blocks of shape `{ type: "thinking"; thinking: string }` on assistant messages.
+
+The default is passthrough. Set the env var or JSON key to `0` to send none. Set the env var or JSON key to a positive integer to keep the last N. The env var is `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP`. The JSON key is `reasoningBlockCap`.
 
 ## Pre-budget collapse
 
