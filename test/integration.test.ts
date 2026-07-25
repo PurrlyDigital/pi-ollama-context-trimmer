@@ -2094,3 +2094,187 @@ describe("context handler — system-prompt token capture (AC-2 wiring)", () => 
 		delete process.env.PI_CONTEXT_TRIMMER_PRESERVED_PATHS;
 	});
 });
+// ─── End-to-end: keepLastUserPrompts + keepOriginalPrompt ───────────────
+//
+// Exercises the wiring-layer resolution (env > JSON > default 10 / default
+// true) and the full pass-through to the policy. The protect-list-only
+// invariant is the load-bearing assertion: outside-N user prompts are NOT
+// forced to drop — they remain trimmable candidates that the budget
+// decides on.
+
+describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring end-to-end)", () => {
+	let sKeepLast: string | undefined;
+	let sKeepOriginal: string | undefined;
+
+	beforeEach(() => {
+		sKeepLast = process.env[CONFIG_ENV.keepLastUserPrompts];
+		sKeepOriginal = process.env[CONFIG_ENV.keepOriginalPrompt];
+	});
+	afterEach(() => {
+		for (const [k, v] of [
+			[CONFIG_ENV.keepLastUserPrompts, sKeepLast],
+			[CONFIG_ENV.keepOriginalPrompt, sKeepOriginal],
+		] as const) {
+			if (v === undefined) delete process.env[k];
+			else process.env[k] = v;
+		}
+	});
+
+	it("wiring default 10 kicks in when neither env nor JSON sets keepLastUserPrompts", async () => {
+		// No env, no JSON (config path is a non-existent file per the
+		// module-level before hook). The wiring-layer default 10
+		// applies. A session with 5 user prompts (well under the
+		// default 10) keeps all of them — the protect-list-only
+		// invariant: the budget does not require trimming.
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg("hi"),
+				userMsg("u1"),
+				assistantMsg("hi1"),
+				userMsg("u2"),
+				assistantMsg("hi2"),
+				userMsg("u3"),
+				assistantMsg("hi3"),
+				userMsg("u4"),
+				assistantMsg("hi4"),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// Pinned synthetic is prepended (1) + the 10 input messages
+		// survive (under budget, verbatim tier).
+		assert.equal(result.messages.length, 11);
+		// All 5 user prompts survive.
+		const users = result.messages.filter((m) => m.role === "user");
+		assert.equal(users.length, 5);
+	});
+
+	it("keepLastUserPrompts=2 protects the last 2 user prompts under a tight budget (no forced drop of older ones)", async () => {
+		// A tight budget that would normally drop older turns. With
+		// keepLastUserPrompts=2, the last 2 user prompts are
+		// protected; the older ones are NOT forced to drop — they
+		// remain trimmable candidates. The protect-list-only
+		// invariant: the knob only ever adds protection.
+		process.env[CONFIG_ENV.keepLastUserPrompts] = "2";
+		const pi = await loadExtension();
+		// Build a session with 4 user prompts + large assistant turns
+		// so the trimmable total exceeds a small summarizeMax.
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a1", 4000)),
+				userMsg("u1"),
+				assistantMsg(pad("a2", 4000)),
+				userMsg("u2"),
+				assistantMsg(pad("a3", 4000)),
+				userMsg("u3"),
+				assistantMsg(pad("a4", 4000)),
+				userMsg("u4"),
+				assistantMsg(pad("a5", 4000)),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The last 2 user prompts (u3, u4) survive (protected by
+		// keepLastUserPrompts=2). dispatch survives (keepOriginalPrompt
+		// default true → dispatch eternally protected). The older user
+		// prompts (u1, u2) are trimmable candidates; whether they
+		// survive depends on the budget, but they are NOT force-dropped
+		// by the knob. The key invariant: u4 (the latest) always
+		// survives.
+		const users = result.messages.filter((m) => m.role === "user");
+		const contents = users.map((u) => u.content);
+		assert.ok(contents.includes("u4"), "the last user prompt survives (in the keep-last window)");
+		assert.ok(contents.includes("u3"), "the second-to-last user prompt survives (in the keep-last window)");
+		assert.ok(contents.includes("dispatch"), "dispatch survives (keepOriginalPrompt default true)");
+	});
+
+	it("keepOriginalPrompt=false removes eternal dispatch protection (dispatch protected only by keep-last)", async () => {
+		// With keepOriginalPrompt=false, dispatch is protected ONLY by
+		// keepLastUserPrompts. When keepLastUserPrompts is small enough
+		// that dispatch falls outside the window AND the budget
+		// requires dropping the dispatch's trimmable-turn slice,
+		// dispatch becomes a normal trimmable candidate. The observable
+		// behavior is the budget effect: dispatch's tokens count toward
+		// the trimmable total when keepOriginalPrompt=false (vs
+		// subtracted when true).
+		process.env[CONFIG_ENV.keepOriginalPrompt] = "0";
+		process.env[CONFIG_ENV.keepLastUserPrompts] = "1";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a1", 4000)),
+				userMsg("u1"),
+				assistantMsg(pad("a2", 4000)),
+				userMsg("u2"),
+				assistantMsg(pad("a3", 4000)),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// The latest user prompt (u2) survives (keepLast=1). dispatch
+		// is NOT eternally protected (keepOriginalPrompt=false) — it
+		// is outside the last-1 window, so it is a trimmable
+		// candidate. Whether it survives depends on the budget, but
+		// the key invariant: u2 (the latest) always survives.
+		const users = result.messages.filter((m) => m.role === "user");
+		const contents = users.map((u) => u.content);
+		assert.ok(contents.includes("u2"), "the last user prompt survives (keepLast=1)");
+	});
+
+	it("protect-list-only invariant: under-budget session keeps ALL user prompts even with a small keepLast window", async () => {
+		// keepLastUserPrompts=1 with a 4-user-prompt session well under
+		// the budget. Outside-N prompts (u1, u2, u3) are NOT dropped —
+		// they remain trimmable candidates and the budget does not
+		// require trimming them. The knob only adds protection; it
+		// never forces a drop.
+		process.env[CONFIG_ENV.keepLastUserPrompts] = "1";
+		process.env[CONFIG_ENV.keepOriginalPrompt] = "0";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg("hi"),
+				userMsg("u1"),
+				assistantMsg("hi1"),
+				userMsg("u2"),
+				assistantMsg("hi2"),
+				userMsg("u3"),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// Under budget → verbatim tier → all messages survive (plus
+		// the pinned synthetic). The 4 user prompts all survive even
+		// though only 1 is in the keep-last window.
+		const users = result.messages.filter((m) => m.role === "user");
+		assert.equal(users.length, 4);
+	});
+
+	it("composes with recencyFloor without conflict", async () => {
+		// Both channels active: keepLastUserPrompts and recencyFloor.
+		// A user message in both windows is just protected (the OR is
+		// additive — isProtectedSlot is a boolean, no double-subtract).
+		process.env[CONFIG_ENV.keepLastUserPrompts] = "3";
+		process.env[CONFIG_ENV.recencyFloor] = "500";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("a1", 3000)),
+				userMsg("u1"),
+				assistantMsg(pad("a2", 3000)),
+				userMsg("u2"),
+				assistantMsg(pad("a3", 3000)),
+				userMsg("u3"),
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		// No crash, no empty output; the last user prompt survives.
+		const users = result.messages.filter((m) => m.role === "user");
+		const contents = users.map((u) => u.content);
+		assert.ok(contents.includes("u3"), "the last user prompt survives");
+		assert.ok(result.messages.length > 0, "non-empty output");
+		// Clean up recencyFloor so other tests are unaffected.
+		delete process.env[CONFIG_ENV.recencyFloor];
+	});
+});

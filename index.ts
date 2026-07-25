@@ -600,6 +600,19 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// opt-in), so the policy's `recencyFloor <= 0 || undefined`
 		// guard treats the default as a no-op.
 		const recencyFloorTokens = cfg.recencyFloor !== undefined ? Math.trunc(cfg.recencyFloor) : undefined;
+		// Keep-last-user-prompts: integer-coerced count passed through
+		// to the policy. Per AC-4 the wiring-layer default is `10` (the
+		// operator-facing default the ticket title commits to) when
+		// neither env nor JSON sets a value; the config.ts field stays
+		// `undefined` so the config-resolver test surface is honest about
+		// the unset-channel path.
+		const keepLastUserPrompts =
+			cfg.keepLastUserPrompts !== undefined ? Math.trunc(cfg.keepLastUserPrompts) : 10;
+		// Keep-original-prompt: boolean governing the eternal dispatch-slot
+		// protection on the first user prompt. Default `true` preserves
+		// the current dispatch behavior; `false` lets the original age
+		// out under keep-last-user-prompts.
+		const keepOriginalPrompt = cfg.keepOriginalPrompt ?? true;
 		const result = await applyThreeTierTrim(withPinned, {
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
@@ -611,6 +624,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectedToolCallIds,
 			tokenEstimatorDivisor,
 			systemPromptTokens,
+			keepLastUserPrompts,
+			keepOriginalPrompt,
 		});
 		// Persist the fingerprints of messages summarized in this
 		// pass. The pure policy emits `summarizedFingerprints` as

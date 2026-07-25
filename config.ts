@@ -125,6 +125,27 @@ export interface ContextTrimmerConfig {
 	 *  `intercomKeepLast` value (env > JSON >
 	 *  `DEFAULT_INTERCOM_KEEP_LAST`). */
 	readonly subagentNotifyKeepLast?: number;
+	/** Keep-last-user-prompts count. The wiring layer (in the context
+	 *  handler) protects the last N operator-authored `role: "user"`
+	 *  messages from drop and summarize regardless of the three-tier
+	 *  budget. Positive integer = keep last N; `undefined`, `0`,
+	 *  negative, non-integer, `NaN`, and `Infinity` are treated as
+	 *  absent (the channel is a no-op at the policy layer). The
+	 *  wiring layer applies the default `10` when neither env nor
+	 *  JSON sets a value. Tandem with the
+	 *  `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` env var per
+	 *  Rule 9. */
+	readonly keepLastUserPrompts?: number;
+	/** Keep-original-prompt toggle. When `true` (the default), the
+	 *  first user message (dispatch slot, `userTurnAge === 0`) is
+	 *  eternally protected from drop regardless of the
+	 *  keep-last-user-prompts window. When `false`, the dispatch slot
+	 *  is protected ONLY by keep-last-user-prompts: in-window →
+	 *  protected, outside N → droppable. The original still counts
+	 *  toward the N count in both modes. Tandem with the
+	 *  `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` env var per
+	 *  Rule 9. */
+	readonly keepOriginalPrompt?: boolean;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -161,6 +182,8 @@ export const ENV = {
 	reasoningBlockCap: "PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP",
 	intercomKeepLast: "PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST",
 	subagentNotifyKeepLast: "PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST",
+	keepLastUserPrompts: "PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS",
+	keepOriginalPrompt: "PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -192,6 +215,10 @@ export interface ParsedConfigFile {
 	reasoningBlockCap?: number;
 	intercomKeepLast?: number;
 	subagentNotifyKeepLast?: number;
+	/** Keep-last-user-prompts count (mirrors the config field). */
+	keepLastUserPrompts?: number;
+	/** Keep-original-prompt boolean (mirrors the config field). */
+	keepOriginalPrompt?: boolean;
 }
 
 /**
@@ -251,6 +278,13 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isValidBlockCap(o.subagentNotifyKeepLast)) {
 		out.subagentNotifyKeepLast = o.subagentNotifyKeepLast;
+	}
+	if (isPositiveNumber(o.keepLastUserPrompts)) {
+		out.keepLastUserPrompts = o.keepLastUserPrompts;
+	}
+	const kop = o.keepOriginalPrompt;
+	if (kop === true || kop === false) {
+		out.keepOriginalPrompt = kop;
 	}
 	return out;
 }
@@ -312,6 +346,21 @@ export function resolveConfig(opts: {
 	const subagentNotifyKeepLast =
 		parseBlockCapEnv(env[ENV.subagentNotifyKeepLast]) ?? file.subagentNotifyKeepLast;
 
+	const keepLastUserPrompts =
+		parseNumberEnv(env[ENV.keepLastUserPrompts]) ?? file.keepLastUserPrompts;
+
+	let keepOriginalPrompt: boolean | undefined;
+	const envKop = env[ENV.keepOriginalPrompt];
+	if (envKop === "1") {
+		keepOriginalPrompt = true;
+	} else if (envKop === "0") {
+		keepOriginalPrompt = false;
+	} else if (file.keepOriginalPrompt === true || file.keepOriginalPrompt === false) {
+		keepOriginalPrompt = file.keepOriginalPrompt;
+	} else {
+		keepOriginalPrompt = undefined;
+	}
+
 	let pinSubagent: boolean | undefined;
 	const envPs = env[ENV.pinSubagent];
 	if (envPs === "1") {
@@ -352,6 +401,8 @@ export function resolveConfig(opts: {
 		reasoningBlockCap,
 		intercomKeepLast,
 		subagentNotifyKeepLast,
+		keepLastUserPrompts,
+		keepOriginalPrompt,
 	};
 }
 
