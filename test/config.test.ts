@@ -1696,3 +1696,188 @@ describe("tokenEstimatorDivisor — resolveConfig (precedence)", () => {
 		assert.equal(ENV.tokenEstimatorDivisor, "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR");
 	});
 });
+// ─── keepLastUserPrompts (count-based user-prompt protection) ──────────
+//
+// Mirrors the recencyFloor config pattern: env > JSON > undefined, with
+// `isPositiveNumber` validation so 0/negative/NaN/Infinity/non-numeric
+// all fall through to absent. The wiring-layer default (10) is applied
+// in index.ts, not here — the config-resolver field stays `undefined`
+// when neither channel sets a value (the honest test surface).
+
+describe("keepLastUserPrompts", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: a positive number is extracted", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: 5 }).keepLastUserPrompts, 5);
+		assert.equal(parseConfigFile({ keepLastUserPrompts: 1 }).keepLastUserPrompts, 1);
+	});
+
+	it("file parse: 0 is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: 0 }).keepLastUserPrompts, undefined);
+	});
+
+	it("file parse: negative is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: -3 }).keepLastUserPrompts, undefined);
+	});
+
+	it("file parse: NaN is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: Number.NaN }).keepLastUserPrompts, undefined);
+	});
+
+	it("file parse: Infinity (positive or negative) is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: Number.POSITIVE_INFINITY }).keepLastUserPrompts, undefined);
+		assert.equal(parseConfigFile({ keepLastUserPrompts: Number.NEGATIVE_INFINITY }).keepLastUserPrompts, undefined);
+	});
+
+	it("file parse: non-numeric (string) is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepLastUserPrompts: "10" }).keepLastUserPrompts, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 50_000 }).keepLastUserPrompts, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env wins over file", () => {
+		const cfg = resolveConfig({
+			file: { keepLastUserPrompts: 5 },
+			env: { [ENV.keepLastUserPrompts]: "20" } as EnvRecord,
+		});
+		assert.equal(cfg.keepLastUserPrompts, 20);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { keepLastUserPrompts: 5 },
+			env: { [ENV.keepLastUserPrompts]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.keepLastUserPrompts, 5);
+	});
+
+	it("resolveConfig: non-positive env (0, negative) falls back to file", () => {
+		const cfgZero = resolveConfig({
+			file: { keepLastUserPrompts: 5 },
+			env: { [ENV.keepLastUserPrompts]: "0" } as EnvRecord,
+		});
+		assert.equal(cfgZero.keepLastUserPrompts, 5);
+		const cfgNeg = resolveConfig({
+			file: { keepLastUserPrompts: 5 },
+			env: { [ENV.keepLastUserPrompts]: "-1" } as EnvRecord,
+		});
+		assert.equal(cfgNeg.keepLastUserPrompts, 5);
+	});
+
+	it("resolveConfig: non-numeric env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { keepLastUserPrompts: 5 },
+			env: { [ENV.keepLastUserPrompts]: "lots" } as EnvRecord,
+		});
+		assert.equal(cfg.keepLastUserPrompts, 5);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		const cfg = resolveConfig({ file: { keepLastUserPrompts: 7 } });
+		assert.equal(cfg.keepLastUserPrompts, 7);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined (wiring applies default 10)", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.keepLastUserPrompts, undefined);
+	});
+
+	// --- env parse grammar ---
+
+	it("env parse: numeric string is coerced to number", () => {
+		const cfg = resolveConfig({
+			env: { [ENV.keepLastUserPrompts]: "15" } as EnvRecord,
+		});
+		assert.equal(cfg.keepLastUserPrompts, 15);
+		assert.equal(typeof cfg.keepLastUserPrompts, "number");
+	});
+
+	// --- ENV map ---
+
+	it("ENV.keepLastUserPrompts is the documented namespace", () => {
+		assert.equal(ENV.keepLastUserPrompts, "PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS");
+	});
+});
+
+// ─── keepOriginalPrompt (dispatch-slot eternal-protection toggle) ──────
+//
+// Boolean knob mirroring the pinSubagent/loopGuard pattern: env "1"/"0"
+// → true/false; file boolean; default undefined (the wiring-layer default
+// `true` is applied in index.ts, not here — the config-resolver field
+// stays `undefined` when neither channel sets a value).
+
+describe("keepOriginalPrompt", () => {
+	// --- parseConfigFile (file channel) ---
+
+	it("file parse: boolean true is extracted", () => {
+		assert.equal(parseConfigFile({ keepOriginalPrompt: true }).keepOriginalPrompt, true);
+	});
+
+	it("file parse: boolean false is extracted", () => {
+		assert.equal(parseConfigFile({ keepOriginalPrompt: false }).keepOriginalPrompt, false);
+	});
+
+	it("file parse: non-boolean (string, number) is treated as absent", () => {
+		assert.equal(parseConfigFile({ keepOriginalPrompt: "true" }).keepOriginalPrompt, undefined);
+		assert.equal(parseConfigFile({ keepOriginalPrompt: 1 }).keepOriginalPrompt, undefined);
+		assert.equal(parseConfigFile({ keepOriginalPrompt: 0 }).keepOriginalPrompt, undefined);
+	});
+
+	it("file parse: missing key leaves the field undefined", () => {
+		assert.equal(parseConfigFile({ tier1MaxTokens: 50_000 }).keepOriginalPrompt, undefined);
+	});
+
+	// --- resolveConfig (env wins over file) ---
+
+	it("resolveConfig: env \"1\" wins over file false", () => {
+		const cfg = resolveConfig({
+			file: { keepOriginalPrompt: false },
+			env: { [ENV.keepOriginalPrompt]: "1" } as EnvRecord,
+		});
+		assert.equal(cfg.keepOriginalPrompt, true);
+	});
+
+	it("resolveConfig: env \"0\" wins over file true", () => {
+		const cfg = resolveConfig({
+			file: { keepOriginalPrompt: true },
+			env: { [ENV.keepOriginalPrompt]: "0" } as EnvRecord,
+		});
+		assert.equal(cfg.keepOriginalPrompt, false);
+	});
+
+	it("resolveConfig: empty-string env falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { keepOriginalPrompt: false },
+			env: { [ENV.keepOriginalPrompt]: "" } as EnvRecord,
+		});
+		assert.equal(cfg.keepOriginalPrompt, false);
+	});
+
+	it("resolveConfig: non-1/0 env (e.g. \"yes\") falls back to file", () => {
+		const cfg = resolveConfig({
+			file: { keepOriginalPrompt: true },
+			env: { [ENV.keepOriginalPrompt]: "yes" } as EnvRecord,
+		});
+		assert.equal(cfg.keepOriginalPrompt, true);
+	});
+
+	it("resolveConfig: file-only returns the file value", () => {
+		assert.equal(resolveConfig({ file: { keepOriginalPrompt: true } }).keepOriginalPrompt, true);
+		assert.equal(resolveConfig({ file: { keepOriginalPrompt: false } }).keepOriginalPrompt, false);
+	});
+
+	it("resolveConfig: nothing configured leaves the field undefined (wiring applies default true)", () => {
+		const cfg = resolveConfig({});
+		assert.equal(cfg.keepOriginalPrompt, undefined);
+	});
+
+	// --- ENV map ---
+
+	it("ENV.keepOriginalPrompt is the documented namespace", () => {
+		assert.equal(ENV.keepOriginalPrompt, "PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT");
+	});
+});
