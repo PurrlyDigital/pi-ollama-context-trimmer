@@ -894,31 +894,40 @@ function dropOldestTurns(
 	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
 	// First pass: identify the trimmable turns and their token mass.
-	// A trimmable turn starts immediately after a non-dispatch user
-	// message and runs to either the next non-dispatch user message
-	// (exclusive) or to a protected custom slot, whichever comes
-	// first. When dispatch protection is OFF, every user message is a
-	// turn anchor (there is no special dispatch slot); when ON, the
-	// dispatch (userTurnAge === 0) is NOT a trimmable turn anchor.
+	// A trimmable turn is anchored at every model-invocation
+	// boundary — both follow-up user prompts and assistant turns —
+	// and runs to the next boundary (exclusive) or to a protected
+	// custom slot. Anchoring on assistant turns subdivides an
+	// autonomous session (one dispatch + a long assistant<->toolResult
+	// tail with no follow-up user message) into droppable
+	// per-assistant units instead of one bulk turn the drop-floor
+	// guard cannot shed. When dispatch protection is OFF, every
+	// user message is an anchor; when ON, the dispatch
+	// (userTurnAge === 0) is NOT an anchor. Assistants have no
+	// dispatch carve-out (dispatch slots are user messages).
 	//
-	// The post-dispatch tail (everything after the dispatch, when
-	// there is no follow-up user message yet) is also a trimmable
-	// turn: in real sessions the LLM is often mid-response (no
-	// follow-up user message has arrived) when the context handler
-	// runs, and a huge tool result tail with no follow-up user
-	// message is exactly the case the drop tier exists to handle.
+	// A user anchor opens the next turn AFTER the user message; an
+	// assistant anchor opens the next turn AT the assistant, so the
+	// assistant and its tool results drop as one unit (pair-atomic).
+	// The post-dispatch tail (no follow-up user, no assistant) is
+	// still synthesized as a trimmable turn by the fallback below.
 	type Turn = { start: number; end: number; tokens: number };
 	const turns: Turn[] = [];
 	let turnStart = -1;
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
-		const isTurnAnchor = msg.role === "user" && (protectDispatch ? msg.userTurnAge !== 0 : true);
+		const isUserAnchor = msg.role === "user" && (protectDispatch ? msg.userTurnAge !== 0 : true);
+		const isAssistantAnchor = msg.role === "assistant";
+		const isTurnAnchor = isUserAnchor || isAssistantAnchor;
 		if (isTurnAnchor) {
-			// Close any open trimmable turn at the previous boundary.
-			if (turnStart !== -1) {
+			// Close any open trimmable turn at this boundary. Skip the
+			// close when the open turn is empty (turnStart === i — an
+			// assistant immediately following a user anchor that set
+			// turnStart = i, or two adjacent anchors).
+			if (turnStart !== -1 && turnStart < i) {
 				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 			}
-			turnStart = i + 1; // The trimmable turn starts AFTER this user message.
+			turnStart = isUserAnchor ? i + 1 : i;
 		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
 			// A protected custom slot closes any open trimmable turn.
 			if (turnStart !== -1) {
