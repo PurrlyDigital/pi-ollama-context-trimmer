@@ -248,9 +248,15 @@ When neither channel resolves a `personalityPath`, the pinned-tier injection is 
 
 ## How the token count is computed
 
-The extension uses a simple approximation: per message, `Math.ceil(text_length / 4)` where `text_length` is the extracted text content (string content is taken as-is; array content is concatenated across `{ type: "text", text: string }` blocks; tool-result blocks are stringified). Non-text content blocks contribute their JSON-stringified length, which undercounts multi-modal content — that bias is the safe direction (we trim sooner rather than later).
+The extension estimates tokens from text length. The default is `Math.ceil(text_length / 3)`. The legacy divisor of `4` is reachable by setting the operator knob.
 
-The trimmable total is the sum of per-message tokens **minus** the protected-slot tokens (the pinned synthetic when injected, and the dispatch task when dispatch protection is enabled). The budget is measured against the trimmable mass, not the raw mass.
+String content is taken as-is. Array content is concatenated across `{ type: "text", text: string }` blocks. Tool-result blocks are stringified. Non-text content blocks contribute their JSON-stringified length. This undercounts multi-modal content. That bias is the safe direction. The trimmer trims sooner rather than later.
+
+The divisor can also be calibrated. When the first assistant message in the stream carries a `usage.input` value, the trimmer derives a calibrated chars-per-token rate from it. The calibration runs once per context hook. The calibrated rate is the effective divisor for that hook.
+
+When no usable `usage.input` is present, the configured divisor applies. This covers the very first turn on a fresh session. It covers test mocks that do not carry `usage`. It covers assistant turns that were aborted or errored. The configured divisor is the operator knob referenced above, or the default `3`.
+
+The trimmable total is the sum of per-message tokens. The protected-slot tokens are subtracted. The protected slots are the pinned synthetic when injected, and the dispatch task when dispatch protection is enabled. The budget is measured against the trimmable mass, not the raw mass.
 
 ## Development
 
