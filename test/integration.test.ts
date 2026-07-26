@@ -1550,6 +1550,120 @@ async function loadExtensionWithTools(toolNames: readonly string[]) {
 	return pi;
 }
 
+// ─── Tier 3 assistant-anchored drop (autonomous session shape) ────────
+//
+// Regression coverage for the autonomous-session defect: a single
+// dispatch prompt followed by a long assistant<->toolResult tail
+// with no follow-up user message. Under the user-message-only turn
+// anchor the whole tail was one bulk trimmable turn; the drop-floor
+// guard aborted the shed and the stream returned untouched (zero
+// `context-trimmer-dropped` events). With assistant messages also
+// anchoring droppable turn boundaries, the tail subdivides into
+// per-assistant units the drop loop sheds incrementally without
+// crossing the floor.
+
+describe("context handler — Tier 3 assistant-anchored drop (autonomous session shape)", () => {
+	it("reproduces-then-stops-reproducing the zero-drop signature: an autonomous tail sheds incrementally after the fix (droppedTurns >= 1, persistence entry recorded)", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Autonomous shape: one dispatch + six assistant<->toolResult
+		// pairs, no follow-up user message. Each pair is ~30k trimmable;
+		// six pairs = ~180k total, above the 100k cap. The drop-floor is
+		// 50% of the 100k cap = 50k. Each assistant-anchored turn is one
+		// 30k pair, so the drop loop sheds the oldest pairs one at a
+		// time (180→150→120, each step ≥ 50k floor) and stops when the
+		// remaining 90k falls under the cap. Three turns drop.
+		// Pre-fix this shape produced zero `context-trimmer-dropped`
+		// entries (the whole 180k tail was one bulk turn; shedding it
+		// would have left 0 < 50k floor, so the guard aborted the shed).
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~30k tokens
+		const event = {
+			messages: [
+				userMsg("dispatch — autonomous run"),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+			],
+		};
+		await fireContextWithCtx(pi, event);
+		const appendEntries = pi.__getAppendEntries();
+		const dropped = appendEntries.filter((e) => e.customType === "context-trimmer-dropped");
+		assert.ok(dropped.length >= 1, "an autonomous tail must produce at least one context-trimmer-dropped entry after the fix (pre-fix this was zero)");
+		for (const e of dropped) {
+			const data = e.data as { droppedTurns?: unknown } | undefined;
+			assert.ok(data && typeof data === "object", "dropped entry must carry a data object");
+			assert.equal(typeof data.droppedTurns, "number", "dropped entry's data.droppedTurns must be a number");
+			assert.ok((data.droppedTurns as number) >= 1, "dropped entry's data.droppedTurns must be >= 1 (the autonomous tail shed incrementally)");
+		}
+	});
+
+	it("surviving stream retains the dispatch and the most-recent pair; the bulk interior is shed", async () => {
+		const pi = await loadExtensionWithPersistence();
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(400); // ~30k tokens
+		const marker = (n: number) => `AUTONOMOUS_PAIR_${n}_`;
+		const event = {
+			messages: [
+				userMsg("dispatch — autonomous run"),
+				assistantMsg(marker(1) + trimmableBody),
+				toolResultMsg(marker(1) + trimmableBody),
+				assistantMsg(marker(2) + trimmableBody),
+				toolResultMsg(marker(2) + trimmableBody),
+				assistantMsg(marker(3) + trimmableBody),
+				toolResultMsg(marker(3) + trimmableBody),
+				assistantMsg(marker(4) + trimmableBody),
+				toolResultMsg(marker(4) + trimmableBody),
+				assistantMsg(marker(5) + trimmableBody),
+				toolResultMsg(marker(5) + trimmableBody),
+				assistantMsg(marker(6) + trimmableBody),
+				toolResultMsg(marker(6) + trimmableBody),
+			],
+		};
+		const result = (await fireContextWithCtx(pi, event)) as { messages: Array<Record<string, unknown>> };
+		const flat = result.messages.map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content))).join("\n");
+		// The dispatch survives (protected by keepOriginalPrompt).
+		assert.ok(flat.includes("dispatch — autonomous run"), "the dispatch prompt must survive the drop (protected)");
+		// The most-recent pair (pair 6) survives; the oldest pairs (1-3) are shed.
+		assert.ok(flat.includes("AUTONOMOUS_PAIR_6_"), "the most-recent assistant/toolResult pair must survive the incremental drop");
+		assert.equal(flat.includes("AUTONOMOUS_PAIR_1_"), false, "the oldest pair must be shed by the incremental drop");
+	});
+
+	it("interactive-shape negative control: the existing user-anchored turn model still sheds incrementally (no regression)", async () => {
+		const pi = await loadExtensionWithPersistence();
+		// Interactive shape: dispatch + follow-up + pair + follow-up +
+		// pair. The follow-up user messages anchor turns exactly as
+		// before; the assistant-anchor branch closes an empty turn at
+		// each assistant that immediately follows a user anchor, so
+		// the turn boundaries are unchanged from the pre-fix behavior.
+		const longSentence = "The cat sat on the mat and looked out the window. The dog ran in the park, barking at the squirrel. Children played in the park, laughing and shouting. Birds flew overhead, singing in the trees. It was a sunny day with a gentle breeze. The park was green and lush, full of life and sound. ";
+		const trimmableBody = longSentence.repeat(800); // ~60k tokens
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				userMsg("follow-up 1"),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+				userMsg("follow-up 2"),
+				assistantMsg(trimmableBody),
+				toolResultMsg(trimmableBody),
+			],
+		};
+		await fireContextWithCtx(pi, event);
+		const appendEntries = pi.__getAppendEntries();
+		const dropped = appendEntries.filter((e) => e.customType === "context-trimmer-dropped");
+		assert.ok(dropped.length >= 1, "the interactive multi-turn shape must still drop the oldest trimmable turn (no regression from the assistant-anchor change)");
+	});
+});
+
 async function fireContextBasic(pi: ReturnType<typeof createMockPiWithTools>, event: unknown) {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
