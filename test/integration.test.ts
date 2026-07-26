@@ -2392,3 +2392,179 @@ describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring e
 		delete process.env[CONFIG_ENV.recencyFloor];
 	});
 });
+// ─── Calibrated token-estimator divisor from usage (AC-1..AC-8) ───────
+//
+// The wiring layer derives a calibrated chars-per-token divisor from
+// the harness's ground-truth `usage.input` on the first assistant
+// message that carries one, and falls back to the configured divisor
+// when no usable `usage` is present. The calibration runs per hook
+// (not at extension-load time), so the same loaded extension produces
+// different divisors for different streams — with-usage vs no-usage.
+//
+// Observable signal: the tier boundary. The tier-2 cap is 100k tokens;
+// the tier-3 drop fires above it. Two assistants of 180k chars each
+// (360k total) read as 60k tokens at divisor 6 (tier 2, hold → both
+// survive) and 120k tokens at divisor 3 (tier 3, drop → the oldest
+// 180k assistant is dropped, the youngest survives; remaining 60k >
+// the 50k drop floor so the drop is not floor-blocked). The survival
+// flip of the oldest 180k assistant distinguishes the divisors.
+//
+// Four paths:
+//   (a) usage-carrying stream → calibrated divisor 6 derived from
+//       usage.input; the oldest 180k assistant survives (tier 2 hold).
+//   (b) no-usage fallback → configured divisor (env > JSON > 3)
+//       applies; the oldest 180k assistant is dropped (tier 3).
+//   (c) resumed session with multiple assistants carrying `usage` →
+//       the FIRST assistant is the calibration point, not the last.
+//   (d) aborted/error assistant → unusable usage is skipped; the
+//       fallback divisor applies.
+
+describe("context handler — calibrated token estimator divisor from usage", () => {
+	let savedDivisorEnv: string | undefined;
+
+	beforeEach(() => {
+		savedDivisorEnv = process.env[CONFIG_ENV.tokenEstimatorDivisor];
+		delete process.env[CONFIG_ENV.tokenEstimatorDivisor];
+	});
+
+	afterEach(() => {
+		if (savedDivisorEnv === undefined) delete process.env[CONFIG_ENV.tokenEstimatorDivisor];
+		else process.env[CONFIG_ENV.tokenEstimatorDivisor] = savedDivisorEnv;
+	});
+
+	async function invokeWithSystemPrompt(
+		pi: ReturnType<typeof createMockPi>,
+		event: unknown,
+		systemPrompt: string,
+	): Promise<{ messages: Array<Record<string, unknown>> }> {
+		const handlers = pi.getHandlers("context");
+		assert.ok(handlers.length > 0, "context handler must be registered");
+		const ctx = {
+			hasUI: false,
+			ui: { setStatus: () => {} },
+			getSystemPrompt: () => systemPrompt,
+		};
+		return (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
+	}
+
+	// (a) usage-carrying stream: the calibrated divisor is derived from
+	// the first assistant's `usage.input`. System prompt (6,000 chars) +
+	// user message before the assistant (6,000 chars) = 12,000 chars;
+	// usage.input = 2,000 → divisor = 6.0. Two 180k-char assistants
+	// after the calibration point → 360k chars / 6 = 60k tokens → tier 2
+	// hold → the oldest 180k assistant survives.
+	it("(a) usage-carrying stream: calibrated divisor holds mass that the /3 fallback would drop", async () => {
+		const pi = await loadExtension();
+		const systemPrompt = "s".repeat(6_000);
+		const userContent = "u".repeat(6_000);
+		const event = {
+			messages: [
+				userMsg(userContent),
+				{ role: "assistant", content: "calibration point", usage: { input: 2_000, output: 1, totalTokens: 2_001 }, stopReason: "stop" },
+				assistantMsg("a".repeat(180_000)),
+				assistantMsg("b".repeat(180_000)),
+			],
+		};
+		const result = await invokeWithSystemPrompt(pi, event, systemPrompt);
+		const oldestBig = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(180_000));
+		// Calibrated divisor 6.0 → 360k / 6 = 60k tokens → tier 2 hold
+		// → the oldest 180k assistant survives. (Under the /3 fallback
+		// it would be 120k tokens → tier 3 → dropped.)
+		assert.ok(oldestBig.length === 1, "calibrated divisor (6.0) holds the oldest 180k assistant in tier 2; the /3 fallback would drop it");
+	});
+
+	// (b) no-usage fallback: when no assistant carries usable `usage`,
+	// the configured divisor applies. The env var is read at extension-
+	// load time, so set it BEFORE loadExtension. With env divisor 2,
+	// two 120k-char assistants → 240k / 2 = 120k tokens → tier 3 →
+	// oldest dropped (remaining 60k > 50k floor). With the default /3,
+	// 240k / 3 = 80k tokens → tier 2 → both survive.
+	it("(b) no-usage fallback: configured divisor applies when no usable usage is present", async () => {
+		// (b-i) Default divisor /3: 240k / 3 = 80k tokens → tier 2 →
+		// both 120k assistants survive.
+		const piDefault = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg("a".repeat(120_000)),
+				assistantMsg("b".repeat(120_000)),
+			],
+		};
+		const resultDefault = await invokeWithSystemPrompt(piDefault, event, "");
+		const oldestDefault = resultDefault.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
+		assert.ok(oldestDefault.length === 1, "default divisor /3 holds both 120k assistants (80k tokens, tier 2)");
+
+		// (b-ii) Env divisor = 2: set BEFORE loadExtension. 240k / 2 =
+		// 120k tokens → tier 3 → oldest 120k assistant dropped
+		// (remaining 60k > 50k floor).
+		process.env[CONFIG_ENV.tokenEstimatorDivisor] = "2";
+		const piDivisor2 = await loadExtension();
+		const event2 = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg("a".repeat(120_000)),
+				assistantMsg("b".repeat(120_000)),
+			],
+		};
+		const resultDivisor2 = await invokeWithSystemPrompt(piDivisor2, event2, "");
+		const oldestDivisor2 = resultDivisor2.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
+		assert.ok(oldestDivisor2.length === 0, "env divisor 2 drops the oldest 120k assistant (120k tokens, tier 3); the default /3 holds it");
+	});
+
+	// (c) resumed session: multiple assistants carrying `usage`. The
+	// FIRST assistant is the calibration point. First assistant:
+	// usage.input = 400 → divisor = 2,400 / 400 = 6.0. Second assistant:
+	// usage.input = 800 → would give divisor 3.0 if it were the point
+	// (it's not). Two 180k-char assistants after → 360k chars. Under
+	// divisor 6.0 (first) → 60k tokens → tier 2 → oldest survives.
+	// Under divisor 3.0 (second, if used) → 120k tokens → tier 3 →
+	// oldest dropped.
+	it("(c) resumed session: first assistant is the calibration point, not the last", async () => {
+		const pi = await loadExtension();
+		const systemPrompt = "s".repeat(1_200);
+		const userContent = "u".repeat(1_200);
+		const event = {
+			messages: [
+				userMsg(userContent),
+				{ role: "assistant", content: "first turn", usage: { input: 400, output: 1, totalTokens: 401 }, stopReason: "stop" },
+				userMsg("second turn user"),
+				{ role: "assistant", content: "second turn", usage: { input: 800, output: 1, totalTokens: 801 }, stopReason: "stop" },
+				assistantMsg("a".repeat(180_000)),
+				assistantMsg("b".repeat(180_000)),
+			],
+		};
+		const result = await invokeWithSystemPrompt(pi, event, systemPrompt);
+		const oldestBig = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(180_000));
+		// First assistant (divisor 6.0) → 360k / 6 = 60k tokens →
+		// tier 2 → oldest 180k assistant survives. If the second
+		// assistant's rate (divisor 3.0) were used → 120k tokens →
+		// tier 3 → oldest dropped. Survival confirms first-assistant
+		// calibration.
+		assert.ok(oldestBig.length === 1, "first assistant is the calibration point (divisor 6.0 → tier 2 hold); the last assistant's rate (divisor 3.0 → tier 3 drop) is not used");
+	});
+
+	// (d) aborted assistant: `usage` on an aborted assistant is not a
+	// usable calibration point (mirrors the harness compaction module's
+	// `getAssistantUsage` predicate). The fallback divisor applies.
+	it("(d) aborted/error assistant: unusable usage is skipped; fallback divisor applies", async () => {
+		const pi = await loadExtension();
+		// First assistant is aborted (usage present but stopReason =
+		// "aborted") → not a calibration point. No other assistant
+		// carries usable usage → fallback to the default /3. Two 120k
+		// assistants → 240k / 3 = 80k tokens → tier 2 → both survive.
+		// If the aborted assistant's usage.input (1,000) were used as
+		// the calibration point, the divisor would be tiny → the mass
+		// would read as a huge token count → tier 3 drop.
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{ role: "assistant", content: "aborted turn", usage: { input: 1_000, output: 0, totalTokens: 1_000 }, stopReason: "aborted" },
+				assistantMsg("a".repeat(120_000)),
+				assistantMsg("b".repeat(120_000)),
+			],
+		};
+		const result = await invokeWithSystemPrompt(pi, event, "");
+		const oldest = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
+		assert.ok(oldest.length === 1, "aborted assistant's usage is skipped; default /3 divisor holds both 120k assistants (80k tokens, tier 2)");
+	});
+});
