@@ -63,6 +63,7 @@ import {
 	computeFlatInputTokenSignal,
 	dedupSubagentNotify,
 	detectConsecutiveIdenticalToolCalls,
+	extractText,
 	isPathPreserved,
 	keepLatestSubagentToolResult,
 	LOOP_GUARD_BLOCK_TEXT,
@@ -120,6 +121,67 @@ function stampUserTurnAge<T extends { role: string }>(messages: ReadonlyArray<T>
 		out.push(stamped);
 	}
 	return out;
+}
+
+// ─── Calibrated token-estimator divisor (derived from real usage) ───────
+// The trimmer's per-message token estimator is `chars / divisor`. The
+// compile-time default is `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`; the
+// operator knob (`tokenEstimatorDivisor` env/JSON) overrides it. This
+// helper derives a calibrated divisor from the harness's ground-truth
+// `usage.input` on the first assistant message that carries one, so the
+// estimator auto-tunes to the model's actual chars-per-token rate
+// instead of a fixed guess. Falls back to `undefined` (caller applies
+// the configured divisor) when no usable `usage` is in the stream.
+
+/**
+ * Type guard for a usable `usage.input` on a raw assistant message.
+ * Mirrors the harness compaction module's `getAssistantUsage` predicate:
+ * the assistant must not be aborted/error, and `usage.input` must be a
+ * positive finite number. Messages without `usage` (test mocks, pre-
+ * first-turn hooks, aborted/error turns) fall through to the fallback.
+ */
+function usableAssistantUsage(msg: Record<string, unknown>): { input: number } | undefined {
+	if (msg.role !== "assistant") return undefined;
+	const stopReason = msg.stopReason;
+	if (stopReason === "aborted" || stopReason === "error") return undefined;
+	const usage = msg.usage;
+	if (typeof usage !== "object" || usage === null) return undefined;
+	const input = (usage as Record<string, unknown>).input;
+	if (typeof input !== "number" || !Number.isFinite(input) || input <= 0) return undefined;
+	return { input };
+}
+
+/**
+ * Derive a calibrated chars-per-token divisor from the first assistant
+ * message in the stream that carries a usable `usage.input`. The
+ * numerator is the total character count the provider saw when it
+ * produced that turn: the system prompt plus every message before the
+ * calibration-point assistant (the assistant itself is the denominator,
+ * not part of the numerator). Returns `undefined` when no usable
+ * `usage` is present — the caller falls back to the configured divisor.
+ *
+ * Pure: reads `systemPromptChars` (a number) and the raw message
+ * array, returns a number or undefined. No I/O, no `process.*`. Kept
+ * in the wiring layer (not `policy.ts`) because it reads the harness
+ * `usage` field, which is a wiring-layer concern; the pure module's
+ * `approximateTextTokens` / `approximateMessageTokens` signatures are
+ * unchanged.
+ */
+function deriveCalibratedDivisor(
+	rawMessages: ReadonlyArray<Record<string, unknown>>,
+	systemPromptChars: number,
+): number | undefined {
+	for (let i = 0; i < rawMessages.length; i++) {
+		const usage = usableAssistantUsage(rawMessages[i]!);
+		if (usage === undefined) continue;
+		let chars = systemPromptChars;
+		for (let j = 0; j < i; j++) {
+			chars += extractText(rawMessages[j]!.content).length;
+		}
+		const divisor = chars / usage.input;
+		return Number.isFinite(divisor) && divisor > 0 ? divisor : undefined;
+	}
+	return undefined;
 }
 
 // ─── Config file reader (the only file-I/O for config) ─────────────────
@@ -417,7 +479,17 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// background-promise `.then()` — hoisted to a single const.
 		const tokenEstimatorDivisor =
 			cfg.tokenEstimatorDivisor !== undefined ? Math.trunc(cfg.tokenEstimatorDivisor) : TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
-		const systemPromptTokens = approximateTextTokens(systemPromptString, tokenEstimatorDivisor);
+		// Calibrate the divisor from the harness's ground-truth `usage.input`
+		// on the first assistant message in the stream that carries one. The
+		// calibrated rate auto-tunes the estimator to the model's actual
+		// chars-per-token ratio; when no usable `usage` is present (pre-first-
+		// turn hooks, test mocks without `usage`, aborted/error turns), the
+		// configured `tokenEstimatorDivisor` above is the fallback. Derived
+		// once per hook and threaded as an immutable number through every
+		// downstream token-count call.
+		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
+		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
+		const systemPromptTokens = approximateTextTokens(systemPromptString, effectiveDivisor);
 		// Stamp userTurnAge on every message. The stamp is the source
 		// of truth for the dispatch-task protection; we pass the
 		// minimum shape (role) to the stampee and use the original
@@ -622,7 +694,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
 			protectedToolCallIds,
-			tokenEstimatorDivisor,
+			tokenEstimatorDivisor: effectiveDivisor,
 			systemPromptTokens,
 			keepLastUserPrompts,
 			keepOriginalPrompt,
