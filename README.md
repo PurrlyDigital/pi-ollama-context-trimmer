@@ -61,7 +61,7 @@ The extension is global. Once installed, every Pi session (parent and subagent) 
 - **The dispatch task** is the first user message, stamped with `userTurnAge === 0`; `isProtectedSlot` exempts it from drop, and its tokens are subtracted from the cap total.
 - **A freshly-dispatched subagent's session** holds the dispatch, the pinned synthetic, and a single short trimmable message — under 50k, the trim path is skipped.
 
-The synthetic is rebuilt on every `context` event from the file system and is never persisted in the session file. The dispatch protection is ON by default when `pi-subagents` is installed. Override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=0`.
+The synthetic is rebuilt on every `context` event from the file system and is never persisted in the session file. The dispatch protection is ON by default when `pi-subagents` is installed. Override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=0`. In a plain parent session without `pi-subagents`, the first user prompt is ordinary trimmable content.
 
 ## Loop guard
 
