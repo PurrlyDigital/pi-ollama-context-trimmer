@@ -57,11 +57,11 @@ The extension is global. Once installed, every Pi session (parent and subagent) 
 
 ## How the protected inputs are wired
 
-- **The agent def** travels as a synthetic `custom` message prepended to the per-LLM-call view carrying `customType: "context-trimmer-pinned"`. The trim policy's `protectedCustomTypes` option matches that customType. The match excludes the message from the trim budget. The injection is rebuilt on every `context` event from the file system. The synthetic, never persisted in the session file, is protected on every injection regardless of other settings.
+- **The agent def** travels as a `context-trimmer-pinned` synthetic; the trim policy's `protectedCustomTypes` option excludes it from the budget.
+- **The dispatch task** is the first user message, stamped with `userTurnAge === 0`; `isProtectedSlot` exempts it from drop, and its tokens are subtracted from the cap total.
+- **A freshly-dispatched subagent's session** holds the dispatch, the pinned synthetic, and a single short trimmable message — under 50k, the trim path is skipped.
 
-- **The dispatch task** is the first user message in the stream, stamped with `userTurnAge === 0`. The trim policy's `isProtectedSlot` predicate reads the stamp, exempting the message from drop. Its tokens are subtracted from the cap total. The protection is ON by default when the `pi-subagents` extension is installed (detection is automatic, see Config). The operator can override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH`. In a plain parent session, the first user prompt is ordinary trimmable content.
-
-- **A freshly-dispatched subagent's session** holds the dispatch, the pinned synthetic, and a single short trimmable message. The trimmable mass is under 50k. The trim path is skipped, returning the messages verbatim.
+The synthetic is rebuilt on every `context` event from the file system and is never persisted in the session file. The dispatch protection is ON by default when `pi-subagents` is installed. Override with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=0`.
 
 ## Loop guard
 
@@ -127,17 +127,11 @@ The guard detects **behavioral** loops via tool-call signatures. **Reasoning-onl
 
 ## Reasoning block cap
 
-Reasoning-capable models surface a `type:"thinking"` content block on assistant messages. The block is the model's intermediate chain of thought.
+Reasoning-capable models surface a `type:"thinking"` content block on assistant messages. The block is the model's intermediate chain of thought. Reasoning blocks have the shape `{ type: "thinking"; thinking: string }`. The provider may or may not bill for these blocks or pass them through.
 
-The provider may or may not bill for these blocks. The provider may or may not pass them through.
+The cap is a count-based gate on those blocks. It keeps the last N reasoning blocks, counted from the latest, and drops the rest. The cap is a count of blocks, not a measurement of tokens.
 
-The cap is a count-based gate on those blocks. It keeps the LAST N reasoning blocks, counted from the latest. It drops the rest.
-
-The cap runs before the three-tier trim. Dropped reasoning blocks are never seen by the trim.
-
-The cap is a count of blocks. The cap is not a measurement of tokens.
-
-The trim budget accounts for the post-cap mass. Dropping reasoning blocks shrinks the budget the three-tier trim needs to satisfy.
+The cap runs before the three-tier trim, before pinned injection, on every context event. Dropped reasoning blocks are never seen by the trim. The trim budget accounts for the post-cap mass. The pinned synthetic is never at risk. The cap runs unconditionally with no per-model branching.
 
 | Cap value | Effect |
 |-----------|--------|
@@ -146,25 +140,13 @@ The trim budget accounts for the post-cap mass. Dropping reasoning blocks shrink
 | `1` | Keep only the last reasoning block. Drop all earlier ones. |
 | any positive integer | Keep the last N reasoning blocks. |
 
-The cap runs unconditionally. It runs on every context event. There is no per-model branching.
-
-The wiring layer applies the cap to the `base` message stream. The cap runs before pinned injection. The pinned synthetic is never at risk of being dropped.
-
-Reasoning blocks are content blocks of shape `{ type: "thinking"; thinking: string }` on assistant messages.
-
-The default is passthrough. Set the env var or JSON key to `0` to send none. Set the env var or JSON key to a positive integer to keep the last N. The env var is `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP`. The JSON key is `reasoningBlockCap`.
+The cap value is in `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` (env) or `reasoningBlockCap` (JSON). Both are integers in `[-1, ∞)`. The default is `-1` (passthrough). Set to `0` to send none, or to a positive integer N to keep the last N.
 
 ## Pre-budget collapse
 
-Three transcript-entry categories accumulate outside the three-tier budget.
+> **Surface split.** Chain and parallel completions emit on both `subagent-notify` and, when an intercom target is set, `intercom_message`. The `subagent-notify` surface is a display notification governed by `subagentNotifyKeepLast`. The `intercom_message` surface is a grouped result governed by `intercomKeepLast`. The two knobs compose independently. See the `subagentNotifyKeepLast` row in the config-file table below for the env-var and JSON-key reference.
 
-The first category is `intercom_message` custom entries. These are full subagent outputs delivered via the intercom channel.
-
-The second category is `subagent-notify` custom entries. These are status notifications.
-
-The third category is `toolResult` entries from the `subagent` tool. These are full subagent dispatch echoes.
-
-The trimmer collapses them on a separate pass. The pass is extension-gated. The pass runs before the three-tier budget computation. The downstream paths then see the already-collapsed stream.
+Three transcript-entry categories accumulate outside the three-tier budget: `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer collapses each on a separate pre-budget pass. Each pass is gated on the relevant extension being installed; when the extension is absent, the pass is skipped entirely.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
@@ -173,15 +155,17 @@ The trimmer collapses them on a separate pass. The pass is extension-gated. The 
 | 2b | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Recency hardtrim. Keep the last N by stream order. Drop the rest. Integer semantics: `-1` keeps all (passthrough). `0` keeps none. A positive N keeps the last N. When unset, the effective value defaults to the resolved `intercomKeepLast`. The pass runs after `dedupSubagentNotify`: dedup first, then recency trim on the deduped stream. |
 | 3 | `toolResult:subagent` (`role: "toolResult"`, `toolName: "subagent"`) | `subagent` tool registered (pi-subagents) | Latest-only. Drop every such entry except the last by stream order. There is no operator knob. |
 
-> **Surface split.** Chain and parallel completions emit on both `subagent-notify` and, when an intercom target is set, `intercom_message`. The `subagent-notify` surface is a display notification governed by `subagentNotifyKeepLast`. The `intercom_message` surface is a grouped result governed by `intercomKeepLast`. The two knobs compose independently. See the `subagentNotifyKeepLast` defaulting paragraph below for the env-var and JSON-key rows.
-
-Each pass is skipped entirely when its gating extension is not present. Skipped means no array allocation and no scan. A session without the gating extension sees no behavior change on any of the rules.
-
-The pre-budget collapse runs before the reasoning-block cap. The pre-budget collapse runs before pinned injection. The pre-budget collapse runs before the three-tier trim. The pinned synthetic is never at risk. It is injected after the pre-budget window, matching the existing `applyReasoningBlockCap` invariant.
+The pre-budget collapse runs before the reasoning-block cap, before pinned injection, and before the three-tier trim. The pinned synthetic is never at risk; it is injected after the pre-budget window.
 
 ## Config
 
-The trim policy's three tier caps live as compile-time constants in `policy.ts`. They are also exposed as operator-configurable knobs through two config channels. The compile-time values are the defaults when neither channel sets a value.
+The trim policy exposes operator-configurable knobs through two channels. Env vars override the file. The file overrides compile-time defaults.
+
+Below: the compile-time defaults, the file schema, and the env-var equivalents.
+
+Use the file when pi runs under a non-interactive supervisor (systemd, launchd, container). The supervisor does not inherit your shell environment.
+
+The personality file is **opt-in**. It is machine-specific and carries no default.
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
@@ -193,16 +177,6 @@ The pinned tier exposes one constant in `pinned-tier.ts`.
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `PINNED_CUSTOM_TYPE` | `"context-trimmer-pinned"` | The customType stamp on the synthetic pinned message. |
-
-The personality file is **opt-in**. It is machine-specific and carries no default.
-
-There are two config channels. The fixed precedence is env, then file, then default.
-
-The first channel is **environment variables** (`PI_CONTEXT_TRIMMER_*`). These are useful for ad-hoc runs, CI, and tests.
-
-The second channel is the **global config file** `~/.pi/agent/context-trimmer.json`. This is the persistent, filesystem-based channel. Use this channel when pi is launched by a non-interactive supervisor.
-
-A supervisor like systemd, launchd, or a container orchestrator does not inherit your shell environment. Put the paths in the JSON file instead of exporting them in a shell rc the supervisor never sources.
 
 ### Config file
 
@@ -228,41 +202,21 @@ Create `~/.pi/agent/context-trimmer.json`:
 
 All fields are optional. The file is read once at extension load. Restart pi to pick up an edit. Unknown keys are ignored. Badly-typed values are treated as absent.
 
-`protectDispatch` accepts `"auto"`, `true`, or `false`. The default is `"auto"`, which is ON when `pi-subagents` is installed. Set `true` or `false` to force.
-
-`loopGuard` accepts `true` or `false`. The default is `true`, ON for every session. The previous `"auto"` sentinel is no longer accepted. A `"auto"` value in the file is treated as absent. The resolver falls through to the default `true`.
-
-The two tier-threshold fields are `tier1MaxTokens` and `tier2MaxTokens`. They follow the same env-over-file-over-default precedence as the other fields. The compile-time constants in `policy.ts` are the final default.
-
-Each threshold value must be a positive finite number. Non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent. The resolver falls back to the other channel or the defaults.
-
-`reasoningBlockCap` is an integer in `[-1, ∞)`. The default is `-1`, the passthrough sentinel where every block survives. `0` sends no reasoning blocks. Any positive integer is the count of blocks to keep from the latest. Non-integer, less than `-1`, `NaN`, and `Infinity` are all treated as absent. The resolver falls through to the env or default layer (`-1`).
-
-`intercomKeepLast` is the count-based knob for the Rule 1 pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `reasoningBlockCap`. The default is `-1`, the passthrough where every `intercom_message` entry survives.
-
-The Rule 1 pass is gated on the `intercom` tool being registered. Without the gating extension, the rule is inert regardless of the knob's value.
-
-`subagentNotifyKeepLast` is the count-based knob for the Rule 2b pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `intercomKeepLast`. The default is the resolved `intercomKeepLast` value. When `subagentNotifyKeepLast` is unset in both channels, the effective value equals the resolved `intercomKeepLast`.
-
-The Rule 2b pass is gated on the `intercom` tool being registered. This is the same gate as Rules 1 and 2. Without the gating extension, the rule is inert regardless of the knob's value. The pass runs after `dedupSubagentNotify`. It dedups first, then applies recency trim on the deduped stream.
-
-Chain and parallel completions emit on both `subagent-notify` and `intercom_message` surfaces. See the surface-split callout in the pre-budget collapse rule table above.
-
-`keepLastUserPrompts` is a positive integer N. It protects the last N operator-authored `role: "user"` messages from drop and summarize. The messages are counted from the latest. The protection applies regardless of the three-tier budget.
-
-The count is over all user messages. Already-protected ones still count toward N. Double-protection is harmless because the protection check is a boolean.
-
-The knob is protect-list-only. A user prompt outside the window is NOT condemned or force-dropped. It remains a normal trimmable candidate. It only gets dropped when the budget math requires it. `0`, negative, non-integer, `NaN`, and `Infinity` are treated as absent. The default is `10` when neither env nor JSON sets a value.
-
-`keepOriginalPrompt` is a boolean. It governs the eternal dispatch-slot protection on the first user message (`userTurnAge === 0`). When `true` (the default), the dispatch slot stays eternally protected regardless of the keep-last window. The original prompt survives even when it falls outside the last N.
-
-When `false`, the dispatch slot is protected only by `keepLastUserPrompts`. In-window is protected. Outside N is droppable. The original still counts toward the N count in both modes. The flag only governs the eternal-protection layer on top. The default is `true` when neither env nor JSON sets a value.
-
-`preservedPaths` is an optional list of patterns. Matching tool-result messages are protected from drop. Their tokens are subtracted from the trimmable budget.
-
-A bare filename like `AGENTS.md` is a **fuzzy** match. It matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match. The `~/` form is expanded to your home directory. For example, `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`.
-
-When `preservedPaths` is unset, no paths are preserved. When set, the matching patterns are protected from the trim budget.
+| Field | Type | Default | Validation | Env var |
+|-------|------|---------|------------|---------|
+| `personalityPath` | string (absolute path) | none (no personality section) | Unset/empty → no personality section. | `PI_CONTEXT_TRIMMER_PERSONALITY_PATH` |
+| `protectDispatch` | `"auto"` \| `true` \| `false` | `"auto"` (ON when `pi-subagents` installed) | `"auto"` is ON when `pi-subagents` is installed. Set `true` or `false` to force. | `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH` |
+| `preservedPaths` | string[] | none (no paths preserved) | Bare filename = **fuzzy** match (any file of that name). `/` or `~/` prefix = **absolute** match. `~/` expanded to home dir. Matching tool-results are protected from drop; their tokens are subtracted from the trimmable budget. | `PI_CONTEXT_TRIMMER_PRESERVED_PATHS` |
+| `tier1MaxTokens` | positive finite number | `VERBATIM_TIER_MAX_TOKENS` (`50_000`) | Non-numeric/zero/negative/`NaN`/`Infinity` → absent. Falls back to the other channel or the compile-time default. | `PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS` |
+| `tier2MaxTokens` | positive finite number | `SUMMARIZE_TIER_MAX_TOKENS` (`100_000`) | Same validation as `tier1MaxTokens`. | `PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS` |
+| `loopGuard` | `true` \| `false` | `true` (ON for every session) | The previous `"auto"` sentinel is no longer accepted. A `"auto"` value is treated as absent. The resolver falls through to the default `true`. | `PI_CONTEXT_TRIMMER_LOOP_GUARD` |
+| `loopGuardThreshold` | positive integer | `3` | Non-numeric/zero/negative → absent. Falls back to the default `3`. | `PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD` |
+| `loopGuardHardBlock` | positive integer | off | Values below the soft-nudge threshold are clamped up to it. | `PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK` |
+| `reasoningBlockCap` | integer in `[-1, ∞)` | `-1` (passthrough) | `0` sends none. A positive integer N keeps the last N. Non-integer/less than `-1`/`NaN`/`Infinity` → absent. | `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` |
+| `intercomKeepLast` | integer in `[-1, ∞)` | `-1` (passthrough) | Same validation as `reasoningBlockCap`. Gated on the `intercom` tool being registered; without it, the rule is inert. | `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` |
+| `subagentNotifyKeepLast` | integer in `[-1, ∞)` | resolved `intercomKeepLast` | When unset in both channels, the effective value equals the resolved `intercomKeepLast`. Same gate as `intercomKeepLast`. The pass runs after `dedupSubagentNotify`: dedup first, then recency trim. | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` |
+| `keepLastUserPrompts` | positive integer N | `10` | Protects the last N operator-authored `role: "user"` messages from drop and summarize. Protect-list-only: outside-N prompts remain trimmable, not force-dropped. `0`/negative/non-integer/`NaN`/`Infinity` → absent. | `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` |
+| `keepOriginalPrompt` | boolean | `true` | `true` = eternal dispatch-slot protection regardless of the keep-last window. `false` = the dispatch slot ages out under `keepLastUserPrompts`. The original counts toward N in both modes. | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` |
 
 ### Environment variables (override the file)
 
@@ -285,7 +239,7 @@ When `preservedPaths` is unset, no paths are preserved. When set, the matching p
 
 When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely. The wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing.
 
-The two trim-policy thresholds follow the same env-over-file-over-default precedence as every other field. The compile-time constants in `policy.ts` are the final fallback when neither channel sets a value. The pre-existing behaviour is preserved for operators who configure nothing.
+The pre-existing behaviour is preserved for operators who configure nothing.
 
 ## How the token count is computed
 
