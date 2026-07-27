@@ -260,14 +260,16 @@ The trimmable total is the sum of per-message tokens. The protected-slot tokens 
 
 ## Development
 
-Run the test suite (373 tests, ~1s on a modern laptop):
+Run the test suite (380 tests, ~1s on a modern laptop):
 
 ```bash
 npm install   # installs tsx as a dev dependency
 npm test
 ```
 
-The test runner is `tsx --test` (NOT `node --test` on `.ts` — native type-stripping without `"type": "module"` thrashes the CPU). Tests use deterministic in-process stubs.
+The test runner is `tsx --test`. Do not use `node --test` on `.ts` files. Native type-stripping without `"type": "module"` thrashes the CPU.
+
+Tests use deterministic in-process stubs.
 
 Project structure:
 
