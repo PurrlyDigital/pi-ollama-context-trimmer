@@ -198,8 +198,11 @@ The personality file is **opt-in**. It is machine-specific and carries no defaul
 
 There are two config channels. The fixed precedence is env, then file, then default.
 
-1. **Environment variables** (`PI_CONTEXT_TRIMMER_*`). These are useful for ad-hoc runs, CI, and tests.
-2. **Global config file** `~/.pi/agent/context-trimmer.json`. This is the persistent, filesystem-based channel. Use this channel when pi is launched by a non-interactive supervisor. A supervisor like systemd, launchd, or a container orchestrator does not inherit your shell environment. Put the paths in the JSON file instead of exporting them in a shell rc the supervisor never sources.
+The first channel is **environment variables** (`PI_CONTEXT_TRIMMER_*`). These are useful for ad-hoc runs, CI, and tests.
+
+The second channel is the **global config file** `~/.pi/agent/context-trimmer.json`. This is the persistent, filesystem-based channel. Use this channel when pi is launched by a non-interactive supervisor.
+
+A supervisor like systemd, launchd, or a container orchestrator does not inherit your shell environment. Put the paths in the JSON file instead of exporting them in a shell rc the supervisor never sources.
 
 ### Config file
 
@@ -229,21 +232,37 @@ All fields are optional. The file is read once at extension load. Restart pi to 
 
 `loopGuard` accepts `true` or `false`. The default is `true`, ON for every session. The previous `"auto"` sentinel is no longer accepted. A `"auto"` value in the file is treated as absent. The resolver falls through to the default `true`.
 
-The two tier-threshold fields are `tier1MaxTokens` and `tier2MaxTokens`. They follow the same env-over-file-over-default precedence as the other fields. The compile-time constants in `policy.ts` are the final default. Each threshold value must be a positive finite number. Non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent. The resolver falls back to the other channel or the defaults.
+The two tier-threshold fields are `tier1MaxTokens` and `tier2MaxTokens`. They follow the same env-over-file-over-default precedence as the other fields. The compile-time constants in `policy.ts` are the final default.
+
+Each threshold value must be a positive finite number. Non-numeric, zero, negative, `NaN`, and `Infinity` are all treated as absent. The resolver falls back to the other channel or the defaults.
 
 `reasoningBlockCap` is an integer in `[-1, ∞)`. The default is `-1`, the passthrough sentinel where every block survives. `0` sends no reasoning blocks. Any positive integer is the count of blocks to keep from the latest. Non-integer, less than `-1`, `NaN`, and `Infinity` are all treated as absent. The resolver falls through to the env or default layer (`-1`).
 
-`intercomKeepLast` is the count-based knob for the Rule 1 pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `reasoningBlockCap`. The default is `-1`, the passthrough where every `intercom_message` entry survives. The Rule 1 pass is gated on the `intercom` tool being registered. Without the gating extension, the rule is inert regardless of the knob's value.
+`intercomKeepLast` is the count-based knob for the Rule 1 pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `reasoningBlockCap`. The default is `-1`, the passthrough where every `intercom_message` entry survives.
 
-`subagentNotifyKeepLast` is the count-based knob for the Rule 2b pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `intercomKeepLast`. The default is the resolved `intercomKeepLast` value. When `subagentNotifyKeepLast` is unset in both channels, the effective value equals the resolved `intercomKeepLast`. The Rule 2b pass is gated on the `intercom` tool being registered. This is the same gate as Rules 1 and 2. Without the gating extension, the rule is inert regardless of the knob's value. The pass runs after `dedupSubagentNotify`. It dedups first, then applies recency trim on the deduped stream.
+The Rule 1 pass is gated on the `intercom` tool being registered. Without the gating extension, the rule is inert regardless of the knob's value.
+
+`subagentNotifyKeepLast` is the count-based knob for the Rule 2b pre-budget collapse. It is an integer in `[-1, ∞)`. It follows the same validation rules as `intercomKeepLast`. The default is the resolved `intercomKeepLast` value. When `subagentNotifyKeepLast` is unset in both channels, the effective value equals the resolved `intercomKeepLast`.
+
+The Rule 2b pass is gated on the `intercom` tool being registered. This is the same gate as Rules 1 and 2. Without the gating extension, the rule is inert regardless of the knob's value. The pass runs after `dedupSubagentNotify`. It dedups first, then applies recency trim on the deduped stream.
 
 Chain and parallel completions emit on both `subagent-notify` and `intercom_message` surfaces. See the surface-split callout in the pre-budget collapse rule table above.
 
-`keepLastUserPrompts` is a positive integer N. It protects the last N operator-authored `role: "user"` messages from drop and summarize. The messages are counted from the latest. The protection applies regardless of the three-tier budget. The count is over all user messages. Already-protected ones still count toward N. Double-protection is harmless because the protection check is a boolean. The knob is protect-list-only. A user prompt outside the window is NOT condemned or force-dropped. It remains a normal trimmable candidate. It only gets dropped when the budget math requires it. `0`, negative, non-integer, `NaN`, and `Infinity` are treated as absent. The default is `10` when neither env nor JSON sets a value.
+`keepLastUserPrompts` is a positive integer N. It protects the last N operator-authored `role: "user"` messages from drop and summarize. The messages are counted from the latest. The protection applies regardless of the three-tier budget.
 
-`keepOriginalPrompt` is a boolean. It governs the eternal dispatch-slot protection on the first user message (`userTurnAge === 0`). When `true` (the default), the dispatch slot stays eternally protected regardless of the keep-last window. The original prompt survives even when it falls outside the last N. When `false`, the dispatch slot is protected only by `keepLastUserPrompts`. In-window is protected. Outside N is droppable. The original still counts toward the N count in both modes. The flag only governs the eternal-protection layer on top. The default is `true` when neither env nor JSON sets a value.
+The count is over all user messages. Already-protected ones still count toward N. Double-protection is harmless because the protection check is a boolean.
 
-`preservedPaths` is an optional list of patterns. Matching tool-result messages are protected from drop. Their tokens are subtracted from the trimmable budget. A bare filename like `AGENTS.md` is a **fuzzy** match. It matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match. The `~/` form is expanded to your home directory. For example, `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`. When `preservedPaths` is unset, no paths are preserved. When set, the matching patterns are protected from the trim budget.
+The knob is protect-list-only. A user prompt outside the window is NOT condemned or force-dropped. It remains a normal trimmable candidate. It only gets dropped when the budget math requires it. `0`, negative, non-integer, `NaN`, and `Infinity` are treated as absent. The default is `10` when neither env nor JSON sets a value.
+
+`keepOriginalPrompt` is a boolean. It governs the eternal dispatch-slot protection on the first user message (`userTurnAge === 0`). When `true` (the default), the dispatch slot stays eternally protected regardless of the keep-last window. The original prompt survives even when it falls outside the last N.
+
+When `false`, the dispatch slot is protected only by `keepLastUserPrompts`. In-window is protected. Outside N is droppable. The original still counts toward the N count in both modes. The flag only governs the eternal-protection layer on top. The default is `true` when neither env nor JSON sets a value.
+
+`preservedPaths` is an optional list of patterns. Matching tool-result messages are protected from drop. Their tokens are subtracted from the trimmable budget.
+
+A bare filename like `AGENTS.md` is a **fuzzy** match. It matches any file of that name regardless of path. A pattern beginning with `/` or `~/` is an **absolute** match. The `~/` form is expanded to your home directory. For example, `~/secrets/keys.md` matches that one file at `$HOME/secrets/keys.md`.
+
+When `preservedPaths` is unset, no paths are preserved. When set, the matching patterns are protected from the trim budget.
 
 ### Environment variables (override the file)
 
