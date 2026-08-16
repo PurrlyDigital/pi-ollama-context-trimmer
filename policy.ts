@@ -110,6 +110,13 @@ export type TrimOptions = {
 	summarizeMaxTokens?: number;
 
 	/**
+	 * Provider-reported aggregate token total for the current context
+	 * event. When finite and positive, this value drives tier selection
+	 * against the raw caps because it includes system and protected mass.
+	 * Visible-content estimates still drive candidate sizing during drops.
+	 */
+	authoritativeTotalTokens?: number;
+	/**
 	 * The set of `customType` values that mark a message as a protected
 	 * slot (e.g. the agent-def / pinned-tier synthetic). Protected
 	 * custom-type messages are excluded from the budget, never
@@ -756,8 +763,10 @@ export async function applyThreeTierTrim(
 		? undefined
 		: Math.max(0, dropFloorTokens - systemPromptTokens - protectedMass);
 
-	// First, decide the tier based on the trimmable total.
-	const total = totalTrimmableTokens(
+	// Provider totals are aggregate counts, so they are compared with
+	// the raw caps. The estimator remains the fallback and the candidate
+	// mass signal used by the drop path.
+	const estimatedTotal = totalTrimmableTokens(
 		messages,
 		protectedCustomTypes,
 		protectDispatch,
@@ -768,10 +777,17 @@ export async function applyThreeTierTrim(
 		keepOriginalPrompt,
 		divisor,
 	);
+	const authoritativeTotal = options.authoritativeTotalTokens;
+	const hasAuthoritativeTotal = Number.isFinite(authoritativeTotal) && authoritativeTotal! > 0;
+	const total = hasAuthoritativeTotal ? authoritativeTotal! : estimatedTotal;
+	const tierVerbatimMax = hasAuthoritativeTotal ? verbatimMax : effectiveVerbatimMax;
+	const tierSummarizeMax = hasAuthoritativeTotal ? summarizeMax : effectiveSummarizeMax;
 
-	// Tier 3: hard-drop oldest whole turns until total ≤
-	// effectiveSummarizeMax.
-	if (total > effectiveSummarizeMax) {
+	// Tier 3: hard-drop oldest whole turns until the estimated
+	// trimmable remainder reaches its effective candidate cap. When
+	// only the provider total shows an overage, force the first eligible
+	// candidate cut so opaque reasoning can still make progress.
+	if (total > tierSummarizeMax) {
 		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
 			messages,
 			effectiveSummarizeMax,
@@ -784,6 +800,7 @@ export async function applyThreeTierTrim(
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
 			divisor,
+			hasAuthoritativeTotal && estimatedTotal <= effectiveSummarizeMax,
 		);
 		// Drop-floor fall-through: when the next-oldest turn would
 		// push the trimmable total below `dropFloorTokens`, stop
@@ -832,7 +849,7 @@ export async function applyThreeTierTrim(
 
 	// Tier 2: hold middle-band messages untouched (transient behavior;
 	// Tier 3 catches oversize if it grows further).
-	if (total > effectiveVerbatimMax) {
+	if (total > tierVerbatimMax) {
 		return {
 			messages: messages.slice(),
 			droppedTurns: 0,
@@ -874,6 +891,7 @@ function dropOldestTurns(
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
 	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
+	forceFirstDrop = false,
 ): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
 	// First pass: identify trimmable turns and their token mass.
 	// A follow-up user message starts a complete interactive turn so
@@ -955,7 +973,7 @@ function dropOldestTurns(
 	const dropSet = new Set<number>();
 	let shouldFallThrough = false;
 	for (const t of turns) {
-		if (remaining <= cap) break;
+		if (remaining <= cap && !(forceFirstDrop && dropSet.size === 0)) break;
 		if (dropFloorTokens !== undefined && remaining - t.tokens < dropFloorTokens) {
 			shouldFallThrough = true;
 			break;

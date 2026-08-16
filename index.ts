@@ -151,6 +151,23 @@ function usableAssistantUsage(msg: Record<string, unknown>): { input: number } |
 	return { input };
 }
 
+/** Return the latest usable provider aggregate for the current stream. */
+function latestProviderTotalTokens(rawMessages: ReadonlyArray<Record<string, unknown>>): number | undefined {
+	let latest: number | undefined;
+	for (const msg of rawMessages) {
+		if (msg.role !== "assistant") continue;
+		const stopReason = msg.stopReason;
+		if (stopReason === "aborted" || stopReason === "error") continue;
+		const usage = msg.usage;
+		if (typeof usage !== "object" || usage === null) continue;
+		const totalTokens = (usage as Record<string, unknown>).totalTokens;
+		if (typeof totalTokens === "number" && Number.isFinite(totalTokens) && totalTokens > 0) {
+			latest = totalTokens;
+		}
+	}
+	return latest;
+}
+
 /**
  * Derive a calibrated chars-per-token divisor from the first assistant
  * message in the stream that carries a usable `usage.input`. The
@@ -488,6 +505,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// once per hook and threaded as an immutable number through every
 		// downstream token-count call.
 		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
+		const authoritativeTotalTokens = latestProviderTotalTokens(rawMessages);
 		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
 		const systemPromptTokens = approximateTextTokens(systemPromptString, effectiveDivisor);
 		// Stamp userTurnAge on every message. The stamp is the source
@@ -689,6 +707,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			preservedPatterns: expandedPreservedPatterns,
 			protectedToolCallIds,
 			tokenEstimatorDivisor: effectiveDivisor,
+			authoritativeTotalTokens,
 			systemPromptTokens,
 			keepLastUserPrompts,
 			keepOriginalPrompt,
