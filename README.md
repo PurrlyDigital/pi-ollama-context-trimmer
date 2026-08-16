@@ -22,7 +22,7 @@ On every LLM call, the extension inspects the message stream. It applies a three
 |------|-------|--------|
 | Verbatim | 0–50k trimmable tokens | No action; the full message stream is sent. |
 | Hold | 50k–100k | Middle-band messages are held untouched (transient behavior; Tier 3 catches oversize if it grows further). |
-| Drop | 100k+ | The oldest whole trimmable turns (assistant + toolResult + custom between two user messages) are hard-dropped until the total is back under 100k. |
+| Drop | 100k+ | The oldest eligible turns are hard-dropped until the effective total is under tier 2. A drop stops before the configured tier 1 floor would be undershot. |
 
 Subagent protected inputs are **never** counted in the budget, **never** dropped:
 
@@ -131,7 +131,7 @@ Reasoning-capable models surface a `type:"thinking"` content block on assistant 
 
 The cap is a count-based gate on those blocks. It keeps the last N reasoning blocks, counted from the latest, and drops the rest. The cap is a count of blocks, not a measurement of tokens.
 
-The cap runs before the three-tier trim, before pinned injection, on every context event. Dropped reasoning blocks are never seen by the trim. The trim budget accounts for the post-cap mass. The pinned synthetic is never at risk. The cap runs unconditionally with no per-model branching.
+The cap runs before the three-tier trim, before pinned injection, on every context event. Dropped reasoning blocks are never seen by the trim. Surviving reasoning blocks remain eligible content: they are retained within tier 2 and can be removed oldest-first above tier 2. The pinned synthetic is never at risk. The cap runs unconditionally with no per-model branching.
 
 | Cap value | Effect |
 |-----------|--------|
@@ -172,6 +172,8 @@ The personality file is **opt-in**. It is machine-specific and carries no defaul
 | `VERBATIM_TIER_MAX_TOKENS` | `50_000` | Trimmable totals at or below this are returned verbatim. |
 | `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this fall into the drop tier. |
 
+The configured tier 1 token limit is also the drop floor. System-prompt and permanently protected mass are accounted for before the floor and tier 2 comparisons. Retained reasoning blocks and user prompts are budget-aware and can be removed oldest-first above tier 2.
+
 The pinned tier exposes one constant in `pinned-tier.ts`.
 
 | Constant | Default | Meaning |
@@ -196,7 +198,7 @@ Create `~/.pi/agent/context-trimmer.json`:
   "intercomKeepLast": -1,                                            // -1 passthrough (default), 0 send none, N keep last N
   "subagentNotifyKeepLast": -1,                                     // unset → falls through to intercomKeepLast
   "keepLastUserPrompts": 10,                                        // default 10; 0/negative/absent → no-op
-  "keepOriginalPrompt": true                                        // default true; false → original ages out under keepLastUserPrompts
+  "keepOriginalPrompt": true                                        // default true; false → original is eligible above tier 2
 }
 ```
 
@@ -215,8 +217,8 @@ All fields are optional. The file is read once at extension load. Restart pi to 
 | `reasoningBlockCap` | integer in `[-1, ∞)` | `-1` (passthrough) | `0` sends none. A positive integer N keeps the last N. Non-integer/less than `-1`/`NaN`/`Infinity` → absent. | `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` |
 | `intercomKeepLast` | integer in `[-1, ∞)` | `-1` (passthrough) | Same validation as `reasoningBlockCap`. Gated on the `intercom` tool being registered; without it, the rule is inert. | `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` |
 | `subagentNotifyKeepLast` | integer in `[-1, ∞)` | resolved `intercomKeepLast` | When unset in both channels, the effective value equals the resolved `intercomKeepLast`. Same gate as `intercomKeepLast`. The pass runs after `dedupSubagentNotify`: dedup first, then recency trim. | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` |
-| `keepLastUserPrompts` | positive integer N | `10` | Protects the last N operator-authored `role: "user"` messages from drop and summarize. Protect-list-only: outside-N prompts remain trimmable, not force-dropped. `0`/negative/non-integer/`NaN`/`Infinity` → absent. | `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` |
-| `keepOriginalPrompt` | boolean | `true` | `true` = eternal dispatch-slot protection regardless of the keep-last window. `false` = the dispatch slot ages out under `keepLastUserPrompts`. The original counts toward N in both modes. | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` |
+| `keepLastUserPrompts` | positive integer N | `10` | Retains the last N operator-authored `role: "user"` messages while the effective total is within tier 2. Above tier 2, retained prompts remain eligible for oldest-first trimming. `0`/negative/non-integer/`NaN`/`Infinity` → absent. | `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` |
+| `keepOriginalPrompt` | boolean | `true` | `true` = permanent dispatch-slot protection. `false` = the dispatch slot is eligible for oldest-first trimming above tier 2. The original counts toward N in both modes. | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` |
 
 ### Environment variables (override the file)
 
@@ -233,8 +235,8 @@ All fields are optional. The file is read once at extension load. Restart pi to 
 | `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` | Integer in `[-1, ∞)`. The count of `type:"thinking"` blocks to keep per message stream. See the `reasoningBlockCap` field above for the full validation rules. |
 | `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` | Integer in `[-1, ∞)`. The count of `intercom_message` entries to keep per message stream. See the `intercomKeepLast` field above for the full validation rules. |
 | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` | Integer in `[-1, ∞)`. The count of `subagent-notify` entries to keep per message stream. See the `subagentNotifyKeepLast` field above for the full validation rules. |
-| `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` | Positive integer N: the last N operator-authored `role: "user"` messages are protected from drop and summarize. See the `keepLastUserPrompts` field above for the full validation rules. |
-| `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` | `1` keeps the dispatch slot eternally protected (the default). `0` removes the eternal protection so the original ages out under `keepLastUserPrompts`. See the `keepOriginalPrompt` field above for the full validation rules. |
+| `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` | Positive integer N: the last N operator-authored `role: "user"` messages are retained within tier 2 and remain eligible for oldest-first trimming above tier 2. See the `keepLastUserPrompts` field above for the full validation rules. |
+| `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` | `1` keeps the dispatch slot permanently protected (the default). `0` makes it eligible for oldest-first trimming above tier 2. See the `keepOriginalPrompt` field above for the full validation rules. |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Override the config-file location (default `~/.pi/agent/context-trimmer.json`). Useful for tests or operators who keep config elsewhere. |
 
 When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped entirely. The wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing.

@@ -69,7 +69,7 @@ import {
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
 	REASONING_BLOCK_CAP_DEFAULT,
-	SUMMARIZE_TIER_MAX_TOKENS,
+	VERBATIM_TIER_MAX_TOKENS,
 	shouldHardBlock,
 	type TrimmableMessage,
 } from "./policy.ts";
@@ -656,16 +656,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// with `~/` expanded at the wiring layer to the operator's
 		// home directory (the pure predicate receives the expanded
 		// pattern; it never reads `os.homedir()` itself).
-		// Drop-floor: a percentage of the effective summarize cap,
-		// resolved to a token count at the wiring layer (the policy
-		// receives the resolved numeric `dropFloorTokens`, not the
-		// operator-configurable percentage). Per AC-3 the compile-time
-		// default is 50% — the no-acknowledge operator still gets a
-		// bound that engages when a whole-turn drop would collapse
-		// the trimmable total below half the summarize cap.
-		const effectiveSummarizeMaxTokens = cfg.tier2MaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
-		const dropFloorPercent = cfg.dropFloorPercent ?? 50;
-		const dropFloorTokens = Math.trunc((dropFloorPercent / 100) * effectiveSummarizeMaxTokens);
+		// Drop-floor: use the configured tier 1 token limit as the
+		// sole floor authority. The policy subtracts system-prompt and
+		// permanently protected mass before applying this floor.
+		const dropFloorTokens = Math.trunc(cfg.tier1MaxTokens ?? VERBATIM_TIER_MAX_TOKENS);
 		// Recency-floor: integer-coerced token count passed through
 		// to the policy unchanged in shape. Per AC-3 the compile-time
 		// default is `undefined` (off; recency protection is operator
@@ -680,10 +674,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// the unset-channel path.
 		const keepLastUserPrompts =
 			cfg.keepLastUserPrompts !== undefined ? Math.trunc(cfg.keepLastUserPrompts) : 10;
-		// Keep-original-prompt: boolean governing the eternal dispatch-slot
+		// Keep-original-prompt: boolean governing permanent dispatch-slot
 		// protection on the first user prompt. Default `true` preserves
-		// the current dispatch behavior; `false` lets the original age
-		// out under keep-last-user-prompts.
+		// the current dispatch behavior; `false` makes the original
+		// eligible for oldest-first trimming above tier 2.
 		const keepOriginalPrompt = cfg.keepOriginalPrompt ?? true;
 		const result = await applyThreeTierTrim(withPinned, {
 			verbatimMaxTokens: cfg.tier1MaxTokens,

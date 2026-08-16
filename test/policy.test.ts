@@ -1680,7 +1680,7 @@ describe("computeKeepLastUserPromptsProtectedIndices", () => {
 
 // ─── isProtectedSlot — keepLastUserPrompts + keepOriginalPrompt ────────
 
-describe("isProtectedSlot — keepLastUserPrompts channel", () => {
+describe("isProtectedSlot — budget-aware retention channels", () => {
 	const dispatch: TrimmableMessage = userMsg("dispatch", 0);
 	const u1: TrimmableMessage = userMsg("u1", 1);
 	const u2: TrimmableMessage = userMsg("u2", 2);
@@ -1689,10 +1689,9 @@ describe("isProtectedSlot — keepLastUserPrompts channel", () => {
 	it("protects a user message in the keep-last set", () => {
 		const messages = [dispatch, u1, u2];
 		const keepSet = new Set([2]);
-		// keepOriginalPrompt defaults true, so dispatch (index 0) is
-		// protected by the dispatch branch; u2 is protected by the
-		// keepLast branch.
-		assert.equal(isProtectedSlot(u2, 2, messages, new Set(), true, [], new Set(), new Set(), keepSet, true), true);
+		// The keep-last set controls retention ordering, not permanent
+		// protection. The prompt remains eligible above tier 2.
+		assert.equal(isProtectedSlot(u2, 2, messages, new Set(), true, [], new Set(), new Set(), keepSet, true), false);
 	});
 
 	it("does not protect a user message outside the keep-last set (keepOriginalPrompt false)", () => {
@@ -1716,8 +1715,8 @@ describe("isProtectedSlot — keepLastUserPrompts channel", () => {
 	it("keepOriginalPrompt false with dispatch in the keep-last set → protected by keepLast, not by dispatch branch", () => {
 		const messages = [dispatch, u1, u2];
 		const keepSet = new Set([0, 2]); // dispatch + u2
-		assert.equal(isProtectedSlot(dispatch, 0, messages, new Set(), true, [], new Set(), new Set(), keepSet, false), true);
-		assert.equal(isProtectedSlot(u2, 2, messages, new Set(), true, [], new Set(), new Set(), keepSet, false), true);
+		assert.equal(isProtectedSlot(dispatch, 0, messages, new Set(), true, [], new Set(), new Set(), keepSet, false), false);
+		assert.equal(isProtectedSlot(u2, 2, messages, new Set(), true, [], new Set(), new Set(), keepSet, false), false);
 	});
 
 	it("keepOriginalPrompt false with empty keep-last set → dispatch is droppable", () => {
@@ -1730,9 +1729,9 @@ describe("isProtectedSlot — keepLastUserPrompts channel", () => {
 		const messages = [dispatch, pinnedMsg("p"), toolResultMsg("r"), assistant];
 		const keepSet = new Set([1, 2, 3]);
 		// The keepLast branch only fires for messages in the set; but
-		// pinned/toolResult may be protected by OTHER channels. Here
-		// we pass empty protectedCustomTypes so only keepLast applies.
-		assert.equal(isProtectedSlot(pinnedMsg("p"), 1, messages, new Set(), true, [], new Set(), new Set(), keepSet, true), true);
+		// Pinned/toolResult may be protected by other channels. Here
+		// the retention set alone does not make them permanent.
+		assert.equal(isProtectedSlot(pinnedMsg("p"), 1, messages, new Set(), true, [], new Set(), new Set(), keepSet, true), false);
 		// assistant is not in any protected set (no toolCallId channel).
 		// Use a fresh assistant not in keepSet:
 		const asst = assistantMsg("x");
@@ -1774,11 +1773,8 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 	});
 
 	it("keepLastUserPrompts subtracts the last N user-prompt tokens from the trimmable budget", async () => {
-		// The observable effect of keepLastUserPrompts is budget math:
-		// the last N user prompts' tokens are subtracted from the
-		// trimmable budget. The pure totalTrimmableTokens reflects this
-		// — the trimmable total is lower when more user prompts are
-		// protected.
+		// The retention selection is budget-aware rather than permanent
+		// protection, so it does not alter the trimmable total.
 		const messages = buildSession(20);
 		const keepSet0 = computeKeepLastUserPromptsProtectedIndices(messages, 0);
 		const keepSet20 = computeKeepLastUserPromptsProtectedIndices(messages, 20);
@@ -1786,9 +1782,9 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 		const recencySet20 = computeRecencyProtectedIndices(messages, undefined, new Set(), true, [], keepSet20, new Set(), true);
 		const total0 = totalTrimmableTokens(messages, new Set(), true, [], recencySet0, new Set(), keepSet0, true);
 		const total20 = totalTrimmableTokens(messages, new Set(), true, [], recencySet20, new Set(), keepSet20, true);
-		// keepLastUserPrompts=20 → 20 user prompts protected → their
-		// tokens are NOT in the trimmable total → total20 < total0.
-		assert.equal(total20 < total0, true);
+		// Both selections remain eligible above tier 2 and contribute
+		// equally to the trimmable total.
+		assert.equal(total20, total0);
 	});
 
 	it("protect-list-only: under-budget conversation keeps ALL user prompts (no forced drop)", async () => {
@@ -1832,12 +1828,12 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 		// unprotected user-anchor tokens count). keepLastUserPrompts=0
 		// does not protect any follow-up user prompts.
 		assert.equal(total > 0, true);
-		// Compare to keepLast=20: the trimmable total is strictly lower
-		// (20 user prompts protected → their tokens subtracted).
+		// Compare to keepLast=20: the trimmable total is unchanged
+		// because the selection is budget-aware.
 		const keepSet20 = computeKeepLastUserPromptsProtectedIndices(messages, 20);
 		const recencySet20 = computeRecencyProtectedIndices(messages, undefined, new Set(), true, [], keepSet20, new Set(), true);
 		const total20 = totalTrimmableTokens(messages, new Set(), true, [], recencySet20, new Set(), keepSet20, true);
-		assert.equal(total20 < total, true);
+		assert.equal(total20, total);
 	});
 
 	it("composes with recencyFloor without conflict (additive-OR)", async () => {
@@ -1857,5 +1853,82 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 		const survivors = result.messages.filter((m) => m.role === "user");
 		assert.equal(survivors.length >= 3, true);
 		assert.equal(result.messages.length > 0, true);
+	});
+
+	it("retains reasoning and user prompts within tier 2", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [{ type: "thinking", thinking: "reasoning that remains visible" }] },
+			userMsg("retained prompt", 1),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 10,
+			summarizeMaxTokens: 100,
+			keepLastUserPrompts: 1,
+			keepOriginalPrompt: false,
+		});
+		assert.equal(result.droppedTurns, 0);
+		assert.equal(result.messages.length, messages.length);
+	});
+
+	it("keeps the prune reminder outside the post-drop budget", async () => {
+		const body = "z".repeat(180);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			userMsg("first", 1),
+			assistantMsg(body),
+			userMsg("second", 2),
+			assistantMsg(body),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 10,
+			summarizeMaxTokens: 100,
+			dropFloorTokens: 0,
+			protectDispatch: false,
+		});
+		assert.ok(result.droppedTurns >= 1);
+		assert.ok(result.totalTokens <= 100);
+		assert.equal(result.messages.filter((m) => m.customType === "context-trimmer-prune-reminder").length, 1);
+	});
+
+	it("drops the oldest reasoning and retained prompt content above tier 2", async () => {
+		const body = "x".repeat(180);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			{ role: "assistant", content: [{ type: "thinking", thinking: body }] },
+			userMsg("old prompt", 1),
+			assistantMsg(body),
+			userMsg("new prompt", 2),
+			assistantMsg(body),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 10,
+			summarizeMaxTokens: 100,
+			dropFloorTokens: 0,
+			keepLastUserPrompts: 2,
+			keepOriginalPrompt: false,
+		});
+		assert.ok(result.droppedTurns >= 1);
+		assert.equal(result.messages.some((m) => m.role === "user" && m.content === "old prompt"), false);
+		assert.equal(result.messages.some((m) => m.role === "user" && m.content === "new prompt"), true);
+	});
+
+	it("uses tier 1 as the effective drop floor", async () => {
+		const body = "y".repeat(180);
+		const messages: TrimmableMessage[] = [
+			userMsg("dispatch", 0),
+			userMsg("first", 1),
+			assistantMsg(body),
+			userMsg("second", 2),
+			assistantMsg(body),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 20,
+			summarizeMaxTokens: 100,
+			dropFloorTokens: 70,
+			keepOriginalPrompt: true,
+		});
+		assert.equal(result.droppedTurns, 0);
+		assert.equal(result.messages.length, messages.length);
 	});
 });

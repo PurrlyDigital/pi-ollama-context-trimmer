@@ -68,11 +68,8 @@ export interface ContextTrimmerConfig {
 	 *  with `Math.trunc` if the consumer needs
 	 *  an integer. */
 	readonly tokenEstimatorDivisor?: number;
-	/** Optional drop-tier floor as a percentage (0, 100] of the
-	 *  trimmable budget. Overrides the policy default when set. */
-	readonly dropFloorPercent?: number;
-	/** Optional recency-floor token count. Overrides the policy
-	 *  default when set. */
+	/** Optional recency-retention token count. Selected content remains
+	 *  eligible for oldest-first trimming above tier 2. */
 	readonly recencyFloor?: number;
 	/** Loop-guard enable mode. `true` (default) turns the guard ON
 	 *  for every session; `false` turns it off. Overrides the policy
@@ -126,9 +123,9 @@ export interface ContextTrimmerConfig {
 	 *  `DEFAULT_INTERCOM_KEEP_LAST`). */
 	readonly subagentNotifyKeepLast?: number;
 	/** Keep-last-user-prompts count. The wiring layer (in the context
-	 *  handler) protects the last N operator-authored `role: "user"`
-	 *  messages from drop and summarize regardless of the three-tier
-	 *  budget. Positive integer = keep last N; `undefined`, `0`,
+	 *  handler) retains the last N operator-authored `role: "user"`
+	 *  messages within tier 2 and leaves them eligible above tier 2.
+	 *  Positive integer = keep last N; `undefined`, `0`,
 	 *  negative, non-integer, `NaN`, and `Infinity` are treated as
 	 *  absent (the channel is a no-op at the policy layer). The
 	 *  wiring layer applies the default `10` when neither env nor
@@ -138,10 +135,9 @@ export interface ContextTrimmerConfig {
 	readonly keepLastUserPrompts?: number;
 	/** Keep-original-prompt toggle. When `true` (the default), the
 	 *  first user message (dispatch slot, `userTurnAge === 0`) is
-	 *  eternally protected from drop regardless of the
+	 *  permanently protected from drop regardless of the
 	 *  keep-last-user-prompts window. When `false`, the dispatch slot
-	 *  is protected ONLY by keep-last-user-prompts: in-window →
-	 *  protected, outside N → droppable. The original still counts
+	 *  is eligible for oldest-first trimming above tier 2. The original still counts
 	 *  toward the N count in both modes. Tandem with the
 	 *  `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` env var per
 	 *  Rule 9. */
@@ -173,7 +169,6 @@ export const ENV = {
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
 	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
 	tokenEstimatorDivisor: "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR",
-	dropFloorPercent: "PI_CONTEXT_TRIMMER_DROP_FLOOR_PERCENT",
 	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
 	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
@@ -206,7 +201,6 @@ export interface ParsedConfigFile {
 	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
 	 *  default when neither channel sets a value. */
 	tokenEstimatorDivisor?: number;
-	dropFloorPercent?: number;
 	recencyFloor?: number;
 	loopGuard?: LoopGuardMode;
 	loopGuardThreshold?: number;
@@ -249,9 +243,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.tokenEstimatorDivisor)) {
 		out.tokenEstimatorDivisor = o.tokenEstimatorDivisor;
-	}
-	if (isDropFloorPercent(o.dropFloorPercent)) {
-		out.dropFloorPercent = o.dropFloorPercent;
 	}
 	if (isPositiveNumber(o.recencyFloor)) {
 		out.recencyFloor = o.recencyFloor;
@@ -318,8 +309,6 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
 	const tokenEstimatorDivisor =
 		parseNumberEnv(env[ENV.tokenEstimatorDivisor]) ?? file.tokenEstimatorDivisor;
-	const dropFloorPercent =
-		parsePercentEnv(env[ENV.dropFloorPercent]) ?? file.dropFloorPercent;
 	const recencyFloor =
 		parseNumberEnv(env[ENV.recencyFloor]) ?? file.recencyFloor;
 
@@ -392,7 +381,6 @@ export function resolveConfig(opts: {
 		tier1MaxTokens,
 		tier2MaxTokens,
 		tokenEstimatorDivisor,
-		dropFloorPercent,
 		recencyFloor,
 		loopGuard,
 		loopGuardThreshold,
@@ -426,15 +414,6 @@ function isPositiveNumber(v: unknown): v is number {
 	return typeof v === "number" && Number.isFinite(v) && v > 0;
 }
 
-/** Type guard: a value is a finite number in the open-closed interval
- *  (0, 100]. Used to validate the drop-floor percent field; non-numeric,
- *  zero, negative, greater than 100, `NaN`, and `Infinity` are all
- *  treated as absent so the resolver falls through to the next
- *  precedence layer. */
-function isDropFloorPercent(v: unknown): v is number {
-	return typeof v === "number" && Number.isFinite(v) && v > 0 && v <= 100;
-}
-
 /** Type guard: a value is an integer in [-1, ∞). Used to validate the
  *  reasoning-block count cap; `-1` is the passthrough sentinel, `0`
  *  means "send none", and any positive integer is the count of blocks
@@ -466,18 +445,6 @@ function parseNumberEnv(s: string | undefined): number | undefined {
 	if (trimmed === undefined) return undefined;
 	const n = Number(trimmed);
 	return isPositiveNumber(n) ? n : undefined;
-}
-
-/** Parse an env-var value as a finite number in (0, 100]. The empty
- *  string (and all-whitespace) returns `undefined` so the caller can
- *  fall through to the next precedence layer; non-numeric, zero,
- *  negative, greater than 100, `NaN`, and `Infinity` likewise return
- *  `undefined`. */
-function parsePercentEnv(s: string | undefined): number | undefined {
-	const trimmed = nonEmpty(s);
-	if (trimmed === undefined) return undefined;
-	const n = Number(trimmed);
-	return isDropFloorPercent(n) ? n : undefined;
 }
 
 /** Parse an env-var value as an integer in [-1, ∞). The empty string
