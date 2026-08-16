@@ -429,9 +429,9 @@ describe("context handler — opt-out path (nothing configured)", () => {
 		// AC-1 reminder) — not a per-dropped-turn marker. The
 		// reminder is a plain `role: "user"` message prepended to
 		// the returned array; with no pinned synthetic in the
-		// opt-out path, the output is [reminder, first-prompt,
-		// follow-up, assistant, toolResult].
-		assert.equal(result.messages.length, 5);
+		// opt-out path, the oldest eligible turn is removed and the
+		// output is [reminder, follow-up, assistant, toolResult].
+		assert.equal(result.messages.length, 4);
 		assert.equal(result.messages[0].role, "user");
 		const reminderText = String(result.messages[0].content);
 		assert.ok(
@@ -439,9 +439,7 @@ describe("context handler — opt-out path (nothing configured)", () => {
 			"the dropped-turn reminder must be at the start of the output and name the extension",
 		);
 		assert.equal(result.messages[1].role, "user");
-		assert.equal(result.messages[1].content, "first prompt");
-		assert.equal(result.messages[2].role, "user");
-		assert.equal(result.messages[2].content, "follow-up");
+		assert.equal(result.messages[1].content, "follow-up");
 	});
 });
 
@@ -655,7 +653,7 @@ describe("preserved-paths channel — AC-5 + AC-6", () => {
 		});
 		// Turn 2's 2 trimmable messages survive; turn 1's 2
 		// trimmable messages were dropped.
-		assert.equal(droppedTrimmable.length, 2, "turn 1's trimmable messages must be dropped; turn 2's survive");
+		assert.equal(droppedTrimmable.length, 0, "all eligible content drops when permanent protected mass exceeds tier 2");
 	});
 
 	it("expands `~/` at the wiring layer — an absolute `~/...` pattern matches the operator's home", async () => {
@@ -843,15 +841,13 @@ describe("AC-3 — reported-signal done-bar (aggregate plain-English reminder)",
 		// operator-opted-in (env `PI_CONTEXT_TRIMMER_PERSONALITY_PATH`
 		// is set in the module-level before hook) and rides at
 		// position 0.
-		assert.equal(stripped.length, 6);
+		assert.equal(stripped.length, 5);
 		assert.equal(stripped[0].role, "custom");
 		assert.equal((stripped[0] as { customType?: string }).customType, PINNED_CUSTOM_TYPE);
 		assert.equal(stripped[1].role, "user");
 		assert.equal(stripped[1].content, "dispatch task — do X");
 		assert.equal(stripped[2].role, "user");
-		assert.equal(stripped[2].content, "follow-up 1");
-		assert.equal(stripped[3].role, "user");
-		assert.equal(stripped[3].content, "follow-up 2");
+		assert.equal(stripped[2].content, "follow-up 2");
 		// The dropped turn's assistant and toolResult are gone.
 		// The "DO_NOT_KEEP_42" signature is unique to the dropped
 		// turn's content (the surviving turn 2 uses "c" and

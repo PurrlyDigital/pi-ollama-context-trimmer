@@ -69,6 +69,7 @@ export const TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3;
 const PRUNE_REMINDER_TEXT =
 	"The Context Trimmer extension has automatically pruned older things in context that weren't asked to be kept. " +
 	"If you need something that was cut, get it fresh.";
+const PRUNE_REMINDER_CUSTOM_TYPE = "context-trimmer-prune-reminder";
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -140,24 +141,21 @@ export type TrimOptions = {
 	preservedPatterns?: ReadonlyArray<string>;
 	/**
 	 * The lower bound the tier-3 drop must not undershoot by dropping a
-	 * whole turn. When set, `dropOldestTurns` stops one step before the
-	 * remaining trimmable mass would dip below this floor; the
-	 * fall-through returns the surviving messages as-is (the summarize
-	 * path was removed; this is the transient hold-untouched seam).
+	 * whole turn. The wiring supplies the configured tier 1 limit. The
+	 * policy adjusts it for system-prompt and permanent protected mass,
+	 * then stops one step before the remaining trimmable mass would dip
+	 * below this effective floor.
 	 * `undefined` or non-positive values disable the floor
 	 * (legacy behavior: drop until the trimmable total ≤
 	 * `summarizeMaxTokens`).
 	 */
 	dropFloorTokens?: number;
 	/**
-	 * A token count; the most-recent-N-tokens of trimmable content
-	 * protected from drop. The recency slice is computed
-	 * once at the top of `applyThreeTierTrim` and threaded through
-	 * every internal call; messages in the slice are treated as
-	 * protected (additive OR with the existing channels) and excluded
-	 * from the trimmable budget. `undefined` or non-positive values
-	 * disable recency protection (legacy behavior: every trimmable
-	 * message is a candidate for drop).
+	 * A token count selecting the most-recent trimmable content while
+	 * the effective total is within tier 2. The slice is computed once
+	 * at the top of `applyThreeTierTrim` and threaded through internal
+	 * calls so it can guide oldest-first eligibility above tier 2.
+	 * `undefined` or non-positive values disable recency selection.
 	 */
 	recencyFloor?: number;
 
@@ -225,11 +223,10 @@ export type TrimOptions = {
 	 */
 	systemPromptTokens?: number;
 	/**
-	 * A positive integer N: the last N operator-authored `role: "user"`
-	 * messages (counted from the latest) are protected from drop and
-	 * summarize regardless of the three-tier budget. The count is over
-	 * ALL user messages (already-protected ones still count toward N;
-	 * double-protection is harmless — `isProtectedSlot` is a boolean).
+	 * A positive integer N selecting the last N operator-authored
+	 * `role: "user"` messages (counted from the latest) for retention
+	 * within tier 2. Above tier 2, selected messages remain eligible
+	 * for oldest-first trimming. The count is over ALL user messages.
 	 * `undefined`, `0`, negative, non-integer, `NaN`, and `Infinity` are
 	 * treated as absent so the channel is a no-op (legacy behavior).
 	 * The wiring layer resolves this from the
@@ -240,14 +237,11 @@ export type TrimOptions = {
 	keepLastUserPrompts?: number;
 	/**
 	 * When `true` (the default), the first user message (the dispatch
-	 * slot, `userTurnAge === 0`) is eternally protected from drop
-	 * regardless of the keep-last-user-prompts window — the original
-	 * prompt survives even when it falls outside the last N. When
-	 * `false`, the dispatch slot is protected ONLY by the
-	 * keep-last-user-prompts channel: in-window → protected,
-	 * outside N → droppable. The original still counts toward the N
-	 * count in both modes; this flag only governs the eternal-protection
-	 * layer on top. The wiring layer resolves this from the
+	 * slot, `userTurnAge === 0`) is permanently protected regardless
+	 * of the keep-last-user-prompts window. When `false`, the dispatch
+	 * slot is eligible for oldest-first trimming above tier 2. The
+	 * original still counts toward the N count in both modes. The
+	 * wiring layer resolves this from the
 	 * `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` env var and the
 	 * `keepOriginalPrompt` JSON key, with default `true`.
 	 */
@@ -491,12 +485,9 @@ function carveProtectedToolCallBlocks(
  * Walk backward from the end of the messages array counting
  * `role === "user"` messages until `keepLastUserPrompts` of them
  * are collected, returning the set of those messages' indices. The
- * count is over ALL user messages (Option B): already-protected
- * user messages (e.g. the dispatch slot when `keepOriginalPrompt` is
- * on, or a user message inside the recency floor) still count toward
- * the N window — the additive-OR in `isProtectedSlot` keeps
- * double-protection harmless (`isProtectedSlot` is a boolean, so
- * there is no double-subtraction in the budget math).
+ * count is over ALL user messages, including dispatch and recency
+ * selections. The result guides retention ordering while the stream
+ * is within tier 2; it is not permanent protection.
  *
  * `keepLastUserPrompts <= 0` or `undefined` → empty set (no
  * keep-last-user-prompts protection).
@@ -524,21 +515,17 @@ export function computeKeepLastUserPromptsProtectedIndices(
 // ─── Recency-floor helper (recency channel) ─────────────────────
 
 /**
- * Walk backward from the end of the messages array, SKIPPING
- * already-protected messages (dispatch via `userTurnAge === 0`,
- * pinned `customType` in `protectedCustomTypes`, or preserved-path
- * matches), accumulating trimmable tokens until the
- * `recencyFloorTokens` threshold is reached. Returns the set of
- * TRIMMABLE-message indices in `[stopIndex, end)`.
+ * Walk backward from the end of the messages array, skipping
+ * permanently protected messages, accumulating trimmable tokens until
+ * the `recencyFloorTokens` threshold is reached. Returns the selected
+ * message indices for budget-aware retention.
  *
  * The recency slice is the "most-recent-N-tokens of trimmable
- * content" the operator asked to protect. The slice is computed
- * once at the top of `applyThreeTierTrim` and threaded through
- * every internal call as an additive OR with the existing
- * protected-slot checks. Already-protected messages are
- * **excluded** from the recency slice — they are already
- * subtracted from the budget by their own channels, so including
- * them here would double-subtract.
+ * content" the operator asked to retain within tier 2. The slice is
+ * computed once at the top of `applyThreeTierTrim` and threaded through
+ * every internal call as an eligibility signal. Permanently protected
+ * messages are excluded because their mass is already handled by the
+ * protected-slot budget.
  *
  * `recencyFloorTokens <= 0` or `undefined` → empty set (no recency
  * protection, legacy behavior).
@@ -585,8 +572,10 @@ export function isProtectedSlot(
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
 ): boolean {
-	// Agent-def / pinned-tier synthetic.
-	if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
+	// Synthetic slots identified by customType are protected regardless
+	// of their role. Some model-facing notices use role `user` so the
+	// provider includes their text in the prompt.
+	if (msg.customType && protectedCustomTypes.has(msg.customType)) {
 		return true;
 	}
 	// Preserved-path slot: the message's stamped source path matches a
@@ -596,21 +585,10 @@ export function isProtectedSlot(
 	if (isPathPreserved(extractSourcePath(msg), preservedPatterns)) {
 		return true;
 	}
-	// Recency-floor slot: a trimmable message in the most-recent
-	// recency window whose drop or summarize would violate the
-	// operator's recency floor. Independent of the three channels
-	// above; the OR is additive.
-	if (recencyProtectedIndices.has(index)) {
-		return true;
-	}
-	// Keep-last-user-prompts slot: one of the last N operator-authored
-	// user messages (counted from the latest). Independent of the
-	// channels above; the OR is additive. Double-protection with an
-	// earlier channel is harmless — `isProtectedSlot` is a boolean, so
-	// there is no double-subtraction in the budget math.
-	if (keepLastUserPromptsProtectedIndices.has(index)) {
-		return true;
-	}
+	// Recency-floor and keep-last-user-prompts selections are
+	// budget-aware retention inputs, not permanent protection. They
+	// survive while the effective total is within tier 2 and become
+	// eligible for oldest-first trimming above tier 2.
 	// Pair-atomic toolCall/toolResult protection: a `toolResult`
 	// whose top-level `toolCallId` is in the protected-toolCall-id
 	// set is protected by association with the assistant `toolCall`
@@ -714,7 +692,8 @@ export async function applyThreeTierTrim(
 ): Promise<TrimResult> {
 	const verbatimMax = options.verbatimMaxTokens ?? VERBATIM_TIER_MAX_TOKENS;
 	const summarizeMax = options.summarizeMaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
-	const protectedCustomTypes = options.protectedCustomTypes ?? new Set<string>();
+	const protectedCustomTypes = new Set(options.protectedCustomTypes ?? []);
+	protectedCustomTypes.add(PRUNE_REMINDER_CUSTOM_TYPE);
 	const protectDispatch = options.protectDispatch ?? true;
 	const preservedPatterns = options.preservedPatterns ?? [];
 	const dropFloorTokens = options.dropFloorTokens;
@@ -773,6 +752,9 @@ export async function applyThreeTierTrim(
 	// and the system-prompt term.
 	const effectiveVerbatimMax = Math.max(0, verbatimMax - systemPromptTokens - protectedMass);
 	const effectiveSummarizeMax = Math.max(0, summarizeMax - systemPromptTokens - protectedMass);
+	const effectiveDropFloor = dropFloorTokens === undefined
+		? undefined
+		: Math.max(0, dropFloorTokens - systemPromptTokens - protectedMass);
 
 	// First, decide the tier based on the trimmable total.
 	const total = totalTrimmableTokens(
@@ -796,7 +778,7 @@ export async function applyThreeTierTrim(
 			protectedCustomTypes,
 			protectDispatch,
 			preservedPatterns,
-			dropFloorTokens,
+			effectiveDropFloor,
 			recencyProtectedIndices,
 			protectedToolCallIds,
 			keepLastUserPromptsProtectedIndices,
@@ -893,47 +875,36 @@ function dropOldestTurns(
 	keepOriginalPrompt = true,
 	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 ): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
-	// First pass: identify the trimmable turns and their token mass.
-	// A trimmable turn is anchored at every model-invocation
-	// boundary — both follow-up user prompts and assistant turns —
-	// and runs to the next boundary (exclusive) or to a protected
-	// custom slot. Anchoring on assistant turns subdivides an
-	// autonomous session (one dispatch + a long assistant<->toolResult
-	// tail with no follow-up user message) into droppable
-	// per-assistant units instead of one bulk turn the drop-floor
-	// guard cannot shed. When dispatch protection is OFF, every
-	// user message is an anchor; when ON, the dispatch
-	// (userTurnAge === 0) is NOT an anchor. Assistants have no
-	// dispatch carve-out (dispatch slots are user messages).
-	//
-	// A user anchor opens the next turn AFTER the user message; an
-	// assistant anchor opens the next turn AT the assistant, so the
-	// assistant and its tool results drop as one unit (pair-atomic).
-	// The post-dispatch tail (no follow-up user, no assistant) is
-	// still synthesized as a trimmable turn by the fallback below.
+	// First pass: identify trimmable turns and their token mass.
+	// A follow-up user message starts a complete interactive turn so
+	// that retained user prompts participate in the same oldest-first
+	// eligibility order as their assistant and tool-result content.
+	// In an autonomous post-dispatch tail, each assistant starts a
+	// droppable unit so long tool-result tails can still be shed in
+	// bounded pieces. Permanent protected slots close a turn without
+	// becoming eligible content.
 	type Turn = { start: number; end: number; tokens: number };
 	const turns: Turn[] = [];
 	let turnStart = -1;
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i];
-		const isUserAnchor = msg.role === "user" && (protectDispatch ? msg.userTurnAge !== 0 : true);
-		const isAssistantAnchor = msg.role === "assistant";
-		const isTurnAnchor = isUserAnchor || isAssistantAnchor;
-		if (isTurnAnchor) {
-			// Close any open trimmable turn at this boundary. Skip the
-			// close when the open turn is empty (turnStart === i — an
-			// assistant immediately following a user anchor that set
-			// turnStart = i, or two adjacent anchors).
+		const isDispatch = msg.role === "user" && protectDispatch && msg.userTurnAge === 0;
+		if (msg.role === "user" && !isDispatch) {
 			if (turnStart !== -1 && turnStart < i) {
 				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 			}
-			turnStart = isUserAnchor ? i + 1 : i;
-		} else if (msg.role === "custom" && msg.customType && protectedCustomTypes.has(msg.customType)) {
-			// A protected custom slot closes any open trimmable turn.
-			if (turnStart !== -1) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
-				turnStart = -1;
+			turnStart = i;
+			continue;
+		}
+		if (msg.role === "assistant") {
+			const currentStartsWithUser = turnStart !== -1 && messages[turnStart].role === "user";
+			if (turnStart === -1 || !currentStartsWithUser) {
+				if (turnStart !== -1 && turnStart < i) {
+					turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+				}
+				turnStart = i;
 			}
+			continue;
 		}
 	}
 	// Close the final open turn (if any).
@@ -1016,7 +987,7 @@ function dropOldestTurns(
 	// conditional ("if you need …"), not a directive.
 	const out: TrimmableMessage[] = [];
 	if (dropSet.size > 0) {
-		out.push({ role: "user", content: PRUNE_REMINDER_TEXT });
+		out.push({ role: "user", content: PRUNE_REMINDER_TEXT, customType: PRUNE_REMINDER_CUSTOM_TYPE });
 	}
 	// Pair-atomic: when an assistant message sits inside a dropped
 	// turn, walk its `toolCall` blocks. Protected `toolCall` blocks
