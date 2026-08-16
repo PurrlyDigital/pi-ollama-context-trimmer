@@ -1405,6 +1405,38 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 
 describe("applyThreeTierTrim — effective budget with protected mass + system-prompt term", () => {
 
+	it("uses an authoritative aggregate total for tier selection", async () => {
+		const messages: TrimmableMessage[] = [
+			userMsg("old user turn", 1),
+			assistantMsg("old assistant turn"),
+			userMsg("new user turn", 2),
+			assistantMsg("new assistant turn"),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 50,
+			summarizeMaxTokens: 100,
+			authoritativeTotalTokens: 101,
+			protectDispatch: false,
+		});
+		assert.equal(result.droppedTurns, 1, "provider overage triggers a fuzzy whole-turn cut");
+		assert.equal(result.messages.some((m) => m.content === "old user turn"), false, "oldest candidate is removed");
+		assert.equal(result.messages.some((m) => m.content === "new assistant turn"), true, "newest candidate survives");
+	});
+
+	it("uses the visible estimate when the provider total is below the tier ceiling", async () => {
+		const messages: TrimmableMessage[] = [
+			assistantMsg("a".repeat(360)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 50,
+			summarizeMaxTokens: 100,
+			authoritativeTotalTokens: 90,
+			protectDispatch: false,
+		});
+		assert.equal(result.droppedTurns, 0, "authoritative total keeps the session in tier 2");
+		assert.equal(result.messages.length, 1, "the message survives despite its visible estimate");
+	});
+
 	// (1) protected mass subtracted from both tier caps (AC-1).
 	//
 	// Build a session whose trimmable mass is 60k tokens (over the
