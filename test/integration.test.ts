@@ -2591,7 +2591,12 @@ describe("context handler: provider totals do not suppress the current stream", 
 		}
 
 		const firstResult = (await invokeContext(pi, eventWithProviderTotal(120_000, "first"))) as { messages: Array<Record<string, unknown>> };
-		const secondResult = (await invokeContext(pi, eventWithProviderTotal(60_000, "second"))) as { messages: Array<Record<string, unknown>> };
+		const secondEvent = eventWithProviderTotal(60_000, "second");
+		const secondResult = (await invokeContext(pi, secondEvent)) as { messages: Array<Record<string, unknown>> };
+		// The third event has the same current stream as the second. Its
+		// preceding event has a different provider total from the second's
+		// preceding event, so the complete output must remain identical.
+		const thirdResult = (await invokeContext(pi, eventWithProviderTotal(60_000, "second"))) as { messages: Array<Record<string, unknown>> };
 
 		const currentConversation = (result: { messages: Array<Record<string, unknown>> }, label: string) =>
 			result.messages
@@ -2620,6 +2625,11 @@ describe("context handler: provider totals do not suppress the current stream", 
 			secondResult.messages.some((message) => typeof message.content === "string" && message.content.startsWith("first-")),
 			false,
 			"the preceding event cannot supply messages to the current result",
+		);
+		assert.deepEqual(
+			thirdResult.messages,
+			secondResult.messages,
+			"identical current streams produce identical identity and order after different preceding provider totals",
 		);
 	});
 });
