@@ -2564,3 +2564,45 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 		assert.ok(oldest.length === 1, "aborted assistant's usage is skipped; default /3 divisor holds both 120k assistants (80k tokens, tier 2)");
 	});
 });
+
+// Provider totals come from the preceding request. A trimmed request can
+// therefore report a smaller total while the next context event still
+// carries the full session stream.
+describe("context handler: provider totals do not suppress the current stream", () => {
+	it("keeps consecutive over-budget events trimmed when the preceding total falls", async () => {
+		const pi = await loadExtension();
+		const first = "a".repeat(180_000);
+		const second = "b".repeat(180_000);
+
+		function eventWithProviderTotal(totalTokens: number) {
+			return {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg(first),
+					{
+						role: "assistant",
+						content: second,
+						usage: { totalTokens },
+						stopReason: "stop",
+					},
+				],
+			};
+		}
+
+		const firstResult = (await invokeContext(pi, eventWithProviderTotal(120_000))) as { messages: Array<Record<string, unknown>> };
+		const secondResult = (await invokeContext(pi, eventWithProviderTotal(60_000))) as { messages: Array<Record<string, unknown>> };
+
+		for (const result of [firstResult, secondResult]) {
+			assert.equal(
+				result.messages.some((message) => message.content === first),
+				false,
+				"the oldest message remains trimmed from the current over-budget stream",
+			);
+			assert.equal(
+				result.messages.some((message) => message.content === second),
+				true,
+				"the newest message survives",
+			);
+		}
+	});
+});
