@@ -392,105 +392,6 @@ describe("tier2MaxTokens", () => {
 	});
 });
 
-describe("recencyFloor", () => {
-	// --- parseConfigFile (file channel) ---
-
-	it("file parse: a positive number is extracted", () => {
-		assert.equal(parseConfigFile({ recencyFloor: 5000 }).recencyFloor, 5000);
-		assert.equal(parseConfigFile({ recencyFloor: 1 }).recencyFloor, 1);
-	});
-
-	it("file parse: 0 is treated as absent (matches isPositiveNumber's open-lower bound)", () => {
-		assert.equal(parseConfigFile({ recencyFloor: 0 }).recencyFloor, undefined);
-	});
-
-	it("file parse: negative is treated as absent", () => {
-		assert.equal(parseConfigFile({ recencyFloor: -100 }).recencyFloor, undefined);
-	});
-
-	it("file parse: NaN is treated as absent", () => {
-		assert.equal(parseConfigFile({ recencyFloor: Number.NaN }).recencyFloor, undefined);
-	});
-
-	it("file parse: Infinity (positive or negative) is treated as absent", () => {
-		assert.equal(parseConfigFile({ recencyFloor: Number.POSITIVE_INFINITY }).recencyFloor, undefined);
-		assert.equal(parseConfigFile({ recencyFloor: Number.NEGATIVE_INFINITY }).recencyFloor, undefined);
-	});
-
-	it("file parse: non-numeric (string) is treated as absent", () => {
-		assert.equal(parseConfigFile({ recencyFloor: "5000" }).recencyFloor, undefined);
-	});
-
-	it("file parse: missing key leaves the field undefined", () => {
-		assert.equal(parseConfigFile({ tier1MaxTokens: 50_000 }).recencyFloor, undefined);
-	});
-
-	// --- resolveConfig (env wins over file) ---
-
-	it("resolveConfig: env wins over file", () => {
-		const cfg = resolveConfig({
-			file: { recencyFloor: 5000 },
-			env: { [ENV.recencyFloor]: "10000" } as EnvRecord,
-		});
-		assert.equal(cfg.recencyFloor, 10000);
-	});
-
-	it("resolveConfig: empty-string env falls back to file", () => {
-		const cfg = resolveConfig({
-			file: { recencyFloor: 5000 },
-			env: { [ENV.recencyFloor]: "" } as EnvRecord,
-		});
-		assert.equal(cfg.recencyFloor, 5000);
-	});
-
-	it("resolveConfig: non-positive env (0, negative) falls back to file", () => {
-		const cfgZero = resolveConfig({
-			file: { recencyFloor: 5000 },
-			env: { [ENV.recencyFloor]: "0" } as EnvRecord,
-		});
-		assert.equal(cfgZero.recencyFloor, 5000);
-		const cfgNeg = resolveConfig({
-			file: { recencyFloor: 5000 },
-			env: { [ENV.recencyFloor]: "-1" } as EnvRecord,
-		});
-		assert.equal(cfgNeg.recencyFloor, 5000);
-	});
-
-	it("resolveConfig: non-numeric env falls back to file", () => {
-		const cfg = resolveConfig({
-			file: { recencyFloor: 5000 },
-			env: { [ENV.recencyFloor]: "lots" } as EnvRecord,
-		});
-		assert.equal(cfg.recencyFloor, 5000);
-	});
-
-	it("resolveConfig: file-only returns the file value", () => {
-		const cfg = resolveConfig({ file: { recencyFloor: 7500 } });
-		assert.equal(cfg.recencyFloor, 7500);
-	});
-
-	it("resolveConfig: nothing configured leaves the field undefined", () => {
-		const cfg = resolveConfig({});
-		assert.equal(cfg.recencyFloor, undefined);
-	});
-
-	// --- env parse grammar ---
-
-	it("env parse: numeric string is coerced to number", () => {
-		const cfg = resolveConfig({
-			env: { [ENV.recencyFloor]: "20000" } as EnvRecord,
-		});
-		assert.equal(cfg.recencyFloor, 20000);
-		assert.equal(typeof cfg.recencyFloor, "number");
-	});
-
-	// --- ENV map ---
-
-	it("ENV.recencyFloor is the documented namespace", () => {
-		assert.equal(ENV.recencyFloor, "PI_CONTEXT_TRIMMER_RECENCY_FLOOR");
-	});
-});
-
 // ─── loopGuard (defense-in-depth for model-caused loops) ───────────────
 //
 // The loop-guard enable mode is opt-out: `loopGuard` in the config
@@ -1506,7 +1407,7 @@ describe("tokenEstimatorDivisor — resolveConfig (precedence)", () => {
 		// chain (env undefined → file value) returns the file
 		// value. The `parseNumberEnv` shape matches every other
 		// numeric knob in the file (tier1MaxTokens, tier2MaxTokens,
-		// recencyFloor, loopGuardThreshold, etc.).
+		// loopGuardThreshold, etc.).
 		const cfg = resolveConfig({
 			file: { tokenEstimatorDivisor: 4 },
 			env: { [ENV.tokenEstimatorDivisor]: "not-a-number" } as EnvRecord,
@@ -1586,7 +1487,7 @@ describe("tokenEstimatorDivisor — resolveConfig (precedence)", () => {
 });
 // ─── keepLastUserPrompts (count-based user-prompt protection) ──────────
 //
-// Mirrors the recencyFloor config pattern: env > JSON > undefined, with
+// Mirrors the numeric config pattern: env > JSON > undefined, with
 // `isPositiveNumber` validation so 0/negative/NaN/Infinity/non-numeric
 // all fall through to absent. The wiring-layer default (10) is applied
 // in index.ts, not here — the config-resolver field stays `undefined`

@@ -484,7 +484,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// JSON key; the wiring layer applies the policy's
 		// compile-time default `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`
 		// (AC-3, AC-4). The `Math.trunc` integer coercion matches
-		// the `summaWords` / `recencyFloor` precedent in this file:
+		// the `summaWords` precedent in this file:
 		// `isPositiveNumber` accepts floats, so a fractional JSON
 		// value (e.g. `3.5`) would survive validation; `Math.trunc`
 		// enforces the integer contract the policy expects. NaN
@@ -678,12 +678,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// sole floor authority. The policy subtracts system-prompt and
 		// permanently protected mass before applying this floor.
 		const dropFloorTokens = Math.trunc(cfg.tier1MaxTokens ?? VERBATIM_TIER_MAX_TOKENS);
-		// Recency-floor: integer-coerced token count passed through
-		// to the policy unchanged in shape. Per AC-3 the compile-time
-		// default is `undefined` (off; recency protection is operator
-		// opt-in), so the policy's `recencyFloor <= 0 || undefined`
-		// guard treats the default as a no-op.
-		const recencyFloorTokens = cfg.recencyFloor !== undefined ? Math.trunc(cfg.recencyFloor) : undefined;
 		// Keep-last-user-prompts: integer-coerced count passed through
 		// to the policy. Per AC-4 the wiring-layer default is `10` (the
 		// operator-facing default the ticket title commits to) when
@@ -701,7 +695,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
 			dropFloorTokens,
-			recencyFloor: recencyFloorTokens,
 			protectedCustomTypes: protectedTypes,
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,

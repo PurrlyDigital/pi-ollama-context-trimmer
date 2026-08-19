@@ -2360,33 +2360,6 @@ describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring e
 		assert.equal(users.length, 4);
 	});
 
-	it("composes with recencyFloor without conflict", async () => {
-		// Both channels active: keepLastUserPrompts and recencyFloor.
-		// A user message in both windows is just protected (the OR is
-		// additive — isProtectedSlot is a boolean, no double-subtract).
-		process.env[CONFIG_ENV.keepLastUserPrompts] = "3";
-		process.env[CONFIG_ENV.recencyFloor] = "500";
-		const pi = await loadExtension();
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg(pad("a1", 3000)),
-				userMsg("u1"),
-				assistantMsg(pad("a2", 3000)),
-				userMsg("u2"),
-				assistantMsg(pad("a3", 3000)),
-				userMsg("u3"),
-			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// No crash, no empty output; the last user prompt survives.
-		const users = result.messages.filter((m) => m.role === "user");
-		const contents = users.map((u) => u.content);
-		assert.ok(contents.includes("u3"), "the last user prompt survives");
-		assert.ok(result.messages.length > 0, "non-empty output");
-		// Clean up recencyFloor so other tests are unaffected.
-		delete process.env[CONFIG_ENV.recencyFloor];
-	});
 });
 // ─── Calibrated token-estimator divisor from usage (AC-1..AC-8) ───────
 //

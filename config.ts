@@ -68,9 +68,6 @@ export interface ContextTrimmerConfig {
 	 *  with `Math.trunc` if the consumer needs
 	 *  an integer. */
 	readonly tokenEstimatorDivisor?: number;
-	/** Optional recency-retention token count. Selected content remains
-	 *  eligible for oldest-first trimming above tier 2. */
-	readonly recencyFloor?: number;
 	/** Loop-guard enable mode. `true` (default) turns the guard ON
 	 *  for every session; `false` turns it off. Overrides the policy
 	 *  default when set. */
@@ -169,7 +166,6 @@ export const ENV = {
 	tier1MaxTokens: "PI_CONTEXT_TRIMMER_TIER1_MAX_TOKENS",
 	tier2MaxTokens: "PI_CONTEXT_TRIMMER_TIER2_MAX_TOKENS",
 	tokenEstimatorDivisor: "PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR",
-	recencyFloor: "PI_CONTEXT_TRIMMER_RECENCY_FLOOR",
 	loopGuard: "PI_CONTEXT_TRIMMER_LOOP_GUARD",
 	loopGuardThreshold: "PI_CONTEXT_TRIMMER_LOOP_GUARD_THRESHOLD",
 	loopGuardHardBlock: "PI_CONTEXT_TRIMMER_LOOP_GUARD_HARD_BLOCK",
@@ -201,7 +197,6 @@ export interface ParsedConfigFile {
 	 *  `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3` is the compile-time
 	 *  default when neither channel sets a value. */
 	tokenEstimatorDivisor?: number;
-	recencyFloor?: number;
 	loopGuard?: LoopGuardMode;
 	loopGuardThreshold?: number;
 	loopGuardHardBlock?: number;
@@ -243,9 +238,6 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	}
 	if (isPositiveNumber(o.tokenEstimatorDivisor)) {
 		out.tokenEstimatorDivisor = o.tokenEstimatorDivisor;
-	}
-	if (isPositiveNumber(o.recencyFloor)) {
-		out.recencyFloor = o.recencyFloor;
 	}
 	const lg = o.loopGuard;
 	if (lg === true || lg === false) {
@@ -309,8 +301,6 @@ export function resolveConfig(opts: {
 		parseNumberEnv(env[ENV.tier2MaxTokens]) ?? file.tier2MaxTokens;
 	const tokenEstimatorDivisor =
 		parseNumberEnv(env[ENV.tokenEstimatorDivisor]) ?? file.tokenEstimatorDivisor;
-	const recencyFloor =
-		parseNumberEnv(env[ENV.recencyFloor]) ?? file.recencyFloor;
 
 	let loopGuard: LoopGuardMode;
 	const envLg = env[ENV.loopGuard];
@@ -381,7 +371,6 @@ export function resolveConfig(opts: {
 		tier1MaxTokens,
 		tier2MaxTokens,
 		tokenEstimatorDivisor,
-		recencyFloor,
 		loopGuard,
 		loopGuardThreshold,
 		loopGuardHardBlock,
