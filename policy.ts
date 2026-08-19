@@ -110,10 +110,11 @@ export type TrimOptions = {
 	summarizeMaxTokens?: number;
 
 	/**
-	 * Provider-reported aggregate token total for the current context
-	 * event. When finite and positive, this value drives tier selection
-	 * against the raw caps because it includes system and protected mass.
-	 * Visible-content estimates still drive candidate sizing during drops.
+	 * Provider-reported aggregate token total from the preceding provider
+	 * request. When finite and positive, this value can force a tier when
+	 * it shows an overage against the raw caps. It cannot suppress the
+	 * current event's visible-content estimate because that estimate may
+	 * represent a larger untrimmed session stream.
 	 */
 	authoritativeTotalTokens?: number;
 	/**
@@ -763,9 +764,13 @@ export async function applyThreeTierTrim(
 		? undefined
 		: Math.max(0, dropFloorTokens - systemPromptTokens - protectedMass);
 
-	// Provider totals are aggregate counts, so they are compared with
-	// the raw caps. The estimator remains the fallback and the candidate
-	// mass signal used by the drop path.
+	// Provider totals describe the preceding provider request, which may
+	// have received a trimmed view while this event still carries the
+	// full session stream. They can force a trim when they show an
+	// overage, but a smaller prior-request total cannot suppress the
+	// current stream's visible estimate. This keeps consecutive context
+	// events monotonic instead of alternating between full and trimmed
+	// output.
 	const estimatedTotal = totalTrimmableTokens(
 		messages,
 		protectedCustomTypes,
@@ -779,15 +784,17 @@ export async function applyThreeTierTrim(
 	);
 	const authoritativeTotal = options.authoritativeTotalTokens;
 	const hasAuthoritativeTotal = Number.isFinite(authoritativeTotal) && authoritativeTotal! > 0;
+	const providerOverVerbatim = hasAuthoritativeTotal && authoritativeTotal! > verbatimMax;
+	const providerOverSummarize = hasAuthoritativeTotal && authoritativeTotal! > summarizeMax;
 	const total = hasAuthoritativeTotal ? authoritativeTotal! : estimatedTotal;
-	const tierVerbatimMax = hasAuthoritativeTotal ? verbatimMax : effectiveVerbatimMax;
-	const tierSummarizeMax = hasAuthoritativeTotal ? summarizeMax : effectiveSummarizeMax;
+	const needsDrop = estimatedTotal > effectiveSummarizeMax || providerOverSummarize;
+	const needsHold = estimatedTotal > effectiveVerbatimMax || providerOverVerbatim;
 
 	// Tier 3: hard-drop oldest whole turns until the estimated
 	// trimmable remainder reaches its effective candidate cap. When
 	// only the provider total shows an overage, force the first eligible
 	// candidate cut so opaque reasoning can still make progress.
-	if (total > tierSummarizeMax) {
+	if (needsDrop) {
 		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
 			messages,
 			effectiveSummarizeMax,
@@ -800,7 +807,7 @@ export async function applyThreeTierTrim(
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
 			divisor,
-			hasAuthoritativeTotal && estimatedTotal <= effectiveSummarizeMax,
+			providerOverSummarize && estimatedTotal <= effectiveSummarizeMax,
 		);
 		// Drop-floor fall-through: when the next-oldest turn would
 		// push the trimmable total below `dropFloorTokens`, stop
@@ -849,7 +856,7 @@ export async function applyThreeTierTrim(
 
 	// Tier 2: hold middle-band messages untouched (transient behavior;
 	// Tier 3 catches oversize if it grows further).
-	if (total > tierVerbatimMax) {
+	if (needsHold) {
 		return {
 			messages: messages.slice(),
 			droppedTurns: 0,

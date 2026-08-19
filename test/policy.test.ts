@@ -1423,9 +1423,10 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 		assert.equal(result.messages.some((m) => m.content === "new assistant turn"), true, "newest candidate survives");
 	});
 
-	it("uses the visible estimate when the provider total is below the tier ceiling", async () => {
+	it("does not let a smaller preceding provider total suppress an over-budget current estimate", async () => {
 		const messages: TrimmableMessage[] = [
-			assistantMsg("a".repeat(360)),
+			assistantMsg("a".repeat(180)),
+			assistantMsg("b".repeat(180)),
 		];
 		const result = await applyThreeTierTrim(messages, {
 			verbatimMaxTokens: 50,
@@ -1433,8 +1434,9 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 			authoritativeTotalTokens: 90,
 			protectDispatch: false,
 		});
-		assert.equal(result.droppedTurns, 0, "authoritative total keeps the session in tier 2");
-		assert.equal(result.messages.length, 1, "the message survives despite its visible estimate");
+		assert.equal(result.droppedTurns, 1, "the current visible estimate still triggers tier 3");
+		assert.equal(result.messages.some((m) => m.content === "a".repeat(180)), false, "the oldest current message is dropped");
+		assert.equal(result.messages.some((m) => m.content === "b".repeat(180)), true, "the newest current message survives");
 	});
 
 	// (1) protected mass subtracted from both tier caps (AC-1).

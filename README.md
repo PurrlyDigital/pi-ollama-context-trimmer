@@ -253,9 +253,9 @@ The divisor can also be calibrated. When the first assistant message in the stre
 
 When no usable `usage.input` is present, the configured divisor applies. This covers the very first turn on a fresh session. It covers test mocks that do not carry `usage`. It covers assistant turns that were aborted or errored. The configured divisor is the operator knob referenced above, or the default `3`.
 
-When an eligible assistant message reports a positive finite `usage.totalTokens`, that provider total is the aggregate signal for tier selection. It includes the system prompt and protected content, so it is compared with the raw tier caps. The latest eligible total in the stream is used. Aborted and errored assistant messages are skipped.
+When an eligible assistant message reports a positive finite `usage.totalTokens`, that provider total can force a trim when it shows an overage. It includes the system prompt and protected content, so it is compared with the raw tier caps. A smaller preceding provider total cannot suppress the current event's visible-content estimate. Aborted and errored assistant messages are skipped.
 
-When no usable provider total is present, the extension falls back to the visible-content estimate. That estimate also sizes and orders whole-turn drop candidates when a provider total is present. Encrypted reasoning can make those candidate sizes fuzzy, so the extension attempts an atomic oldest-turn cut rather than claiming exact per-turn accounting.
+The visible-content estimate remains the candidate-sizing signal for whole-turn drops. It is also the fallback when no usable provider total is present. Encrypted reasoning can make candidate sizes fuzzy, so the extension attempts an atomic oldest-turn cut rather than claiming exact per-turn accounting.
 
 Protected-slot tokens continue to be estimated for candidate budgeting and protected content remains preserved. Tool-call and tool-result pairs remain atomic.
 
