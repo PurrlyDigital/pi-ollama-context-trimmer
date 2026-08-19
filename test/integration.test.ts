@@ -2571,17 +2571,18 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 describe("context handler: provider totals do not suppress the current stream", () => {
 	it("keeps consecutive over-budget events trimmed when the preceding total falls", async () => {
 		const pi = await loadExtension();
-		const first = "a".repeat(180_000);
-		const second = "b".repeat(180_000);
+		const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
+		const newAssistantText = "new-assistant-" + "b".repeat(180_000);
 
-		function eventWithProviderTotal(totalTokens: number) {
+		function eventWithProviderTotal(totalTokens: number, label: string) {
 			return {
 				messages: [
-					userMsg("dispatch"),
-					assistantMsg(first),
+					userMsg(`${label}-dispatch`),
+					assistantMsg(`${label}-${oldAssistantText}`),
+					userMsg(`${label}-follow-up`),
 					{
 						role: "assistant",
-						content: second,
+						content: `${label}-${newAssistantText}`,
 						usage: { totalTokens },
 						stopReason: "stop",
 					},
@@ -2589,20 +2590,71 @@ describe("context handler: provider totals do not suppress the current stream", 
 			};
 		}
 
-		const firstResult = (await invokeContext(pi, eventWithProviderTotal(120_000))) as { messages: Array<Record<string, unknown>> };
-		const secondResult = (await invokeContext(pi, eventWithProviderTotal(60_000))) as { messages: Array<Record<string, unknown>> };
+		const firstResult = (await invokeContext(pi, eventWithProviderTotal(120_000, "first"))) as { messages: Array<Record<string, unknown>> };
+		const secondResult = (await invokeContext(pi, eventWithProviderTotal(60_000, "second"))) as { messages: Array<Record<string, unknown>> };
 
-		for (const result of [firstResult, secondResult]) {
-			assert.equal(
-				result.messages.some((message) => message.content === first),
-				false,
-				"the oldest message remains trimmed from the current over-budget stream",
-			);
-			assert.equal(
-				result.messages.some((message) => message.content === second),
-				true,
-				"the newest message survives",
-			);
+		const currentConversation = (result: { messages: Array<Record<string, unknown>> }, label: string) =>
+			result.messages
+				.filter((message) => typeof message.content === "string" && message.content.startsWith(`${label}-`))
+				.map((message) => [message.role, message.content]);
+
+		assert.deepEqual(
+			currentConversation(firstResult, "first"),
+			[
+				["user", "first-dispatch"],
+				["user", "first-follow-up"],
+				["assistant", `first-${newAssistantText}`],
+			],
+			"the first result is the deterministic trim of its own alternating input stream",
+		);
+		assert.deepEqual(
+			currentConversation(secondResult, "second"),
+			[
+				["user", "second-dispatch"],
+				["user", "second-follow-up"],
+				["assistant", `second-${newAssistantText}`],
+			],
+			"the second result is trimmed from its own stream even after the provider total falls",
+		);
+		assert.equal(
+			secondResult.messages.some((message) => typeof message.content === "string" && message.content.startsWith("first-")),
+			false,
+			"the preceding event cannot supply messages to the current result",
+		);
+	});
+});
+
+describe("context handler: transport boundary", () => {
+	it("transforms host messages without using provider or websocket transport", async () => {
+		const globals = globalThis as unknown as Record<string, unknown>;
+		const originalFetch = globals.fetch;
+		const originalWebSocket = globals.WebSocket;
+		const transportCalls: string[] = [];
+		globals.fetch = () => {
+			transportCalls.push("fetch");
+			throw new Error("context trimmer must not issue provider requests");
+		};
+		globals.WebSocket = class {
+			constructor() {
+				transportCalls.push("websocket");
+				throw new Error("context trimmer must not open websocket connections");
+			}
+		};
+
+		try {
+			const pi = await loadExtension();
+			const marker = "host-supplied-message";
+			const result = (await invokeContext(pi, { messages: [userMsg(marker)] })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+
+			assert.equal(result.messages.some((message) => message.role === "user" && message.content === marker), true);
+			assert.deepEqual(transportCalls, []);
+		} finally {
+			if (originalFetch === undefined) delete globals.fetch;
+			else globals.fetch = originalFetch;
+			if (originalWebSocket === undefined) delete globals.WebSocket;
+			else globals.WebSocket = originalWebSocket;
 		}
 	});
 });
