@@ -159,15 +159,6 @@ export type TrimOptions = {
 	 */
 	dropFloorTokens?: number;
 	/**
-	 * A token count selecting the most-recent trimmable content while
-	 * the effective total is within tier 2. The slice is computed once
-	 * at the top of `applyThreeTierTrim` and threaded through internal
-	 * calls so it can guide oldest-first eligibility above tier 2.
-	 * `undefined` or non-positive values disable recency selection.
-	 */
-	recencyFloor?: number;
-
-	/**
 	 * Tool-call IDs whose assistant `toolCall` blocks are protected
 	 * from drop. The set is computed by the wiring
 	 * layer at view time by walking every assistant message's
@@ -493,8 +484,8 @@ function carveProtectedToolCallBlocks(
  * Walk backward from the end of the messages array counting
  * `role === "user"` messages until `keepLastUserPrompts` of them
  * are collected, returning the set of those messages' indices. The
- * count is over ALL user messages, including dispatch and recency
- * selections. The result guides retention ordering while the stream
+ * count is over ALL user messages, including dispatch. The result
+ * guides retention ordering while the stream
  * is within tier 2; it is not permanent protection.
  *
  * `keepLastUserPrompts <= 0` or `undefined` → empty set (no
@@ -520,52 +511,6 @@ export function computeKeepLastUserPromptsProtectedIndices(
 	return out;
 }
 
-// ─── Recency-floor helper (recency channel) ─────────────────────
-
-/**
- * Walk backward from the end of the messages array, skipping
- * permanently protected messages, accumulating trimmable tokens until
- * the `recencyFloorTokens` threshold is reached. Returns the selected
- * message indices for budget-aware retention.
- *
- * The recency slice is the "most-recent-N-tokens of trimmable
- * content" the operator asked to retain within tier 2. The slice is
- * computed once at the top of `applyThreeTierTrim` and threaded through
- * every internal call as an eligibility signal. Permanently protected
- * messages are excluded because their mass is already handled by the
- * protected-slot budget.
- *
- * `recencyFloorTokens <= 0` or `undefined` → empty set (no recency
- * protection, legacy behavior).
- *
- * Pure: no `process.*`, no `node:fs`. Operates on the messages
- * array and the predicate arguments; all input data is the
- * caller's responsibility to thread through.
- */
-export function computeRecencyProtectedIndices(
-	messages: ReadonlyArray<TrimmableMessage>,
-	recencyFloorTokens: number | undefined,
-	protectedCustomTypes: ReadonlySet<string> = new Set(),
-	protectDispatch = true,
-	preservedPatterns: ReadonlyArray<string> = [],
-	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
-	protectedToolCallIds: ReadonlySet<string> = new Set(),
-	keepOriginalPrompt = true,
-	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
-): ReadonlySet<number> {
-	const out = new Set<number>();
-	if (recencyFloorTokens === undefined || recencyFloorTokens <= 0) return out;
-	let acc = 0;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, new Set(), protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) continue;
-		const tokens = approximateMessageTokens(messages[i], divisor);
-		out.add(i);
-		acc += tokens;
-		if (acc >= recencyFloorTokens) break;
-	}
-	return out;
-}
-
 // ─── Protected-slot predicate ──────────────────────────────────────────
 
 export function isProtectedSlot(
@@ -575,7 +520,6 @@ export function isProtectedSlot(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
@@ -593,10 +537,9 @@ export function isProtectedSlot(
 	if (isPathPreserved(extractSourcePath(msg), preservedPatterns)) {
 		return true;
 	}
-	// Recency-floor and keep-last-user-prompts selections are
-	// budget-aware retention inputs, not permanent protection. They
-	// survive while the effective total is within tier 2 and become
-	// eligible for oldest-first trimming above tier 2.
+	// Keep-last-user-prompts selections are budget-aware retention
+	// inputs, not permanent protection. They remain eligible for
+	// oldest-first trimming above tier 2.
 	// Pair-atomic toolCall/toolResult protection: a `toolResult`
 	// whose top-level `toolCallId` is in the protected-toolCall-id
 	// set is protected by association with the assistant `toolCall`
@@ -606,7 +549,7 @@ export function isProtectedSlot(
 	// is the resume-compat fallback. The set is the source of truth
 	// for which `toolResult` messages are protected, and it keeps
 	// the message-level carve-out working for the dropped-turn and
-	// recency paths. Independent of the channels above; the OR is
+	// trim paths. Independent of the channels above; the OR is
 	// additive. Note: an ASSISTANT message whose `toolCall` block is
 	// protected does NOT return true here — block-level protection
 	// is the load-bearing seam, not message-level protection; the
@@ -653,7 +596,6 @@ export function totalTrimmableTokens(
 	protectedCustomTypes: ReadonlySet<string> = new Set(),
 	protectDispatch = true,
 	preservedPatterns: ReadonlyArray<string> = [],
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
@@ -661,7 +603,7 @@ export function totalTrimmableTokens(
 ): number {
 	let total = 0;
 	for (let i = 0; i < messages.length; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) continue;
 		total += approximateMessageTokens(messages[i], divisor);
 	}
 	return total;
@@ -705,7 +647,6 @@ export async function applyThreeTierTrim(
 	const protectDispatch = options.protectDispatch ?? true;
 	const preservedPatterns = options.preservedPatterns ?? [];
 	const dropFloorTokens = options.dropFloorTokens;
-	const recencyFloor = options.recencyFloor;
 	const protectedToolCallIds = options.protectedToolCallIds ?? new Set<string>();
 	const divisor = options.tokenEstimatorDivisor ?? TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
 	const systemPromptTokens = options.systemPromptTokens ?? 0;
@@ -714,26 +655,9 @@ export async function applyThreeTierTrim(
 
 	// Compute the keep-last-user-prompts slice first. The count is
 	// independent of other channels (Option B: plain count over all
-	// user messages, no skip-already-protected seam), so it computes
-	// before the recency slice.
+	// user messages, no skip-already-protected seam).
 	const keepLastUserPromptsProtectedIndices =
 		computeKeepLastUserPromptsProtectedIndices(messages, keepLastUserPrompts);
-
-	// Compute the recency-protected slice once and thread it through
-	// every internal call. The keep-last-user-prompts set is passed in
-	// so the recency walk skips already-keep-last-protected messages
-	// (the existing skip-already-protected seam).
-	const recencyProtectedIndices = computeRecencyProtectedIndices(
-		messages,
-		recencyFloor,
-		protectedCustomTypes,
-		protectDispatch,
-		preservedPatterns,
-		keepLastUserPromptsProtectedIndices,
-		protectedToolCallIds,
-		keepOriginalPrompt,
-		divisor,
-	);
 
 	// Compute the protected-slot mass once.
 	let protectedMass = 0;
@@ -746,7 +670,6 @@ export async function applyThreeTierTrim(
 				protectedCustomTypes,
 				protectDispatch,
 				preservedPatterns,
-				recencyProtectedIndices,
 				protectedToolCallIds,
 				keepLastUserPromptsProtectedIndices,
 				keepOriginalPrompt,
@@ -776,7 +699,6 @@ export async function applyThreeTierTrim(
 		protectedCustomTypes,
 		protectDispatch,
 		preservedPatterns,
-		recencyProtectedIndices,
 		protectedToolCallIds,
 		keepLastUserPromptsProtectedIndices,
 		keepOriginalPrompt,
@@ -802,7 +724,6 @@ export async function applyThreeTierTrim(
 			protectDispatch,
 			preservedPatterns,
 			effectiveDropFloor,
-			recencyProtectedIndices,
 			protectedToolCallIds,
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
@@ -823,7 +744,6 @@ export async function applyThreeTierTrim(
 					protectedCustomTypes,
 					protectDispatch,
 					preservedPatterns,
-					recencyProtectedIndices,
 					protectedToolCallIds,
 					keepLastUserPromptsProtectedIndices,
 					keepOriginalPrompt,
@@ -837,7 +757,6 @@ export async function applyThreeTierTrim(
 			protectedCustomTypes,
 			protectDispatch,
 			preservedPatterns,
-			recencyProtectedIndices,
 			protectedToolCallIds,
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
@@ -893,7 +812,6 @@ function dropOldestTurns(
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string>,
 	dropFloorTokens: number | undefined = undefined,
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
@@ -916,7 +834,7 @@ function dropOldestTurns(
 		const isDispatch = msg.role === "user" && protectDispatch && msg.userTurnAge === 0;
 		if (msg.role === "user" && !isDispatch) {
 			if (turnStart !== -1 && turnStart < i) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 			}
 			turnStart = i;
 			continue;
@@ -925,7 +843,7 @@ function dropOldestTurns(
 			const currentStartsWithUser = turnStart !== -1 && messages[turnStart].role === "user";
 			if (turnStart === -1 || !currentStartsWithUser) {
 				if (turnStart !== -1 && turnStart < i) {
-					turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+					turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 				}
 				turnStart = i;
 			}
@@ -934,7 +852,7 @@ function dropOldestTurns(
 	}
 	// Close the final open turn (if any).
 	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 	}
 	// If no trimmable turn was identified but there is post-dispatch
 	// trimmable mass (the "mid-response tool result tail" case),
@@ -962,10 +880,10 @@ function dropOldestTurns(
 		// Count trimmable messages in the post-dispatch tail.
 		let trimmableCount = 0;
 		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) trimmableCount++;
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) trimmableCount++;
 		}
 		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
 		}
 	}
 	// Compute the total trimmable token mass of the input.
@@ -1046,7 +964,7 @@ function dropOldestTurns(
 			// unprotected `toolCall` block IDs it carried are
 			// added to `droppedToolCallIds` for the post-pass
 			// toolResult drop.
-			if (isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) {
+			if (isProtectedSlot(msg, i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) {
 				out.push(msg);
 				continue;
 			}
@@ -1097,7 +1015,6 @@ function makeTurn(
 	protectedCustomTypes: ReadonlySet<string>,
 	protectDispatch: boolean,
 	preservedPatterns: ReadonlyArray<string>,
-	recencyProtectedIndices: ReadonlySet<number> = new Set(),
 	protectedToolCallIds: ReadonlySet<string> = new Set(),
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
@@ -1105,7 +1022,7 @@ function makeTurn(
 ): { start: number; end: number; tokens: number } {
 	let tokens = 0;
 	for (let i = start; i < end; i++) {
-		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, recencyProtectedIndices, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) continue;
+		if (isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) continue;
 		tokens += approximateMessageTokens(messages[i], divisor);
 	}
 	return { start, end, tokens };
