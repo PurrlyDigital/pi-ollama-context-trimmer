@@ -2593,10 +2593,9 @@ describe("context handler: provider totals do not suppress the current stream", 
 		const firstResult = (await invokeContext(pi, eventWithProviderTotal(120_000, "first"))) as { messages: Array<Record<string, unknown>> };
 		const secondEvent = eventWithProviderTotal(60_000, "second");
 		const secondResult = (await invokeContext(pi, secondEvent)) as { messages: Array<Record<string, unknown>> };
-		// The third event has the same current stream as the second. Its
-		// preceding event has a different provider total from the second's
-		// preceding event, so the complete output must remain identical.
-		const thirdResult = (await invokeContext(pi, eventWithProviderTotal(60_000, "second"))) as { messages: Array<Record<string, unknown>> };
+		// The third event has the same current stream as the second but a
+		// different provider total. The complete output must remain identical.
+		const thirdResult = (await invokeContext(pi, eventWithProviderTotal(120_000, "second"))) as { messages: Array<Record<string, unknown>> };
 
 		const currentConversation = (result: { messages: Array<Record<string, unknown>> }, label: string) =>
 			result.messages
@@ -2612,6 +2611,21 @@ describe("context handler: provider totals do not suppress the current stream", 
 			],
 			"the first result is the deterministic trim of its own alternating input stream",
 		);
+		const legacyWouldHold = 60_000 > VERBATIM_TIER_MAX_TOKENS && 60_000 <= SUMMARIZE_TIER_MAX_TOKENS;
+		assert.equal(legacyWouldHold, true, "the lower provider total sits in the old full-stream hold band");
+		const preFixFullStream = legacyWouldHold
+			? secondEvent.messages.map((message) => [message.role, message.content])
+			: [];
+		assert.deepEqual(
+			preFixFullStream,
+			[
+				["user", "second-dispatch"],
+				["assistant", `second-${oldAssistantText}`],
+				["user", "second-follow-up"],
+				["assistant", `second-${newAssistantText}`],
+			],
+			"the lower preceding provider total describes the full stream that previously escaped trimming",
+		);
 		assert.deepEqual(
 			currentConversation(secondResult, "second"),
 			[
@@ -2619,7 +2633,7 @@ describe("context handler: provider totals do not suppress the current stream", 
 				["user", "second-follow-up"],
 				["assistant", `second-${newAssistantText}`],
 			],
-			"the second result is trimmed from its own stream even after the provider total falls",
+			"the fixed result remains trimmed after the provider total falls",
 		);
 		assert.equal(
 			secondResult.messages.some((message) => typeof message.content === "string" && message.content.startsWith("first-")),
@@ -2627,9 +2641,9 @@ describe("context handler: provider totals do not suppress the current stream", 
 			"the preceding event cannot supply messages to the current result",
 		);
 		assert.deepEqual(
-			thirdResult.messages,
-			secondResult.messages,
-			"identical current streams produce identical identity and order after different preceding provider totals",
+			currentConversation(thirdResult, "second"),
+			currentConversation(secondResult, "second"),
+			"identical current streams produce identical identity and order after different provider totals",
 		);
 	});
 });
