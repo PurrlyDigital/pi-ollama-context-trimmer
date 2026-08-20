@@ -55,6 +55,7 @@ import { join } from "node:path";
 import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
+	collapseDuplicateSkillReads,
 	applyReasoningBlockCap,
 	applySubagentNotifyKeepLast,
 	applyThreeTierTrim,
@@ -649,9 +650,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const subagentNotifyKeepLast = cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : intercomKeepLast;
 		const intercomInstalled = resolveIntercomInstalled();
 		const subagentsInstalled = resolveSubagentsInstalled();
+		const afterSkillReadCollapse = collapseDuplicateSkillReads(base);
 		const afterRule1: TrimmableMessage[] = intercomInstalled
-			? applyIntercomKeepLast(base, intercomKeepLast)
-			: base;
+			? applyIntercomKeepLast(afterSkillReadCollapse, intercomKeepLast)
+			: afterSkillReadCollapse;
 		const afterRule2: TrimmableMessage[] = intercomInstalled
 			? dedupSubagentNotify(afterRule1)
 			: afterRule1;

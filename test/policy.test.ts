@@ -28,6 +28,7 @@ import {
 	FLAT_INPUT_TOKEN_TOLERANCE,
 	LOOP_GUARD_NUDGE_TEXT,
 	LOOP_GUARD_BLOCK_TEXT,
+	collapseDuplicateSkillReads,
 	computeKeepLastUserPromptsProtectedIndices,
 	isPathPreserved,
 	isProtectedSlot,
@@ -315,6 +316,99 @@ describe("totalTrimmableTokens", () => {
 		];
 		// Only the assistant message (6 chars / 4 = 2 tokens) is trimmable.
 		assert.equal(totalTrimmableTokens(messages, protectedSet), 2);
+	});
+});
+
+// ─── Duplicate skill reads ────────────────────────────────────────────
+
+describe("collapseDuplicateSkillReads", () => {
+	const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
+
+	function readCall(id: string, args: Record<string, unknown>): TrimmableMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "toolCall", id, name: "read", arguments: args }],
+		};
+	}
+
+	function readResult(id: string): TrimmableMessage {
+		return { role: "toolResult", content: `contents for ${id}`, toolCallId: id } as TrimmableMessage;
+	}
+
+	it("keeps the newest completed whole-file read and its pair", () => {
+		const messages = [
+			readCall("old", { path: skillPath }),
+			readResult("old"),
+			readCall("new", { path: skillPath }),
+			readResult("new"),
+		];
+		const result = collapseDuplicateSkillReads(messages);
+		assert.equal(result.length, 2);
+		assert.equal((result[0].content as Array<{ id?: string }>)[0].id, "new");
+		assert.equal((result[1] as TrimmableMessage & { toolCallId?: string }).toolCallId, "new");
+	});
+
+	it("deduplicates only the exact range, not overlapping or whole-file reads", () => {
+		const messages = [
+			readCall("range-old", { path: skillPath, offset: 40, limit: 50 }),
+			readResult("range-old"),
+			readCall("overlap", { path: skillPath, offset: 41, limit: 50 }),
+			readResult("overlap"),
+			readCall("range-new", { path: skillPath, offset: 40, limit: 50 }),
+			readResult("range-new"),
+			readCall("whole", { path: skillPath }),
+			readResult("whole"),
+		];
+		const result = collapseDuplicateSkillReads(messages);
+		const ids = result.flatMap((message) => {
+			if (message.role === "toolResult") return [(message as TrimmableMessage & { toolCallId?: string }).toolCallId];
+			if (message.role === "assistant" && Array.isArray(message.content)) {
+				return message.content.map((block) => (block as { id?: string }).id);
+			}
+			return [];
+		});
+		assert.deepEqual(ids, ["overlap", "overlap", "range-new", "range-new", "whole", "whole"]);
+	});
+
+	it("leaves non-skill files and incomplete reads untouched", () => {
+		const messages = [
+			readCall("non-skill-1", { path: "/repo/README.md" }),
+			readResult("non-skill-1"),
+			readCall("non-skill-2", { path: "/repo/README.md" }),
+			readResult("non-skill-2"),
+			readCall("incomplete", { path: skillPath }),
+		];
+		assert.equal(collapseDuplicateSkillReads(messages).length, messages.length);
+	});
+
+	it("does not use a reused ID to remove an unrelated tool call or result", () => {
+		const messages = [
+			readCall("same", { path: skillPath }),
+			readResult("same"),
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "same", name: "delete", arguments: { path: "/repo/file.txt" } },
+					{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } },
+				],
+			} as TrimmableMessage,
+			readResult("same"),
+			readResult("new"),
+		];
+		const result = collapseDuplicateSkillReads(messages);
+		assert.equal(result.length, messages.length);
+		assert.equal((result[2].content as Array<{ name?: string }>)[0].name, "delete");
+	});
+
+	it("leaves duplicate results untouched when their ID is reused", () => {
+		const messages = [
+			readCall("old", { path: skillPath }),
+			readResult("old"),
+			readCall("new", { path: skillPath }),
+			readResult("new"),
+			readResult("new"),
+		];
+		assert.equal(collapseDuplicateSkillReads(messages).length, messages.length);
 	});
 });
 
