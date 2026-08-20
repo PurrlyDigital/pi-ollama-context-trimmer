@@ -1315,13 +1315,21 @@ export function collapseDuplicateSkillReads(
 	}
 
 	const reads: SkillRead[] = [];
+	const toolCallCounts = new Map<string, number>();
+	const nonSkillToolCallIds = new Set<string>();
 	for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
 		const message = messages[messageIndex];
 		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
 		for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
 			const block = message.content[blockIndex];
 			if (!block || typeof block !== "object") continue;
-			const read = skillReadKey(block as Record<string, unknown>);
+			const record = block as Record<string, unknown>;
+			const id = record.id;
+			const read = skillReadKey(record);
+			if (typeof id === "string" && id.length > 0) {
+				toolCallCounts.set(id, (toolCallCounts.get(id) ?? 0) + 1);
+				if (!read) nonSkillToolCallIds.add(id);
+			}
 			if (read && resultIds.has(read.toolCallId)) {
 				reads.push({ messageIndex, blockIndex, ...read });
 			}
@@ -1329,10 +1337,15 @@ export function collapseDuplicateSkillReads(
 	}
 	if (reads.length < 2) return messages.slice();
 
+	const ambiguousIds = new Set<string>();
+	for (const [id, count] of toolCallCounts) {
+		if (count > 1 || nonSkillToolCallIds.has(id)) ambiguousIds.add(id);
+	}
 	const seenKeys = new Set<string>();
 	const duplicateIds = new Set<string>();
 	for (let i = reads.length - 1; i >= 0; i--) {
 		const read = reads[i];
+		if (ambiguousIds.has(read.toolCallId)) continue;
 		if (seenKeys.has(read.key)) duplicateIds.add(read.toolCallId);
 		else seenKeys.add(read.key);
 	}

@@ -380,6 +380,25 @@ describe("collapseDuplicateSkillReads", () => {
 		];
 		assert.equal(collapseDuplicateSkillReads(messages).length, messages.length);
 	});
+
+	it("does not use a reused ID to remove an unrelated tool call or result", () => {
+		const messages = [
+			readCall("same", { path: skillPath }),
+			readResult("same"),
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "same", name: "delete", arguments: { path: "/repo/file.txt" } },
+					{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } },
+				],
+			} as TrimmableMessage,
+			readResult("same"),
+			readResult("new"),
+		];
+		const result = collapseDuplicateSkillReads(messages);
+		assert.equal(result.length, messages.length);
+		assert.equal((result[2].content as Array<{ name?: string }>)[0].name, "delete");
+	});
 });
 
 // ─── Verbatim tier (0–50k) ─────────────────────────────────────────────
