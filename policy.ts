@@ -1240,27 +1240,126 @@ export function applyReasoningBlockCap(
 
 // ─── Pre-budget collapse (extension-gated category trims) ─────────
 //
-// Three pure array-in/array-out transforms that collapse transcript
-// entries — `intercom_message`, `subagent-notify`, and
-// `toolResult:subagent` — that accumulate outside the three-tier
-// budget. Each function targets a single category and is tier-blind
-// (drops regardless of which three-tier budget slot the entry would
-// have occupied). The wiring layer (`index.ts`) invokes them on
-// `base` after source-path stamping and before pinned injection,
-// and gates each by an extension-presence probe (pi-intercom,
-// pi-subagents) so a session without the gating extension sees no
-// behavior change.
-//
-// Identification predicates match the source extensions:
-//   - `intercom_message`:  role === "custom" && customType === "intercom_message" (pi-intercom)
-//   - `subagent-notify`:   role === "custom" && customType === "subagent-notify"  (pi-intercom)
-//   - `toolResult:subagent`: role === "toolResult" && toolName === "subagent"     (pi-subagents)
+// Four pure array-in/array-out transforms collapse transcript entries
+// before the three-tier budget. Skill-read deduplication is always on;
+// the remaining transforms are gated by their owning extensions.
 //
 // Purity: each function is a pure array transform — no `process.*`,
-// no Node I/O, no `pi` reference. Mirrors the `applyReasoningBlockCap`
-// purity contract. The wiring layer is responsible for the gate
-// (extension-presence probe) and the integer coercion of the
-// `keepLast` knob.
+// no Node I/O, no `pi` reference. The wiring layer owns extension
+// detection and ordering.
+
+/**
+ * Return whether a path points inside a skills directory. Skill paths
+ * are identified structurally so the extension does not depend on one
+ * operator's home directory.
+ */
+function isSkillPath(sourcePath: string): boolean {
+	const normalized = sourcePath.replaceAll("\\", "/");
+	return normalized.split("/").includes("skills");
+}
+
+type SkillRead = {
+	messageIndex: number;
+	blockIndex: number;
+	toolCallId: string;
+	key: string;
+};
+
+/**
+ * Build an exact-read identity from a read tool call. A call without
+ * offset or limit represents a whole-file read. Any bounded call is
+ * identified by its exact offset and limit; overlapping ranges are not
+ * treated as duplicates.
+ */
+function skillReadKey(block: Record<string, unknown>): { toolCallId: string; key: string } | undefined {
+	if (block.type !== "toolCall") return undefined;
+	const name = block.name;
+	if (name !== "read" && name !== "functions.read") return undefined;
+	const toolCallId = block.id;
+	if (typeof toolCallId !== "string" || toolCallId.length === 0) return undefined;
+	const args = block.arguments;
+	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
+	const record = args as Record<string, unknown>;
+	const sourcePath = record.path;
+	if (typeof sourcePath !== "string" || sourcePath.length === 0 || !isSkillPath(sourcePath)) return undefined;
+
+	const hasOffset = record.offset !== undefined && record.offset !== null;
+	const hasLimit = record.limit !== undefined && record.limit !== null;
+	let scope = "full";
+	if (hasOffset || hasLimit) {
+		if (hasOffset && (typeof record.offset !== "number" || !Number.isInteger(record.offset))) return undefined;
+		if (hasLimit && (typeof record.limit !== "number" || !Number.isInteger(record.limit))) return undefined;
+		scope = `range:${hasOffset ? record.offset : "start"}:${hasLimit ? record.limit : "end"}`;
+	}
+	return {
+		toolCallId,
+		key: `${path.normalize(sourcePath.replaceAll("\\", "/"))}\u0000${scope}`,
+	};
+}
+
+/**
+ * Remove older completed reads of the same skill-file scope. A whole
+ * file only duplicates another whole-file read. A ranged read only
+ * duplicates the same path, offset, and limit. The newest completed
+ * read survives, and its matching tool call and result remain paired.
+ * The transform is independent of the three-tier token thresholds.
+ */
+export function collapseDuplicateSkillReads(
+	messages: ReadonlyArray<TrimmableMessage>,
+): TrimmableMessage[] {
+	const resultIds = new Set<string>();
+	for (const message of messages) {
+		if (message.role !== "toolResult") continue;
+		const toolCallId = (message as TrimmableMessage & { toolCallId?: unknown }).toolCallId;
+		if (typeof toolCallId === "string" && toolCallId.length > 0) resultIds.add(toolCallId);
+	}
+
+	const reads: SkillRead[] = [];
+	for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+		const message = messages[messageIndex];
+		if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+		for (let blockIndex = 0; blockIndex < message.content.length; blockIndex++) {
+			const block = message.content[blockIndex];
+			if (!block || typeof block !== "object") continue;
+			const read = skillReadKey(block as Record<string, unknown>);
+			if (read && resultIds.has(read.toolCallId)) {
+				reads.push({ messageIndex, blockIndex, ...read });
+			}
+		}
+	}
+	if (reads.length < 2) return messages.slice();
+
+	const seenKeys = new Set<string>();
+	const duplicateIds = new Set<string>();
+	for (let i = reads.length - 1; i >= 0; i--) {
+		const read = reads[i];
+		if (seenKeys.has(read.key)) duplicateIds.add(read.toolCallId);
+		else seenKeys.add(read.key);
+	}
+	if (duplicateIds.size === 0) return messages.slice();
+
+	const out: TrimmableMessage[] = [];
+	for (const message of messages) {
+		if (message.role === "toolResult") {
+			const toolCallId = (message as TrimmableMessage & { toolCallId?: unknown }).toolCallId;
+			if (typeof toolCallId === "string" && duplicateIds.has(toolCallId)) continue;
+		}
+		if (message.role === "assistant" && Array.isArray(message.content)) {
+			const filtered = message.content.filter((block) => {
+				if (!block || typeof block !== "object") return true;
+				const id = (block as { type?: unknown; id?: unknown }).id;
+				return !(typeof id === "string" && duplicateIds.has(id) && (block as { type?: unknown }).type === "toolCall");
+			});
+			if (filtered.length === 0) continue;
+			if (filtered.length !== message.content.length) {
+				out.push({ ...message, content: filtered });
+				continue;
+			}
+		}
+		out.push(message);
+	}
+	return out;
+}
 
 /**
  * Pure recency hardtrim for `intercom_message` custom entries. Drops

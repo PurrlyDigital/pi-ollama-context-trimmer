@@ -1127,6 +1127,37 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 	});
 });
 
+// ─── Duplicate skill reads ────────────────────────────────────────────
+
+describe("context handler — duplicate skill reads", () => {
+	it("removes an older exact whole-file read even in the verbatim tier", async () => {
+		const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "old", name: "read", arguments: { path: skillPath } }],
+				},
+				{ role: "toolResult", content: "old skill contents", toolCallId: "old" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } }],
+				},
+				{ role: "toolResult", content: "new skill contents", toolCallId: "new" },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		assert.equal(result.messages.some((message) => message.content === "old skill contents"), false);
+		assert.equal(result.messages.some((message) => message.content === "new skill contents"), true);
+		const toolCalls = result.messages.flatMap((message) =>
+			Array.isArray(message.content) ? message.content : [],
+		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;
+		assert.deepEqual(toolCalls.map((block) => block.id), ["new"]);
+	});
+});
+
 // ─── Persistence and resume (AC-8) ─────────────────────────────────────
 //
 // The wiring layer persists the fingerprints of messages it has
