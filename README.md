@@ -232,19 +232,21 @@ The existing behavior remains unchanged when operators set no options.
 
 ## How the token count is computed
 
-The extension estimates tokens from text length. The default is `Math.ceil(text_length / 3)`. The legacy divisor of `4` is available through the operator setting.
+The trimmer estimates tokens with `Math.ceil(text.length / divisor)`. The default divisor is `3`. The legacy divisor of `4` is available through the `tokenEstimatorDivisor` setting, using `PI_CONTEXT_TRIMMER_TOKEN_ESTIMATOR_DIVISOR` or the `tokenEstimatorDivisor` JSON key.
 
-String content stays as-is. Array content is concatenated across `{ type: "text", text: string }` blocks. Tool-result blocks are stringified. Non-text content blocks contribute their JSON-stringified length. This undercounts multimodal content, so the trimmer can act earlier rather than later.
+String content is counted as-is. For array content, an object with a string `text` field contributes that text. Other object blocks contribute their `JSON.stringify()` output, and primitive blocks contribute their string value. The trimmer joins those pieces before counting them. This undercounts multimodal content, so it can trim earlier rather than later.
 
-The divisor can also be calibrated. When the first assistant message in the stream carries a `usage.input` value, the trimmer derives a chars-per-token rate from it. It calibrates once per context hook, and that rate becomes the divisor for the hook.
+The wiring layer can calibrate the divisor from provider usage. Once per context event, it looks for the first assistant message that is not aborted or errored and has a positive, finite `usage.input`. It divides the system-prompt character count plus the extracted text from every message before that assistant by `usage.input`. That result becomes the divisor for the event. The assistant message that supplies `usage.input` is not included in the character count.
 
-When no usable `usage.input` is present, the configured divisor applies. This covers the first turn of a new session, test mocks without `usage`, and assistant turns that were aborted or errored. The configured divisor is the operator setting described above, or the default `3`.
+If no usable `usage.input` appears, the configured divisor applies. This is the normal path for a new session's first turn, test messages without usage data, and streams whose assistant messages are aborted or errored. The configured divisor is the operator setting above, or `3` when neither configuration channel sets one.
 
-When an eligible assistant message reports a positive finite `usage.totalTokens`, that provider total can force a trim when it reports an overage. The total includes the system prompt and protected content, so the trimmer compares it with the raw tier caps. A smaller preceding provider total cannot suppress the current event's visible-content estimate. The trimmer skips aborted and errored assistant messages.
+The trimmer also reads the latest positive, finite `usage.totalTokens` from a non-aborted, non-errored assistant message. A provider total above a raw tier cap can force the corresponding hold or drop decision even when the visible-content estimate is smaller. Because the provider total includes the system prompt and protected content, the trimmer compares it with the raw caps. A smaller total from an earlier message cannot hide an over-budget estimate from the current stream. When no usable provider total is available, the visible-content estimate determines the tier.
 
-The visible-content estimate sizes whole-turn drops and serves as the fallback when no usable provider total is present. Encrypted reasoning can make exact candidate sizes unavailable, so the extension attempts one oldest-turn cut at a time instead of claiming exact per-turn accounting.
+For the visible estimate, the trimmer subtracts system-prompt tokens and permanently protected message mass from both tier caps. Protected mass includes the dispatch slot when dispatch and original-prompt protection are enabled, pinned or other protected custom messages, preserved-path messages, and tool results paired with protected tool calls. Tier 1 returns the stream unchanged. Tier 2 holds it unchanged. Tier 3 drops the oldest whole turns until the remaining estimated mass fits under the effective tier 2 cap. The drop stops before the effective tier 1 floor would be undershot, so a stream can remain above the cap when the next whole-turn drop would cross that floor or when no eligible whole turn remains.
 
-The trimmer still estimates protected-slot tokens when sizing candidates, but it never removes protected content. Tool-call and tool-result pairs stay together.
+Protected messages survive even when they sit inside a dropped turn. A protected tool-call block can remain inside its assistant message with its matching result. When an unprotected tool-call block is dropped, its matching result is dropped too. Opaque reasoning can make exact per-turn sizes unavailable, so the trimmer cuts whole turns instead of claiming exact accounting.
+
+The loop guard has its own informational token signal. It samples up to the last five assistant messages after trimming, estimates them with the default divisor of `3`, and marks the sample flat when the largest and smallest values differ by no more than 5 percent. A sample of all zeroes is flat too. The trim event's calibrated or configured divisor does not change that separate signal.
 
 ## Development
 
