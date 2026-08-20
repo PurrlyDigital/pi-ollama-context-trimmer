@@ -1308,10 +1308,14 @@ export function collapseDuplicateSkillReads(
 	messages: ReadonlyArray<TrimmableMessage>,
 ): TrimmableMessage[] {
 	const resultIds = new Set<string>();
+	const resultCounts = new Map<string, number>();
 	for (const message of messages) {
 		if (message.role !== "toolResult") continue;
 		const toolCallId = (message as TrimmableMessage & { toolCallId?: unknown }).toolCallId;
-		if (typeof toolCallId === "string" && toolCallId.length > 0) resultIds.add(toolCallId);
+		if (typeof toolCallId === "string" && toolCallId.length > 0) {
+			resultIds.add(toolCallId);
+			resultCounts.set(toolCallId, (resultCounts.get(toolCallId) ?? 0) + 1);
+		}
 	}
 
 	const reads: SkillRead[] = [];
@@ -1339,7 +1343,7 @@ export function collapseDuplicateSkillReads(
 
 	const ambiguousIds = new Set<string>();
 	for (const [id, count] of toolCallCounts) {
-		if (count > 1 || nonSkillToolCallIds.has(id)) ambiguousIds.add(id);
+		if (count > 1 || nonSkillToolCallIds.has(id) || (resultCounts.get(id) ?? 0) > 1) ambiguousIds.add(id);
 	}
 	const seenKeys = new Set<string>();
 	const duplicateIds = new Set<string>();

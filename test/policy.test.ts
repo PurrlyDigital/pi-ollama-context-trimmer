@@ -399,6 +399,17 @@ describe("collapseDuplicateSkillReads", () => {
 		assert.equal(result.length, messages.length);
 		assert.equal((result[2].content as Array<{ name?: string }>)[0].name, "delete");
 	});
+
+	it("leaves duplicate results untouched when their ID is reused", () => {
+		const messages = [
+			readCall("old", { path: skillPath }),
+			readResult("old"),
+			readCall("new", { path: skillPath }),
+			readResult("new"),
+			readResult("new"),
+		];
+		assert.equal(collapseDuplicateSkillReads(messages).length, messages.length);
+	});
 });
 
 // ─── Verbatim tier (0–50k) ─────────────────────────────────────────────
