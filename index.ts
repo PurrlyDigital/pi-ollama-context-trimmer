@@ -128,28 +128,36 @@ function stampUserTurnAge<T extends { role: string }>(messages: ReadonlyArray<T>
 // The trimmer's per-message token estimator is `chars / divisor`. The
 // compile-time default is `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`; the
 // operator knob (`tokenEstimatorDivisor` env/JSON) overrides it. This
-// helper derives a calibrated divisor from the harness's ground-truth
-// `usage.input` on the first assistant message that carries one, so the
-// estimator auto-tunes to the model's actual chars-per-token rate
-// instead of a fixed guess. Falls back to `undefined` (caller applies
-// the configured divisor) when no usable `usage` is in the stream.
+// helper derives a rough chars-per-prompt-token divisor from the latest
+// usable assistant usage already attached to the stream. It uses Pi's
+// provider-neutral prompt-token components, including cache reads and
+// writes when present, instead of guessing how a provider encodes opaque
+// reasoning. The current stream is recalculated on every context event;
+// no calibration state is retained.
 
 /**
- * Type guard for a usable `usage.input` on a raw assistant message.
- * Mirrors the harness compaction module's `getAssistantUsage` predicate:
- * the assistant must not be aborted/error, and `usage.input` must be a
- * positive finite number. Messages without `usage` (test mocks, pre-
- * first-turn hooks, aborted/error turns) fall through to the fallback.
+ * Return the prompt-token total reported by a usable assistant message.
+ * Mirrors the harness compaction module's validity checks while using the
+ * prompt components rather than output-inclusive `totalTokens`. Cache
+ * fields are optional because some providers do not report them.
  */
-function usableAssistantUsage(msg: Record<string, unknown>): { input: number } | undefined {
+function usableAssistantUsage(msg: Record<string, unknown>): { promptTokens: number } | undefined {
 	if (msg.role !== "assistant") return undefined;
 	const stopReason = msg.stopReason;
 	if (stopReason === "aborted" || stopReason === "error") return undefined;
 	const usage = msg.usage;
 	if (typeof usage !== "object" || usage === null) return undefined;
-	const input = (usage as Record<string, unknown>).input;
-	if (typeof input !== "number" || !Number.isFinite(input) || input <= 0) return undefined;
-	return { input };
+	const fields = usage as Record<string, unknown>;
+	const input = fields.input;
+	if (typeof input !== "number" || !Number.isFinite(input) || input < 0) return undefined;
+	let promptTokens = input;
+	for (const field of ["cacheRead", "cacheWrite"] as const) {
+		const value = fields[field];
+		if (value === undefined) continue;
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) return undefined;
+		promptTokens += value;
+	}
+	return Number.isFinite(promptTokens) && promptTokens > 0 ? { promptTokens } : undefined;
 }
 
 /** Return the latest usable provider aggregate for the current stream. */
@@ -170,34 +178,36 @@ function latestProviderTotalTokens(rawMessages: ReadonlyArray<Record<string, unk
 }
 
 /**
- * Derive a calibrated chars-per-token divisor from the first assistant
- * message in the stream that carries a usable `usage.input`. The
- * numerator is the total character count the provider saw when it
- * produced that turn: the system prompt plus every message before the
- * calibration-point assistant (the assistant itself is the denominator,
- * not part of the numerator). Returns `undefined` when no usable
- * `usage` is present — the caller falls back to the configured divisor.
+ * Derive a calibrated chars-per-token divisor from the latest assistant
+ * message in the stream that carries usable prompt-token usage. The
+ * numerator is the character count the provider saw for that turn: the
+ * system prompt plus every message before the calibration-point assistant.
+ * The denominator is `input + cacheRead + cacheWrite`, using the standard
+ * Pi usage fields that are present. The current assistant is not part of
+ * that prompt, so its output does not distort the calibration.
  *
- * Pure: reads `systemPromptChars` (a number) and the raw message
- * array, returns a number or undefined. No I/O, no `process.*`. Kept
- * in the wiring layer (not `policy.ts`) because it reads the harness
- * `usage` field, which is a wiring-layer concern; the pure module's
- * `approximateTextTokens` / `approximateMessageTokens` signatures are
- * unchanged.
+ * Returns `undefined` when no usable usage is present. The caller then
+ * falls back to the configured divisor. No calibration state is retained
+ * between context events.
+ *
+ * Pure: reads `systemPromptChars` (a number) and the raw message array,
+ * returns a number or undefined. No I/O, no `process.*`. Kept in the
+ * wiring layer because it reads the harness `usage` field; the pure
+ * module's estimator signatures remain unchanged.
  */
 function deriveCalibratedDivisor(
 	rawMessages: ReadonlyArray<Record<string, unknown>>,
 	systemPromptChars: number,
 ): number | undefined {
-	for (let i = 0; i < rawMessages.length; i++) {
+	for (let i = rawMessages.length - 1; i >= 0; i--) {
 		const usage = usableAssistantUsage(rawMessages[i]!);
 		if (usage === undefined) continue;
 		let chars = systemPromptChars;
 		for (let j = 0; j < i; j++) {
 			chars += extractText(rawMessages[j]!.content).length;
 		}
-		const divisor = chars / usage.input;
-		return Number.isFinite(divisor) && divisor > 0 ? divisor : undefined;
+		const divisor = chars / usage.promptTokens;
+		if (Number.isFinite(divisor) && divisor > 0) return divisor;
 	}
 	return undefined;
 }
@@ -497,14 +507,15 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// background-promise `.then()` — hoisted to a single const.
 		const tokenEstimatorDivisor =
 			cfg.tokenEstimatorDivisor !== undefined ? Math.trunc(cfg.tokenEstimatorDivisor) : TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
-		// Calibrate the divisor from the harness's ground-truth `usage.input`
-		// on the first assistant message in the stream that carries one. The
-		// calibrated rate auto-tunes the estimator to the model's actual
-		// chars-per-token ratio; when no usable `usage` is present (pre-first-
-		// turn hooks, test mocks without `usage`, aborted/error turns), the
-		// configured `tokenEstimatorDivisor` above is the fallback. Derived
-		// once per hook and threaded as an immutable number through every
-		// downstream token-count call.
+		// Calibrate the divisor from the latest usable assistant usage in the
+		// stream. The prompt-token total includes cache reads and writes when
+		// the provider reports them, so opaque reasoning already present in a
+		// resumed stream contributes to the same rough estimate without a
+		// provider-specific conversion. When no usable usage is present
+		// (pre-first-turn hooks, test mocks without `usage`, aborted/error
+		// turns), the configured `tokenEstimatorDivisor` above is the fallback.
+		// Derive it once per hook and thread it through every downstream
+		// token-count call. No calibration state is retained between hooks.
 		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
 		const authoritativeTotalTokens = latestProviderTotalTokens(rawMessages);
 		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
