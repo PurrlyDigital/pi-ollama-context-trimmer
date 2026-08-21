@@ -2392,14 +2392,13 @@ describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring e
 	});
 
 });
-// ─── Calibrated token-estimator divisor from usage (AC-1..AC-8) ───────
+// ─── Calibrated token-estimator divisor from usage ────────────────────
 //
-// The wiring layer derives a calibrated chars-per-token divisor from
-// the harness's ground-truth `usage.input` on the first assistant
-// message that carries one, and falls back to the configured divisor
-// when no usable `usage` is present. The calibration runs per hook
-// (not at extension-load time), so the same loaded extension produces
-// different divisors for different streams — with-usage vs no-usage.
+// The wiring layer derives a rough chars-per-prompt-token divisor from
+// the latest usable assistant usage in the stream. It includes cache
+// reads and writes when present, and falls back to the configured
+// divisor when no usable usage exists. Calibration runs per hook and
+// retains no state between context events.
 //
 // Observable signal: the tier boundary. The tier-2 cap is 100k tokens;
 // the tier-3 drop fires above it. Two assistants of 180k chars each
@@ -2411,11 +2410,14 @@ describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring e
 //
 // Four paths:
 //   (a) usage-carrying stream → calibrated divisor 6 derived from
-//       usage.input; the oldest 180k assistant survives (tier 2 hold).
+//       the provider's prompt-token usage; the oldest 180k assistant
+//       survives (tier 2 hold).
 //   (b) no-usage fallback → configured divisor (env > JSON > 3)
 //       applies; the oldest 180k assistant is dropped (tier 3).
 //   (c) resumed session with multiple assistants carrying `usage` →
-//       the FIRST assistant is the calibration point, not the last.
+//       the LATEST assistant is the calibration point, so the estimate
+//       follows the current provider/model behavior without retained
+//       calibration state.
 //   (d) aborted/error assistant → unusable usage is skipped; the
 //       fallback divisor applies.
 
@@ -2448,9 +2450,10 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 	}
 
 	// (a) usage-carrying stream: the calibrated divisor is derived from
-	// the first assistant's `usage.input`. System prompt (6,000 chars) +
+	// the latest assistant's prompt-token usage. System prompt (6,000 chars) +
 	// user message before the assistant (6,000 chars) = 12,000 chars;
-	// usage.input = 2,000 → divisor = 6.0. Two 180k-char assistants
+	// input (1,500) + cacheRead (400) + cacheWrite (100) = 2,000
+	// prompt tokens → divisor = 6.0. Two 180k-char assistants
 	// after the calibration point → 360k chars / 6 = 60k tokens → tier 2
 	// hold → the oldest 180k assistant survives.
 	it("(a) usage-carrying stream: calibrated divisor holds mass that the /3 fallback would drop", async () => {
@@ -2460,7 +2463,7 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 		const event = {
 			messages: [
 				userMsg(userContent),
-				{ role: "assistant", content: "calibration point", usage: { input: 2_000, output: 1, totalTokens: 2_001 }, stopReason: "stop" },
+				{ role: "assistant", content: "calibration point", usage: { input: 1_500, cacheRead: 400, cacheWrite: 100, output: 1, totalTokens: 2_001 }, stopReason: "stop" },
 				assistantMsg("a".repeat(180_000)),
 				assistantMsg("b".repeat(180_000)),
 			],
@@ -2512,14 +2515,12 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 	});
 
 	// (c) resumed session: multiple assistants carrying `usage`. The
-	// FIRST assistant is the calibration point. First assistant:
+	// LATEST assistant is the calibration point. First assistant:
 	// usage.input = 400 → divisor = 2,400 / 400 = 6.0. Second assistant:
-	// usage.input = 800 → would give divisor 3.0 if it were the point
-	// (it's not). Two 180k-char assistants after → 360k chars. Under
-	// divisor 6.0 (first) → 60k tokens → tier 2 → oldest survives.
-	// Under divisor 3.0 (second, if used) → 120k tokens → tier 3 →
-	// oldest dropped.
-	it("(c) resumed session: first assistant is the calibration point, not the last", async () => {
+	// usage.input = 800 → divisor is about 3.0 at the latest point.
+	// Two 180k-char assistants after → 360k chars. The latest divisor
+	// reads this as over 100k tokens, so the oldest assistant drops.
+	it("(c) resumed session: latest assistant supplies the calibration", async () => {
 		const pi = await loadExtension();
 		const systemPrompt = "s".repeat(1_200);
 		const userContent = "u".repeat(1_200);
@@ -2529,18 +2530,18 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 				{ role: "assistant", content: "first turn", usage: { input: 400, output: 1, totalTokens: 401 }, stopReason: "stop" },
 				userMsg("second turn user"),
 				{ role: "assistant", content: "second turn", usage: { input: 800, output: 1, totalTokens: 801 }, stopReason: "stop" },
+				userMsg("third turn user"),
 				assistantMsg("a".repeat(180_000)),
+				userMsg("fourth turn user"),
 				assistantMsg("b".repeat(180_000)),
 			],
 		};
 		const result = await invokeWithSystemPrompt(pi, event, systemPrompt);
 		const oldestBig = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(180_000));
-		// First assistant (divisor 6.0) → 360k / 6 = 60k tokens →
-		// tier 2 → oldest 180k assistant survives. If the second
-		// assistant's rate (divisor 3.0) were used → 120k tokens →
-		// tier 3 → oldest dropped. Survival confirms first-assistant
-		// calibration.
-		assert.ok(oldestBig.length === 1, "first assistant is the calibration point (divisor 6.0 → tier 2 hold); the last assistant's rate (divisor 3.0 → tier 3 drop) is not used");
+		// Latest assistant's divisor (about 3.0) → over 100k tokens →
+		// tier 3 → oldest dropped. This confirms the calibration follows
+		// the latest usable provider usage in the current stream.
+		assert.equal(oldestBig.length, 0, "latest assistant usage supplies the current calibration; the older divisor does not remain in force");
 	});
 
 	// (d) aborted assistant: `usage` on an aborted assistant is not a
