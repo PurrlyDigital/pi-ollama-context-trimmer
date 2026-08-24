@@ -1159,7 +1159,8 @@ describe("context handler — duplicate skill reads", () => {
 
 	it("removes every marked pair before ordinary Tier 2 trimming", async () => {
 		const pi = await loadExtension();
-		const olderContext = pad("older context", 65_000);
+		const olderContext = pad("older context", 15_000);
+		const laterContext = pad("later context", 50_000);
 		const oldA = pad("old A", 2_000);
 		const newA = pad("new A", 2_000);
 		const oldB = pad("old B", 2_000);
@@ -1170,6 +1171,7 @@ describe("context handler — duplicate skill reads", () => {
 			messages: [
 				userMsg("dispatch"),
 				assistantMsg(olderContext),
+				assistantMsg(laterContext),
 				{
 					role: "assistant",
 					content: [{ type: "toolCall", id: "old-a", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/a/SKILL.md" } }],
@@ -1204,6 +1206,7 @@ describe("context handler — duplicate skill reads", () => {
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		assert.equal(result.messages.some((message) => message.content === olderContext), true);
+		assert.equal(result.messages.some((message) => message.content === laterContext), true);
 		assert.equal(result.messages.some((message) => message.content === oldA), false);
 		assert.equal(result.messages.some((message) => message.content === oldB), false);
 		assert.equal(result.messages.some((message) => message.content === oldC), false);
@@ -1214,6 +1217,10 @@ describe("context handler — duplicate skill reads", () => {
 			Array.isArray(message.content) ? message.content : [],
 		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;
 		assert.deepEqual(toolCalls.map((block) => block.id), ["new-a", "new-b", "new-c"]);
+		const toolResultIds = result.messages
+			.filter((message) => message.role === "toolResult")
+			.map((message) => message.toolCallId);
+		assert.deepEqual(toolResultIds, ["new-a", "new-b", "new-c"]);
 	});
 });
 
