@@ -1,14 +1,11 @@
 // ─── Token-tier trim policy (three-tier amended design) ────────────────
 //
-// Three tiers, keyed on the total token count of the trimmable messages
-// (chars / 4 per message, summed):
+// Three tiers, keyed on the total token count of the trimmable messages:
 //
 //   0–50k          → verbatim, no action
-//   50k–100k       → hold middle-band messages untouched (transient
-//                    behavior; Tier 3 catches oversize if it grows further)
-//   100k+          → hard drop the OLDEST whole turns (user+assistant+
-//                    tool+custom together) until the total is back under
-//                    100k
+//   50k–100k       → hold middle-band messages untouched
+//   100k+          → remove duplicate skill reads, then drop the oldest
+//                    eligible whole turns toward the Tier 1 target
 //
 // Subagent protected inputs (subagent-only, excluded from the 50k/100k
 // budget, never dropped):
@@ -191,7 +188,7 @@ export type TrimOptions = {
 	/**
 	 * Older completed skill-read IDs found before pre-budget transforms.
 	 * At the Tier 2 boundary, the policy removes their paired tool calls
-	 * and results before applying ordinary trimming.
+	 * and results before resetting eligible context toward Tier 1.
 	 */
 	duplicateSkillReadIds?: ReadonlySet<string>;
 	/**
@@ -264,6 +261,10 @@ export type TrimResult = {
 	 * informational only).
 	 */
 	totalTokens: number;
+};
+
+type InternalTrimOptions = TrimOptions & {
+	tier2Reset?: boolean;
 };
 
 // ─── Per-message token accounting (chars / divisor) ─────────────────────
@@ -628,19 +629,14 @@ export function totalTrimmableTokens(
  *   1. Compute `totalTrimmableTokens` (subtracting protected slots).
  *   2. Tier selection:
  *      - total ≤ verbatimMaxTokens           → return messages as-is.
- *      - verbatimMaxTokens < total ≤ summarizeMaxTokens
- *                                            → return messages as-is
- *                                              (transient hold-untouched
- *                                              behavior; Tier 3 catches
- *                                              oversize if it grows
- *                                              further).
- *      - total > summarizeMaxTokens          → hard-drop oldest whole
- *                                              turns until total ≤
- *                                              summarizeMaxTokens.
+ *      - verbatimMaxTokens < total < summarizeMaxTokens
+ *                                            → return messages as-is.
+ *      - total ≥ summarizeMaxTokens          → remove duplicate skill-read
+ *                                              pairs, then drop oldest
+ *                                              whole turns toward Tier 1.
  *
- * The summarize path was removed. Tier 2 is a transient hold-untouched
- * seam; Tier 3 catches oversize on the next context event if the
- * middle-band mass grows further.
+ * The middle band stays untouched. Reaching the Tier 2 ceiling starts a
+ * reset so later turns can reuse a smaller context window.
  */
 export async function applyThreeTierTrim(
 	messages: ReadonlyArray<TrimmableMessage>,
@@ -713,61 +709,48 @@ export async function applyThreeTierTrim(
 	const authoritativeTotal = options.authoritativeTotalTokens;
 	const hasAuthoritativeTotal = Number.isFinite(authoritativeTotal) && authoritativeTotal! > 0;
 	const providerOverVerbatim = hasAuthoritativeTotal && authoritativeTotal! > verbatimMax;
-	const providerOverSummarize = hasAuthoritativeTotal && authoritativeTotal! > summarizeMax;
 	const total = hasAuthoritativeTotal ? authoritativeTotal! : estimatedTotal;
-	const needsDrop = estimatedTotal > effectiveSummarizeMax || providerOverSummarize;
 	const needsHold = estimatedTotal > effectiveVerbatimMax || providerOverVerbatim;
 	const duplicateSkillReadIds = options.duplicateSkillReadIds ?? findDuplicateSkillReadIds(messages);
-	const reachesDuplicateSkillReadTrimBoundary =
+	const removableDuplicateSkillReadIds = new Set(
+		[...duplicateSkillReadIds].filter((id) => !protectedToolCallIds.has(id)),
+	);
+	const forceTier2Reset = (options as InternalTrimOptions).tier2Reset === true;
+	const reachesTier2ResetBoundary =
+		forceTier2Reset ||
 		(estimatedTotal > 0 && estimatedTotal >= effectiveSummarizeMax) ||
 		(hasAuthoritativeTotal && authoritativeTotal! >= summarizeMax);
-	if (duplicateSkillReadIds.size > 0 && reachesDuplicateSkillReadTrimBoundary) {
-		return applyThreeTierTrim(collapseDuplicateSkillReads(messages, duplicateSkillReadIds), {
+	if (removableDuplicateSkillReadIds.size > 0 && reachesTier2ResetBoundary) {
+		const resetOptions: InternalTrimOptions = {
 			...options,
 			duplicateSkillReadIds: new Set(),
-		});
+			tier2Reset: true,
+		};
+		return applyThreeTierTrim(
+			collapseDuplicateSkillReads(messages, removableDuplicateSkillReadIds),
+			resetOptions,
+		);
 	}
 
-	// Tier 3: hard-drop oldest whole turns until the estimated
-	// trimmable remainder reaches its effective candidate cap. When
-	// only the provider total shows an overage, force the first eligible
-	// candidate cut so opaque reasoning can still make progress.
-	if (needsDrop) {
-		const { messages: dropped, droppedTurns, shouldFallThrough } = dropOldestTurns(
+	// At the Tier 2 ceiling, reset the eligible context toward the
+	// effective Tier 1 target. An authoritative provider total can
+	// trigger the reset even when opaque content leaves the visible
+	// estimate below that target.
+	if (reachesTier2ResetBoundary) {
+		const resetDropFloor = effectiveDropFloor;
+		const { messages: dropped, droppedTurns } = dropOldestTurns(
 			messages,
-			effectiveSummarizeMax,
+			effectiveVerbatimMax,
 			protectedCustomTypes,
 			protectDispatch,
 			preservedPatterns,
-			effectiveDropFloor,
+			resetDropFloor,
 			protectedToolCallIds,
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
 			divisor,
-			providerOverSummarize && estimatedTotal <= effectiveSummarizeMax,
+			hasAuthoritativeTotal && authoritativeTotal! >= summarizeMax && estimatedTotal <= effectiveVerbatimMax,
 		);
-		// Drop-floor fall-through: when the next-oldest turn would
-		// push the trimmable total below `dropFloorTokens`, stop
-		// dropping and return the surviving messages as-is (Tier 2
-		// hold-untouched behavior). The summarize path was removed;
-		// this is the transient hold-untouched seam.
-		if (shouldFallThrough) {
-			return {
-				messages: dropped,
-				droppedTurns,
-				totalTokens: totalTrimmableTokens(
-					dropped,
-					protectedCustomTypes,
-					protectDispatch,
-					preservedPatterns,
-					protectedToolCallIds,
-					keepLastUserPromptsProtectedIndices,
-					keepOriginalPrompt,
-					divisor,
-				),
-			};
-		}
-		// Re-check; we may have overshot (no trimmable turns left).
 		const postDropTotal = totalTrimmableTokens(
 			dropped,
 			protectedCustomTypes,
@@ -778,10 +761,6 @@ export async function applyThreeTierTrim(
 			keepOriginalPrompt,
 			divisor,
 		);
-		// If still over effectiveSummarizeMax (a single trimmable
-		// turn is larger than the tier ceiling), return the dropped
-		// messages as-is. The summarize fallback was removed; Tier 3
-		// catches oversize on the next context event if it grows further.
 		return {
 			messages: dropped,
 			droppedTurns,
@@ -789,8 +768,7 @@ export async function applyThreeTierTrim(
 		};
 	}
 
-	// Tier 2: hold middle-band messages untouched (transient behavior;
-	// Tier 3 catches oversize if it grows further).
+	// Tier 2 middle band: hold messages untouched.
 	if (needsHold) {
 		return {
 			messages: messages.slice(),

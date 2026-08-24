@@ -358,13 +358,37 @@ describe("collapseDuplicateSkillReads", () => {
 			readCall("new", { path: skillPath }),
 			readResult("new"),
 		];
+		const retained = collapseDuplicateSkillReads(messages);
 		const result = await applyThreeTierTrim(messages, {
-			verbatimMaxTokens: 1,
+			verbatimMaxTokens: totalTrimmableTokens(retained),
 			summarizeMaxTokens: totalTrimmableTokens(messages),
 		});
 		assert.equal(result.messages.some((message) => message.content === "contents for old"), false);
 		assert.equal(result.messages.some((message) => message.content === "contents for new"), true);
 		assert.equal(result.droppedTurns, 0);
+	});
+
+	it("keeps a protected duplicate pair at the Tier 2 ceiling", async () => {
+		const messages = [
+			readCall("old", { path: skillPath }),
+			readResult("old"),
+			readCall("new", { path: skillPath }),
+			readResult("new"),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 1,
+			summarizeMaxTokens: 1,
+			dropFloorTokens: 0,
+			protectDispatch: false,
+			protectedToolCallIds: new Set(["old"]),
+		});
+		const oldCallSurvives = result.messages.some(
+			(message) => Array.isArray(message.content) && message.content.some(
+				(block) => (block as { type?: string; id?: string }).type === "toolCall" && (block as { id?: string }).id === "old",
+			),
+		);
+		assert.equal(oldCallSurvives, true);
+		assert.equal(result.messages.some((message) => message.content === "contents for old"), true);
 	});
 
 	it("deduplicates only the exact range, not overlapping or whole-file reads", () => {
@@ -446,14 +470,9 @@ describe("applyThreeTierTrim — verbatim tier (total ≤ 50k)", () => {
 	});
 });
 
-// ─── Tier 2 empty seam (transient hold-untouched behavior) ────────────
-//
-// The summarize path was removed. Tier 2 holds middle-band messages
-// untouched; Tier 3 catches oversize if it grows further. This
-// describe block locks the transient hold-untouched behavior as a
-// discoverable, greppable contract.
+// ─── Tier 2 middle band (hold-untouched behavior) ────────────────────
 
-describe("applyThreeTierTrim — tier 2 empty seam (hold-untouched)", () => {
+describe("applyThreeTierTrim — Tier 2 middle band", () => {
 	it("returns messages unchanged when total is between verbatim and summarize caps", async () => {
 		const messages = trimmableMass(60_000);
 		const result = await applyThreeTierTrim(messages);
@@ -490,6 +509,44 @@ describe("applyThreeTierTrim — tier 2 empty seam (hold-untouched)", () => {
 		const messages = trimmableMass(60_000);
 		const result = await applyThreeTierTrim(messages);
 		assert.equal(result.totalTokens, totalTrimmableTokens(messages));
+	});
+});
+
+describe("applyThreeTierTrim — Tier 2 reset", () => {
+	it("drops oldest eligible turns at the ceiling until the Tier 1 target", async () => {
+		const messages = [
+			assistantMsg("a".repeat(30)),
+			assistantMsg("b".repeat(30)),
+			assistantMsg("c".repeat(30)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 10,
+			summarizeMaxTokens: 30,
+			dropFloorTokens: 10,
+			protectDispatch: false,
+		});
+		assert.equal(result.droppedTurns, 2);
+		assert.equal(result.messages.some((message) => message.content === "a".repeat(30)), false);
+		assert.equal(result.messages.some((message) => message.content === "b".repeat(30)), false);
+		assert.equal(result.messages.some((message) => message.content === "c".repeat(30)), true);
+		assert.equal(result.totalTokens, 10);
+	});
+
+	it("stops above Tier 1 when the next whole turn would cross the floor", async () => {
+		const messages = [
+			assistantMsg("a".repeat(36)),
+			assistantMsg("b".repeat(36)),
+			assistantMsg("c".repeat(36)),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 10,
+			summarizeMaxTokens: 30,
+			dropFloorTokens: 10,
+			protectDispatch: false,
+		});
+		assert.equal(result.droppedTurns, 2);
+		assert.equal(result.messages.some((message) => message.content === "c".repeat(36)), true);
+		assert.equal(result.totalTokens, 12);
 	});
 });
 
@@ -1517,7 +1574,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 
 describe("applyThreeTierTrim — effective budget with protected mass + system-prompt term", () => {
 
-	it("uses an authoritative aggregate total for tier selection", async () => {
+	it("uses an authoritative aggregate total at the reset boundary", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("old user turn", 1),
 			assistantMsg("old assistant turn"),
@@ -1527,10 +1584,11 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 		const result = await applyThreeTierTrim(messages, {
 			verbatimMaxTokens: 50,
 			summarizeMaxTokens: 100,
-			authoritativeTotalTokens: 101,
+			authoritativeTotalTokens: 100,
 			protectDispatch: false,
 		});
-		assert.equal(result.droppedTurns, 1, "provider overage triggers a fuzzy whole-turn cut");
+		assert.equal(result.droppedTurns, 1, "provider total at the ceiling triggers a whole-turn reset");
+		assert.ok(result.totalTokens < 100, "the returned estimate is not the unchanged provider total");
 		assert.equal(result.messages.some((m) => m.content === "old user turn"), false, "oldest candidate is removed");
 		assert.equal(result.messages.some((m) => m.content === "new assistant turn"), true, "newest candidate survives");
 	});
@@ -1544,6 +1602,7 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 			verbatimMaxTokens: 50,
 			summarizeMaxTokens: 100,
 			authoritativeTotalTokens: 90,
+			dropFloorTokens: 50,
 			protectDispatch: false,
 		});
 		assert.equal(result.droppedTurns, 1, "the current visible estimate still triggers tier 3");
@@ -2026,7 +2085,7 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 		const result = await applyThreeTierTrim(messages, {
 			verbatimMaxTokens: 10,
 			summarizeMaxTokens: 100,
-			dropFloorTokens: 0,
+			dropFloorTokens: 10,
 			keepLastUserPrompts: 2,
 			keepOriginalPrompt: false,
 		});
