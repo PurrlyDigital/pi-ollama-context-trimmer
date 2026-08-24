@@ -8,9 +8,9 @@ Subagents can accumulate long tool-result tails. Eventually, those tails exceed 
 
 It sorts trimmable messages into three bands. Each band has its own rule.
 
-The extension targets Ollama Cloud's per-request billing. It works with any provider or model, but it is a poor fit for token-based billing subscriptions.
+The extension works with any provider or model. It does not require cache reporting.
 
-Anthropic and OpenAI bill by tokens and cache full text. Trimming breaks that cache. Ollama bills per request and GPU time, which is the billing model this extension assumes.
+At the reset boundary, it makes a larger safe cut so cache-enabled providers can reuse the smaller context for more turns. Providers without cache reporting also receive smaller context windows.
 
 ## What it does
 
@@ -19,8 +19,8 @@ On each LLM call, the extension inspects the message stream and applies one of t
 | Tier | Range | Action |
 |------|-------|--------|
 | Verbatim | 0 to 50k trimmable tokens | Send the full message stream. |
-| Hold | 50k to 100k | Leave middle-band messages untouched. If the stream grows further, the drop rule handles the excess. |
-| Drop | over 100k | Drop the oldest eligible turns until the effective total fits under tier 2. Stop before the configured tier 1 floor is undershot. |
+| Hold | over 50k and below 100k | Leave middle-band messages untouched. |
+| Reset | 100k or more | Remove duplicate skill-read pairs, then drop the oldest eligible turns toward tier 1. Stop before the configured tier 1 floor is undershot. |
 
 Protected subagent inputs never count toward this budget, and never get dropped.
 
@@ -132,11 +132,11 @@ Set the cap with `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` or the `reasoningBlock
 
 Chain and parallel completions can appear as both `subagent-notify` and, when an intercom target is set, `intercom_message`. `subagent-notify` is a display notification controlled by `subagentNotifyKeepLast`. `intercom_message` is a grouped result controlled by `intercomKeepLast`. The two limits are independent. See the `subagentNotifyKeepLast` row in the config-file table for the env-var and JSON-key reference.
 
-Four kinds of transcript entries can accumulate outside the three-tier budget: repeated skill reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer records duplicate skill reads while it builds the message stream. It removes the marked older pairs only at the Tier 2 ceiling, before ordinary Tier 2 trimming. The other passes run before the three-tier budget and only when the relevant extension is installed.
+Four kinds of transcript entries can accumulate outside the three-tier budget: repeated skill reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer records duplicate skill reads while it builds the message stream. At the Tier 2 ceiling, it removes marked older pairs before it resets eligible context toward Tier 1. The other passes run before the three-tier budget and only when the relevant extension is installed.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
-| 0 | Completed reads under a `skills` directory | Tier 2 ceiling reached | Keep every pair below the ceiling. At the ceiling or above, keep the newest read when the same skill file was read with the same scope. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together. |
+| 0 | Completed reads under a `skills` directory | Tier 2 ceiling reached | Keep every pair below the ceiling. At the ceiling or above, keep the newest read when the same skill file was read with the same scope. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together before the reset. |
 | 1 | `intercom_message` (`role: "custom"`, `customType: "intercom_message"`) | `intercom` tool registered (pi-intercom) | Keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. |
 | 2 | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Keep the first occurrence of each run identity in stream order. Drop later duplicates. There is no operator knob. Run identity priority is `details.sessionValue`, then the `details` fingerprint, then the content-header agent name, then the stream index. |
 | 2b | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | After deduplication, keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. When unset, use the resolved `intercomKeepLast` value. |
@@ -157,7 +157,7 @@ The personality file is opt-in. It is machine-specific and has no default path.
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `VERBATIM_TIER_MAX_TOKENS` | `50_000` | Trimmable totals at or below this value are returned verbatim. |
-| `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this value enter the drop tier. |
+| `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals at or above this value start the reset. |
 
 The configured tier 1 token limit is also the drop floor. The trimmer accounts for system-prompt and permanently protected mass before comparing the floor and tier 2 limits. Retained reasoning blocks and user prompts are budget-aware and can be removed oldest-first above tier 2.
 
@@ -240,9 +240,9 @@ The wiring layer can calibrate the divisor from provider usage. Once per context
 
 If no usable prompt usage appears, the configured divisor applies. This is the normal path for a new session's first turn, test messages without usage data, and streams whose assistant messages are aborted or errored. The configured divisor is the operator setting above, or `3` when neither configuration channel sets one.
 
-The trimmer also reads the latest positive, finite `usage.totalTokens` from a non-aborted, non-errored assistant message. A provider total above a raw tier cap can force the corresponding hold or drop decision even when the visible-content estimate is smaller. Because the provider total includes the system prompt and protected content, the trimmer compares it with the raw caps. A smaller total from an earlier message cannot hide an over-budget estimate from the current stream. When no usable provider total is available, the visible-content estimate determines the tier.
+The trimmer also reads the latest positive, finite `usage.totalTokens` from a non-aborted, non-errored assistant message. A provider total at or above the raw Tier 2 ceiling can trigger a reset even when the visible-content estimate is smaller. Because the provider total includes the system prompt and protected content, the trimmer compares it with the raw caps. A smaller total from an earlier message cannot hide an over-budget estimate from the current stream. When no usable provider total is available, the visible-content estimate determines the tier.
 
-For the visible estimate, the trimmer subtracts system-prompt tokens and permanently protected message mass from both tier caps. Protected mass includes the dispatch slot when dispatch and original-prompt protection are enabled, pinned or other protected custom messages, preserved-path messages, and tool results paired with protected tool calls. Tier 1 returns the stream unchanged. Tier 2 holds it unchanged. Tier 3 drops the oldest whole turns until the remaining estimated mass fits under the effective tier 2 cap. The drop stops before the effective tier 1 floor would be undershot, so a stream can remain above the cap when the next whole-turn drop would cross that floor or when no eligible whole turn remains.
+For the visible estimate, the trimmer subtracts system-prompt tokens and permanently protected message mass from both tier caps. Protected mass includes the dispatch slot when dispatch and original-prompt protection are enabled, pinned or other protected custom messages, preserved-path messages, and tool results paired with protected tool calls. Tier 1 returns the stream unchanged. The middle band holds it unchanged. At the Tier 2 ceiling, the trimmer removes duplicate skill-read pairs, then drops the oldest whole turns toward the effective Tier 1 target. The reset stops before the effective tier 1 floor would be undershot, so a stream can remain above the target when the next whole-turn drop would cross that floor or when no eligible whole turn remains.
 
 Protected messages survive even when they sit inside a dropped turn. A protected tool-call block can remain inside its assistant message with its matching result. When an unprotected tool-call block is dropped, its matching result is dropped too. Opaque reasoning can make exact per-turn sizes unavailable, so the trimmer cuts whole turns instead of claiming exact accounting.
 
@@ -250,7 +250,7 @@ The loop guard has its own informational token signal. It samples up to the last
 
 ## Development
 
-Run the test suite. It currently contains 361 tests and takes about one second on a modern laptop.
+Run the test suite. It currently contains 366 tests and takes about one second on a modern laptop.
 
 ```bash
 npm install   # installs tsx as a dev dependency

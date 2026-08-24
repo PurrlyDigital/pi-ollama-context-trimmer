@@ -1157,7 +1157,7 @@ describe("context handler — duplicate skill reads", () => {
 		assert.deepEqual(toolCalls.map((block) => block.id), ["old", "new"]);
 	});
 
-	it("removes every marked pair before ordinary Tier 2 trimming", async () => {
+	it("removes marked pairs, then resets eligible context toward Tier 1", async () => {
 		const pi = await loadExtension();
 		const olderContext = pad("older context", 15_000);
 		const laterContext = pad("later context", 50_000);
@@ -1205,8 +1205,14 @@ describe("context handler — duplicate skill reads", () => {
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		assert.equal(result.messages.some((message) => message.content === olderContext), true);
+		assert.equal(result.messages.some((message) => message.content === olderContext), false);
 		assert.equal(result.messages.some((message) => message.content === laterContext), true);
+		assert.equal(
+			result.messages.some(
+				(message) => typeof message.content === "string" && message.content.includes("Context Trimmer extension"),
+			),
+			true,
+		);
 		assert.equal(result.messages.some((message) => message.content === oldA), false);
 		assert.equal(result.messages.some((message) => message.content === oldB), false);
 		assert.equal(result.messages.some((message) => message.content === oldC), false);
