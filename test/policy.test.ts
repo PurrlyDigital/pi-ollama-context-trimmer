@@ -29,6 +29,7 @@ import {
 	LOOP_GUARD_NUDGE_TEXT,
 	LOOP_GUARD_BLOCK_TEXT,
 	collapseDuplicateSkillReads,
+	findDuplicateSkillReadIds,
 	computeKeepLastUserPromptsProtectedIndices,
 	isPathPreserved,
 	isProtectedSlot,
@@ -342,10 +343,28 @@ describe("collapseDuplicateSkillReads", () => {
 			readCall("new", { path: skillPath }),
 			readResult("new"),
 		];
-		const result = collapseDuplicateSkillReads(messages);
+		const duplicateIds = findDuplicateSkillReadIds(messages);
+		assert.deepEqual([...duplicateIds], ["old"]);
+		const result = collapseDuplicateSkillReads(messages, duplicateIds);
 		assert.equal(result.length, 2);
 		assert.equal((result[0].content as Array<{ id?: string }>)[0].id, "new");
 		assert.equal((result[1] as TrimmableMessage & { toolCallId?: string }).toolCallId, "new");
+	});
+
+	it("removes marked pairs at the Tier 2 ceiling", async () => {
+		const messages = [
+			readCall("old", { path: skillPath }),
+			readResult("old"),
+			readCall("new", { path: skillPath }),
+			readResult("new"),
+		];
+		const result = await applyThreeTierTrim(messages, {
+			verbatimMaxTokens: 1,
+			summarizeMaxTokens: totalTrimmableTokens(messages),
+		});
+		assert.equal(result.messages.some((message) => message.content === "contents for old"), false);
+		assert.equal(result.messages.some((message) => message.content === "contents for new"), true);
+		assert.equal(result.droppedTurns, 0);
 	});
 
 	it("deduplicates only the exact range, not overlapping or whole-file reads", () => {

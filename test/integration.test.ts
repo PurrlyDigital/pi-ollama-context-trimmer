@@ -1130,7 +1130,7 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 // ─── Duplicate skill reads ────────────────────────────────────────────
 
 describe("context handler — duplicate skill reads", () => {
-	it("removes an older exact whole-file read even in the verbatim tier", async () => {
+	it("keeps duplicate pairs below the Tier 2 ceiling", async () => {
 		const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
 		const pi = await loadExtension();
 		const event = {
@@ -1149,8 +1149,40 @@ describe("context handler — duplicate skill reads", () => {
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		assert.equal(result.messages.some((message) => message.content === "old skill contents"), false);
+		assert.equal(result.messages.some((message) => message.content === "old skill contents"), true);
 		assert.equal(result.messages.some((message) => message.content === "new skill contents"), true);
+		const toolCalls = result.messages.flatMap((message) =>
+			Array.isArray(message.content) ? message.content : [],
+		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;
+		assert.deepEqual(toolCalls.map((block) => block.id), ["old", "new"]);
+	});
+
+	it("removes duplicate pairs before ordinary Tier 2 trimming", async () => {
+		const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
+		const pi = await loadExtension();
+		const olderContext = pad("older context", 68_000);
+		const oldContents = pad("old skill contents", 5_000);
+		const newContents = pad("new skill contents", 5_000);
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(olderContext),
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "old", name: "read", arguments: { path: skillPath } }],
+				},
+				{ role: "toolResult", content: oldContents, toolCallId: "old" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } }],
+				},
+				{ role: "toolResult", content: newContents, toolCallId: "new" },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		assert.equal(result.messages.some((message) => message.content === olderContext), true);
+		assert.equal(result.messages.some((message) => message.content === oldContents), false);
+		assert.equal(result.messages.some((message) => message.content === newContents), true);
 		const toolCalls = result.messages.flatMap((message) =>
 			Array.isArray(message.content) ? message.content : [],
 		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;

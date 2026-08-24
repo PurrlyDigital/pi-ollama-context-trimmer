@@ -55,7 +55,7 @@ import { join } from "node:path";
 import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
-	collapseDuplicateSkillReads,
+	findDuplicateSkillReadIds,
 	applyReasoningBlockCap,
 	applySubagentNotifyKeepLast,
 	applyThreeTierTrim,
@@ -579,6 +579,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				customType: typeof m.customType === "string" ? m.customType : undefined,
 			};
 		});
+		const duplicateSkillReadIds = findDuplicateSkillReadIds(base);
 		// When a trimmable message's source path matches a preserved
 		// pattern, stamp it with the `PRESERVED_CUSTOM_TYPE` so the
 		// existing `protectedCustomTypes` channel protects it. The
@@ -611,10 +612,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		//       `toolCall` block survives inside the dropped
 		//       assistant message; `text`/`thinking` and unprotected
 		//       `toolCall` blocks are dropped).
-		// Computed BEFORE the pre-budget collapse passes and the
+		// Computed BEFORE the pre-budget transforms and the
 		// reasoning-block cap so the set reflects the assistant
 		// messages as the model emitted them (the cap / pre-budget
-		// passes may drop assistant message content, but the
+		// transforms may drop assistant message content, but the
 		// set is already computed against the source stream).
 		const protectedToolCallIds = extractProtectedToolCallIds(base, expandedPreservedPatterns);
 		// Apply the reasoning-block-count cap to the base message
@@ -635,36 +636,13 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// `base` (the stream before pinned injection) so the
 		// pinned synthetic is never at risk of being dropped.
 		const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
-		// Pre-budget collapse (extension-gated category trims). Each
-		// pass runs on `base` (after source-path stamping, before
-		// pinned injection) and its output feeds the existing
-		// `applyReasoningBlockCap` call. The ordering is fixed per
-		// the AC-6 binding: Rule 1 → Rule 2 → Rule 3 → reasoning
-		// cap → pinned → three-tier. Each pass is skipped entirely
-		// (no array allocation, no scan) when its gate is false.
-		// The pinned synthetic is never at risk — it is injected
-		// AFTER the pre-budget passes, matching the existing
-		// `applyReasoningBlockCap` invariant. The pre-budget passes
-		// run on the source-path-stamped `base` so a
-		// `toolResult:subagent` entry that also matches a
-		// preserved-path pattern is identifiable; the
-		// category-specific predicates and the preserved-paths
-		// channel are disjoint surfaces (predicates target
-		// `role+customType` / `role+toolName`; the preserved-paths
-		// channel stamps `PRESERVED_CUSTOM_TYPE` on `base` AFTER
-		// the pre-budget window). The cache-substituted
-		// `intercom_message` entries preserve `customType` (the
-		// cache spreads the original message, including
-		// `customType`); Rule 1 still applies on a cache-substituted
-		// entry.
 		const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;
 		const subagentNotifyKeepLast = cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : intercomKeepLast;
 		const intercomInstalled = resolveIntercomInstalled();
 		const subagentsInstalled = resolveSubagentsInstalled();
-		const afterSkillReadCollapse = collapseDuplicateSkillReads(base);
 		const afterRule1: TrimmableMessage[] = intercomInstalled
-			? applyIntercomKeepLast(afterSkillReadCollapse, intercomKeepLast)
-			: afterSkillReadCollapse;
+			? applyIntercomKeepLast(base, intercomKeepLast)
+			: base;
 		const afterRule2: TrimmableMessage[] = intercomInstalled
 			? dedupSubagentNotify(afterRule1)
 			: afterRule1;
@@ -712,6 +690,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectDispatch: resolveProtectDispatch(),
 			preservedPatterns: expandedPreservedPatterns,
 			protectedToolCallIds,
+			duplicateSkillReadIds,
 			tokenEstimatorDivisor: effectiveDivisor,
 			authoritativeTotalTokens,
 			systemPromptTokens,
