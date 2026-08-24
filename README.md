@@ -128,21 +128,21 @@ The cap runs before the three-tier trim and pinned injection on every context ev
 
 Set the cap with `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` or the `reasoningBlockCap` JSON key. Both accept integers in `[-1, ∞)`. The default is `-1`, which passes every block through. Set it to `0` to send none, or to a positive integer N to keep the last N.
 
-## Pre-budget collapse
+## Transcript cleanup
 
 Chain and parallel completions can appear as both `subagent-notify` and, when an intercom target is set, `intercom_message`. `subagent-notify` is a display notification controlled by `subagentNotifyKeepLast`. `intercom_message` is a grouped result controlled by `intercomKeepLast`. The two limits are independent. See the `subagentNotifyKeepLast` row in the config-file table for the env-var and JSON-key reference.
 
-Four kinds of transcript entries accumulate outside the three-tier budget: repeated skill reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer processes each kind in a separate pre-budget pass. Skill-read deduplication is always active. The other passes run only when the relevant extension is installed.
+Four kinds of transcript entries can accumulate outside the three-tier budget: repeated skill reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer records duplicate skill reads while it builds the message stream. It removes the marked older pairs only at the Tier 2 ceiling, before ordinary Tier 2 trimming. The other passes run before the three-tier budget and only when the relevant extension is installed.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
-| 0 | Completed reads under a `skills` directory | Always active | Keep the newest read when the same skill file was read with the same scope. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together. |
+| 0 | Completed reads under a `skills` directory | Tier 2 ceiling reached | Keep every pair below the ceiling. At the ceiling or above, keep the newest read when the same skill file was read with the same scope. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together. |
 | 1 | `intercom_message` (`role: "custom"`, `customType: "intercom_message"`) | `intercom` tool registered (pi-intercom) | Keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. |
 | 2 | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | Keep the first occurrence of each run identity in stream order. Drop later duplicates. There is no operator knob. Run identity priority is `details.sessionValue`, then the `details` fingerprint, then the content-header agent name, then the stream index. |
 | 2b | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | `intercom` tool registered (pi-intercom) | After deduplication, keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. When unset, use the resolved `intercomKeepLast` value. |
 | 3 | `toolResult:subagent` (`role: "toolResult"`, `toolName: "subagent"`) | `subagent` tool registered (pi-subagents) | Keep only the last entry in stream order. There is no operator knob. |
 
-This cleanup runs before the reasoning-block cap, pinned injection, and three-tier trim. The pinned synthetic is injected after the cleanup and is never at risk.
+Rules 1 through 3 run before the reasoning-block cap, pinned injection, and three-tier trim. Rule 0 records candidates before those passes, then removes them at the Tier 2 ceiling in the trim policy. The pinned synthetic is never at risk.
 
 ## Config
 

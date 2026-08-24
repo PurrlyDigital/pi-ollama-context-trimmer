@@ -189,6 +189,12 @@ export type TrimOptions = {
 	 */
 	protectedToolCallIds?: ReadonlySet<string>;
 	/**
+	 * Older completed skill-read IDs found before pre-budget transforms.
+	 * At the Tier 2 boundary, the policy removes their paired tool calls
+	 * and results before applying ordinary trimming.
+	 */
+	duplicateSkillReadIds?: ReadonlySet<string>;
+	/**
 	 * Override the per-message token estimator divisor (default 3,
 	 * `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`). Used by both
 	 * `approximateMessageTokens` and `approximateTextTokens` for
@@ -711,6 +717,16 @@ export async function applyThreeTierTrim(
 	const total = hasAuthoritativeTotal ? authoritativeTotal! : estimatedTotal;
 	const needsDrop = estimatedTotal > effectiveSummarizeMax || providerOverSummarize;
 	const needsHold = estimatedTotal > effectiveVerbatimMax || providerOverVerbatim;
+	const duplicateSkillReadIds = options.duplicateSkillReadIds ?? findDuplicateSkillReadIds(messages);
+	const reachesDuplicateSkillReadTrimBoundary =
+		(estimatedTotal > 0 && estimatedTotal >= effectiveSummarizeMax) ||
+		(hasAuthoritativeTotal && authoritativeTotal! >= summarizeMax);
+	if (duplicateSkillReadIds.size > 0 && reachesDuplicateSkillReadTrimBoundary) {
+		return applyThreeTierTrim(collapseDuplicateSkillReads(messages, duplicateSkillReadIds), {
+			...options,
+			duplicateSkillReadIds: new Set(),
+		});
+	}
 
 	// Tier 3: hard-drop oldest whole turns until the estimated
 	// trimmable remainder reaches its effective candidate cap. When
@@ -1238,11 +1254,11 @@ export function applyReasoningBlockCap(
 	return out;
 }
 
-// ─── Pre-budget collapse (extension-gated category trims) ─────────
+// ─── Transcript cleanup ───────────────────────────────────────────
 //
-// Four pure array-in/array-out transforms collapse transcript entries
-// before the three-tier budget. Skill-read deduplication is always on;
-// the remaining transforms are gated by their owning extensions.
+// Three pure array-in/array-out transforms collapse transcript entries
+// before the three-tier budget. Skill-read detection records duplicate
+// pairs here for removal at the Tier 2 boundary.
 //
 // Purity: each function is a pure array transform — no `process.*`,
 // no Node I/O, no `pi` reference. The wiring layer owns extension
@@ -1298,15 +1314,13 @@ function skillReadKey(block: Record<string, unknown>): { toolCallId: string; key
 }
 
 /**
- * Remove older completed reads of the same skill-file scope. A whole
+ * Find older completed reads of the same skill-file scope. A whole
  * file only duplicates another whole-file read. A ranged read only
- * duplicates the same path, offset, and limit. The newest completed
- * read survives, and its matching tool call and result remain paired.
- * The transform is independent of the three-tier token thresholds.
+ * duplicates the same path, offset, and limit.
  */
-export function collapseDuplicateSkillReads(
+export function findDuplicateSkillReadIds(
 	messages: ReadonlyArray<TrimmableMessage>,
-): TrimmableMessage[] {
+): Set<string> {
 	const resultIds = new Set<string>();
 	const resultCounts = new Map<string, number>();
 	for (const message of messages) {
@@ -1339,7 +1353,6 @@ export function collapseDuplicateSkillReads(
 			}
 		}
 	}
-	if (reads.length < 2) return messages.slice();
 
 	const ambiguousIds = new Set<string>();
 	for (const [id, count] of toolCallCounts) {
@@ -1353,6 +1366,17 @@ export function collapseDuplicateSkillReads(
 		if (seenKeys.has(read.key)) duplicateIds.add(read.toolCallId);
 		else seenKeys.add(read.key);
 	}
+	return duplicateIds;
+}
+
+/**
+ * Remove marked duplicate skill-read pairs while keeping the newest
+ * completed read for each exact path and scope.
+ */
+export function collapseDuplicateSkillReads(
+	messages: ReadonlyArray<TrimmableMessage>,
+	duplicateIds: ReadonlySet<string> = findDuplicateSkillReadIds(messages),
+): TrimmableMessage[] {
 	if (duplicateIds.size === 0) return messages.slice();
 
 	const out: TrimmableMessage[] = [];
