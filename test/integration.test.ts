@@ -1157,36 +1157,63 @@ describe("context handler — duplicate skill reads", () => {
 		assert.deepEqual(toolCalls.map((block) => block.id), ["old", "new"]);
 	});
 
-	it("removes duplicate pairs before ordinary Tier 2 trimming", async () => {
-		const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
+	it("removes every marked pair before ordinary Tier 2 trimming", async () => {
 		const pi = await loadExtension();
-		const olderContext = pad("older context", 68_000);
-		const oldContents = pad("old skill contents", 5_000);
-		const newContents = pad("new skill contents", 5_000);
+		const olderContext = pad("older context", 65_000);
+		const oldA = pad("old A", 2_000);
+		const newA = pad("new A", 2_000);
+		const oldB = pad("old B", 2_000);
+		const newB = pad("new B", 2_000);
+		const oldC = pad("old C", 2_000);
+		const newC = pad("new C", 2_000);
 		const event = {
 			messages: [
 				userMsg("dispatch"),
 				assistantMsg(olderContext),
 				{
 					role: "assistant",
-					content: [{ type: "toolCall", id: "old", name: "read", arguments: { path: skillPath } }],
+					content: [{ type: "toolCall", id: "old-a", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/a/SKILL.md" } }],
 				},
-				{ role: "toolResult", content: oldContents, toolCallId: "old" },
+				{ role: "toolResult", content: oldA, toolCallId: "old-a" },
 				{
 					role: "assistant",
-					content: [{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } }],
+					content: [{ type: "toolCall", id: "new-a", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/a/SKILL.md" } }],
 				},
-				{ role: "toolResult", content: newContents, toolCallId: "new" },
+				{ role: "toolResult", content: newA, toolCallId: "new-a" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "old-b", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/b/SKILL.md" } }],
+				},
+				{ role: "toolResult", content: oldB, toolCallId: "old-b" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "new-b", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/b/SKILL.md" } }],
+				},
+				{ role: "toolResult", content: newB, toolCallId: "new-b" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "old-c", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/c/SKILL.md" } }],
+				},
+				{ role: "toolResult", content: oldC, toolCallId: "old-c" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "new-c", name: "read", arguments: { path: "/home/operator/.pi/agent/skills/c/SKILL.md" } }],
+				},
+				{ role: "toolResult", content: newC, toolCallId: "new-c" },
 			],
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		assert.equal(result.messages.some((message) => message.content === olderContext), true);
-		assert.equal(result.messages.some((message) => message.content === oldContents), false);
-		assert.equal(result.messages.some((message) => message.content === newContents), true);
+		assert.equal(result.messages.some((message) => message.content === oldA), false);
+		assert.equal(result.messages.some((message) => message.content === oldB), false);
+		assert.equal(result.messages.some((message) => message.content === oldC), false);
+		assert.equal(result.messages.some((message) => message.content === newA), true);
+		assert.equal(result.messages.some((message) => message.content === newB), true);
+		assert.equal(result.messages.some((message) => message.content === newC), true);
 		const toolCalls = result.messages.flatMap((message) =>
 			Array.isArray(message.content) ? message.content : [],
 		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;
-		assert.deepEqual(toolCalls.map((block) => block.id), ["new"]);
+		assert.deepEqual(toolCalls.map((block) => block.id), ["new-a", "new-b", "new-c"]);
 	});
 });
 
