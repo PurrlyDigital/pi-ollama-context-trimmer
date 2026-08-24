@@ -2723,6 +2723,123 @@ describe("context handler: provider totals do not suppress the current stream", 
 			"identical current streams produce identical identity and order after different provider totals",
 		);
 	});
+
+	it("does not reuse an oversized provider total after its reset", async () => {
+		const savedTier2MaxTokens = process.env[CONFIG_ENV.tier2MaxTokens];
+		process.env[CONFIG_ENV.tier2MaxTokens] = "150000";
+		try {
+			const pi = await loadExtension();
+			const entries: Array<{ customType: string; data?: unknown }> = [];
+			(pi as unknown as {
+				appendEntry: (customType: string, data?: unknown) => void;
+			}).appendEntry = (customType, data) => entries.push({ customType, data });
+			const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
+			const retainedAssistantText = "retained-assistant-" + "b".repeat(180_000);
+			const firstResult = (await invokeContext(pi, {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg(oldAssistantText),
+					userMsg("follow-up"),
+					assistantMsg(retainedAssistantText),
+					userMsg("provider-report"),
+					{
+						role: "assistant",
+						content: "provider report",
+						usage: { totalTokens: 150_000 },
+						stopReason: "stop",
+						timestamp: 1,
+					},
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(firstResult.messages.some((message) => message.content === oldAssistantText), false);
+			assert.equal(firstResult.messages.some((message) => message.content === retainedAssistantText), true);
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
+
+			const secondResult = (await invokeContext(pi, {
+				messages: [
+					...firstResult.messages,
+					userMsg("later turn"),
+					assistantMsg("later-assistant-" + "c".repeat(180_000)),
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(secondResult.messages.some((message) => message.content === retainedAssistantText), true);
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
+
+			await invokeContext(pi, {
+				messages: [
+					...secondResult.messages,
+					userMsg("fresh provider report"),
+					{
+						role: "assistant",
+						content: "fresh provider report",
+						usage: { totalTokens: 150_000 },
+						stopReason: "stop",
+						timestamp: 2,
+					},
+				],
+			});
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 2);
+		} finally {
+			if (savedTier2MaxTokens === undefined) delete process.env[CONFIG_ENV.tier2MaxTokens];
+			else process.env[CONFIG_ENV.tier2MaxTokens] = savedTier2MaxTokens;
+		}
+	});
+
+	it("keeps a duplicate fallback report consumed after an earlier duplicate drops", async () => {
+		const savedTier2MaxTokens = process.env[CONFIG_ENV.tier2MaxTokens];
+		process.env[CONFIG_ENV.tier2MaxTokens] = "150000";
+		try {
+			const pi = await loadExtension();
+			const entries: Array<{ customType: string; data?: unknown }> = [];
+			(pi as unknown as {
+				appendEntry: (customType: string, data?: unknown) => void;
+			}).appendEntry = (customType, data) => entries.push({ customType, data });
+			const duplicateProviderReport = () => ({
+				role: "assistant",
+				content: "duplicate provider report",
+				usage: { totalTokens: 150_000 },
+				stopReason: "stop",
+			});
+			const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
+			const retainedAssistantText = "retained-assistant-" + "b".repeat(180_000);
+			const firstResult = (await invokeContext(pi, {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg(oldAssistantText),
+					userMsg("first provider report"),
+					duplicateProviderReport(),
+					userMsg("retained turn"),
+					assistantMsg(retainedAssistantText),
+					userMsg("latest provider report"),
+					duplicateProviderReport(),
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(firstResult.messages.filter((message) => message.content === "duplicate provider report").length, 1);
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
+
+			const secondResult = (await invokeContext(pi, {
+				messages: [
+					...firstResult.messages,
+					userMsg("later turn"),
+					assistantMsg("later-assistant-" + "c".repeat(180_000)),
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(secondResult.messages.some((message) => message.content === retainedAssistantText), true);
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
+
+			await invokeContext(pi, {
+				messages: [
+					...secondResult.messages,
+					userMsg("fresh identical provider report"),
+					duplicateProviderReport(),
+				],
+			});
+			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 2);
+		} finally {
+			if (savedTier2MaxTokens === undefined) delete process.env[CONFIG_ENV.tier2MaxTokens];
+			else process.env[CONFIG_ENV.tier2MaxTokens] = savedTier2MaxTokens;
+		}
+	});
 });
 
 describe("context handler: transport boundary", () => {
