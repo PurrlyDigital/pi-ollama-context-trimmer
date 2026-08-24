@@ -31,7 +31,7 @@ import * as path from "node:path";
 /** Verbatim tier ceiling. Totals at or below this are untouched. */
 export const VERBATIM_TIER_MAX_TOKENS = 50_000;
 
-/** Summarize tier ceiling. Totals above this fall into the drop tier. */
+/** Tier 2 ceiling. Totals at or above this start the reset. */
 export const SUMMARIZE_TIER_MAX_TOKENS = 100_000;
 
 

@@ -157,7 +157,7 @@ The personality file is opt-in. It is machine-specific and has no default path.
 | Constant | Default | Meaning |
 |----------|---------|---------|
 | `VERBATIM_TIER_MAX_TOKENS` | `50_000` | Trimmable totals at or below this value are returned verbatim. |
-| `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals above this value enter the drop tier. |
+| `SUMMARIZE_TIER_MAX_TOKENS` | `100_000` | Trimmable totals at or above this value start the reset. |
 
 The configured tier 1 token limit is also the drop floor. The trimmer accounts for system-prompt and permanently protected mass before comparing the floor and tier 2 limits. Retained reasoning blocks and user prompts are budget-aware and can be removed oldest-first above tier 2.
 
