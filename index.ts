@@ -166,23 +166,54 @@ type ProviderTotal = {
 	reportKey: string;
 };
 
-function providerReportIdentity(msg: Record<string, unknown>, totalTokens: number): string {
+type ProviderReportIdentityStore = {
+	fallbackId(message: Record<string, unknown>): string;
+	copyFallbackId(source: object, target: object): void;
+};
+
+function createProviderReportIdentityStore(): ProviderReportIdentityStore {
+	const fallbackIds = new WeakMap<object, string>();
+	let nextFallbackId = 0;
+	return {
+		fallbackId(message) {
+			let id = fallbackIds.get(message);
+			if (id === undefined) {
+				id = `fallback-${nextFallbackId}`;
+				nextFallbackId += 1;
+				fallbackIds.set(message, id);
+			}
+			return id;
+		},
+		copyFallbackId(source, target) {
+			const id = fallbackIds.get(source);
+			if (id !== undefined) fallbackIds.set(target, id);
+		},
+	};
+}
+
+function providerReportIdentity(
+	msg: Record<string, unknown>,
+	totalTokens: number,
+	identityStore: ProviderReportIdentityStore,
+): string {
+	const timestamp = msg.timestamp;
+	const validTimestamp = typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : undefined;
 	const responseId = msg.responseId;
 	if (typeof responseId === "string" && responseId.length > 0) {
-		return JSON.stringify(["response", responseId, totalTokens]);
+		return JSON.stringify(["response", responseId, validTimestamp, totalTokens]);
 	}
-	const timestamp = msg.timestamp;
-	if (typeof timestamp === "number" && Number.isFinite(timestamp)) {
-		return JSON.stringify(["timestamp", timestamp, totalTokens]);
+	if (validTimestamp !== undefined) {
+		return JSON.stringify(["timestamp", validTimestamp, totalTokens]);
 	}
-	const text = extractText(msg.content);
-	return JSON.stringify(["fallback", totalTokens, text.length, text.slice(0, 128), text.slice(-128)]);
+	return JSON.stringify(["fallback", identityStore.fallbackId(msg), totalTokens]);
 }
 
 /** Return the latest usable provider aggregate and its stable report identity. */
-function latestProviderTotalTokens(rawMessages: ReadonlyArray<Record<string, unknown>>): ProviderTotal | undefined {
+function latestProviderTotalTokens(
+	rawMessages: ReadonlyArray<Record<string, unknown>>,
+	identityStore: ProviderReportIdentityStore,
+): ProviderTotal | undefined {
 	let latest: ProviderTotal | undefined;
-	const occurrences = new Map<string, number>();
 	for (const msg of rawMessages) {
 		if (msg.role !== "assistant") continue;
 		const stopReason = msg.stopReason;
@@ -191,10 +222,10 @@ function latestProviderTotalTokens(rawMessages: ReadonlyArray<Record<string, unk
 		if (typeof usage !== "object" || usage === null) continue;
 		const totalTokens = (usage as Record<string, unknown>).totalTokens;
 		if (typeof totalTokens !== "number" || !Number.isFinite(totalTokens) || totalTokens <= 0) continue;
-		const identity = providerReportIdentity(msg, totalTokens);
-		const occurrence = (occurrences.get(identity) ?? 0) + 1;
-		occurrences.set(identity, occurrence);
-		latest = { totalTokens, reportKey: JSON.stringify([identity, occurrence]) };
+		latest = {
+			totalTokens,
+			reportKey: providerReportIdentity(msg, totalTokens, identityStore),
+		};
 	}
 	return latest;
 }
@@ -381,6 +412,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const pinnedTier = createPinnedTier({
 		personalityPath: cfg.personalityPath,
 	});
+	const providerReportIdentities = createProviderReportIdentityStore();
 	let lastResetProviderReportKey: string | undefined;
 
 	// Subagent-context pin decision. Resolved once at load — the
@@ -541,7 +573,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// Derive it once per hook and thread it through every downstream
 		// token-count call. No calibration state is retained between hooks.
 		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
-		const providerTotal = latestProviderTotalTokens(rawMessages);
+		const providerTotal = latestProviderTotalTokens(rawMessages, providerReportIdentities);
 		const authoritativeTotalTokens = providerTotal?.reportKey === lastResetProviderReportKey
 			? undefined
 			: providerTotal?.totalTokens;
@@ -598,13 +630,15 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			// stamps on top. The source-path stamp goes via the seam
 			// helper so the type contract is enforced.
 			const stamped = stampSourcePath(m, sourcePath) as TrimmableMessage;
-			return {
+			const trimmable: TrimmableMessage = {
 				...stamped,
 				role: stampedAges[i].role as TrimmableMessage["role"],
 				content: m.content,
 				userTurnAge: stampedAges[i].userTurnAge,
 				customType: typeof m.customType === "string" ? m.customType : undefined,
 			};
+			providerReportIdentities.copyFallbackId(m, trimmable);
+			return trimmable;
 		});
 		const duplicateSkillReadIds = findDuplicateSkillReadIds(base);
 		// When a trimmable message's source path matches a preserved
