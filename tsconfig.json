@@ -35,6 +35,7 @@
     "./pinned-tier.ts",
     "./test/policy.test.ts",
     "./test/config.test.ts",
-    "./test/integration.test.ts"
+    "./test/integration.test.ts",
+    "./test/guarded-closure-reproduction.test.ts"
   ]
 }
