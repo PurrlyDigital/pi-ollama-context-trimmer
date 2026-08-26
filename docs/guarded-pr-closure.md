@@ -10,7 +10,7 @@ Run the disposable check from the repository root.
 npx tsx --test test/guarded-closure-reproduction.test.ts
 ```
 
-The check requires Git on your `PATH`. It creates a temporary bare remote and temporary working clones. It does not contact GitHub, read operator configuration, or change this repository. It removes the temporary directory after each test.
+The check requires Git on your `PATH`. It creates a temporary bare remote and temporary working clones. It ignores inherited Git environment settings, does not contact GitHub, does not read operator configuration, and does not change this repository. It removes the temporary directory after each test.
 
 A successful run covers these scenarios:
 

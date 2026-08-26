@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -48,7 +48,7 @@ afterEach(() => {
 });
 
 function runGit(cwd: string, home: string, args: string[]): string {
-	const { GIT_DIR: _gitDir, GIT_WORK_TREE: _gitWorkTree, ...environment } = process.env;
+	const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.toUpperCase().startsWith("GIT_")));
 	return execFileSync("git", args, {
 		cwd,
 		encoding: "utf8",
@@ -62,6 +62,22 @@ function runGit(cwd: string, home: string, args: string[]): string {
 			XDG_CONFIG_HOME: join(home, ".config"),
 		},
 	}).trim();
+}
+
+function withEnvironment(values: Record<string, string>, action: () => void): void {
+	const original = new Map(Object.keys(values).map((key) => [key, process.env[key]]));
+	try {
+		Object.assign(process.env, values);
+		action();
+	} finally {
+		for (const [key, value] of original) {
+			if (value === undefined) {
+				delete process.env[key];
+			} else {
+				process.env[key] = value;
+			}
+		}
+	}
 }
 
 function commit(work: string, home: string, message: string): void {
@@ -296,6 +312,25 @@ describe("guarded closure reproduction", () => {
 			refValue(fixture.root, fixture.home, `refs/heads/${fixture.unrelated}`, fixture.remote),
 			fixture.unrelatedHead,
 		);
+	});
+
+	it("ignores inherited Git configuration", () => {
+		const outside = mkdtempSync(join(tmpdir(), "context-trimmer-outside-"));
+		fixtureRoots.push(outside);
+		writeFileSync(join(outside, "sentinel.txt"), "outside\n");
+		withEnvironment(
+			{
+				GIT_CONFIG_COUNT: "1",
+				GIT_CONFIG_KEY_0: "core.worktree",
+				GIT_CONFIG_VALUE_0: outside,
+			},
+			() => {
+				const fixture = createFixture();
+				assert.equal(closeFixture(fixture).status, "closed");
+			},
+		);
+		assert.equal(readFileSync(join(outside, "sentinel.txt"), "utf8"), "outside\n");
+		assert.deepEqual(readdirSync(outside).sort(), ["sentinel.txt"]);
 	});
 
 	it("rejects an incomplete or mismatched binding before merge", () => {
