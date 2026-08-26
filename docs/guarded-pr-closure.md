@@ -12,14 +12,15 @@ npx tsx --test test/guarded-closure-reproduction.test.ts
 
 The check requires Git on your `PATH`. It creates a temporary bare remote and temporary working clones. It does not contact GitHub, read operator configuration, or change this repository. It removes the temporary directory after each test.
 
-A successful run reports these four cases:
+A successful run covers these scenarios:
 
 - A valid bound change reaches the default branch, then removes only its local and remote feature refs.
 - Missing approval or a mismatched pull request stops before merge.
 - A failed remote-ref cleanup records rejection and stops without later cleanup.
 - A replay after merge accepts absent bound refs without another merge or an unrelated ref deletion.
+- A replay with an ambiguous identity or incomplete binding rejects before a new mutation.
 
-Run the focused check before the full suite.
+After the focused check passes, run the full suite.
 
 ```bash
 npm test

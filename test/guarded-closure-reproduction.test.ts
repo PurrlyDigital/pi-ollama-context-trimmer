@@ -21,6 +21,7 @@ type ClosureOptions = {
 	baseBranch?: string;
 	defaultBranch?: string;
 	prNumber?: number;
+	bindingComplete?: boolean;
 	expectedHead?: string;
 	merged?: boolean;
 	failRemoteCleanup?: boolean;
@@ -172,6 +173,9 @@ function closeFixture(fixture: Fixture, options: ClosureOptions = {}): ClosureRe
 
 	if ((options.prNumber ?? fixture.prNumber) !== fixture.prNumber) {
 		return reject("pr-identity");
+	}
+	if (!(options.bindingComplete ?? true)) {
+		return reject("binding");
 	}
 	if (!(options.open ?? true)) {
 		return reject("state");
@@ -363,6 +367,27 @@ describe("guarded closure reproduction", () => {
 			],
 		});
 		assert.equal(refValue(fixture.work, fixture.home, "refs/heads/main"), mainHead);
+		assert.equal(refValue(fixture.work, fixture.home, `refs/heads/${fixture.unrelated}`), fixture.unrelatedHead);
+		assert.equal(
+			refValue(fixture.root, fixture.home, `refs/heads/${fixture.unrelated}`, fixture.remote),
+			fixture.unrelatedHead,
+		);
+	});
+
+	it("rejects replay with ambiguous identity or an incomplete binding", () => {
+		const fixture = createFixture();
+		assert.equal(closeFixture(fixture).status, "closed");
+		const mainHead = refValue(fixture.work, fixture.home, "refs/heads/main");
+		const ambiguousIdentity = closeFixture(fixture, { merged: true, prNumber: fixture.prNumber + 1 });
+		const incompleteBinding = closeFixture(fixture, { merged: true, bindingComplete: false });
+		const mismatchedHead = closeFixture(fixture, { merged: true, expectedHead: "not-the-bound-head" });
+
+		assert.deepEqual(ambiguousIdentity, { status: "rejected", events: ["rejected:pr-identity"] });
+		assert.deepEqual(incompleteBinding, { status: "rejected", events: ["rejected:binding"] });
+		assert.deepEqual(mismatchedHead, { status: "rejected", events: ["validated", "rejected:merged-evidence"] });
+		assert.equal(refValue(fixture.work, fixture.home, "refs/heads/main"), mainHead);
+		assert.equal(refValue(fixture.work, fixture.home, `refs/heads/${fixture.feature}`), undefined);
+		assert.equal(refValue(fixture.root, fixture.home, `refs/heads/${fixture.feature}`, fixture.remote), undefined);
 		assert.equal(refValue(fixture.work, fixture.home, `refs/heads/${fixture.unrelated}`), fixture.unrelatedHead);
 		assert.equal(
 			refValue(fixture.root, fixture.home, `refs/heads/${fixture.unrelated}`, fixture.remote),
