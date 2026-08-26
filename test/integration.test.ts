@@ -117,6 +117,17 @@ function pad(text: string, n: number): string {
 	return text + " ".repeat(Math.max(0, n * 4 - text.length));
 }
 
+function withTier2Boundary(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+	const [first, ...rest] = messages;
+	if (first === undefined) return messages;
+	return [
+		first,
+		assistantMsg(pad("tier2-reset-old", 80_000)),
+		assistantMsg(pad("tier2-reset-retained", 40_000)),
+		...rest,
+	];
+}
+
 async function invokeContext(pi: ReturnType<typeof createMockPi>, event: unknown) {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
@@ -987,7 +998,7 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 		process.env[CONFIG_ENV.loopGuardThreshold] = "3";
 		process.env[CONFIG_ENV.loopGuardHardBlock] = "3";
 		const pi = await loadExtension();
-		const event = { messages: buildLoopSession() };
+		const event = { messages: withTier2Boundary(buildLoopSession()) };
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// The block-text synthetic must be prepended.
 		const block = result.messages.find(
@@ -1068,6 +1079,23 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 			(m) => m.role === "user" && m.content === "dispatch",
 		);
 		assert.ok(dispatch, "dispatch task must survive the hard-block path");
+	});
+
+	it("hard-block stays a non-destructive nudge below the local Tier 2 boundary", async () => {
+		process.env[CONFIG_ENV.loopGuard] = "1";
+		process.env[CONFIG_ENV.loopGuardThreshold] = "3";
+		process.env[CONFIG_ENV.loopGuardHardBlock] = "3";
+		const pi = await loadExtension();
+		const result = (await invokeContext(pi, { messages: buildLoopSession() })) as {
+			messages: Array<Record<string, unknown>>;
+		};
+		const block = result.messages.find(
+			(m) => m.role === "user" && typeof m.content === "string" && (m.content as string).includes("blocked"),
+		);
+		assert.equal(block, undefined, "below Tier 2, the hard-block cannot remove tool calls");
+		const toolCallCount = result.messages.flatMap((m) => Array.isArray(m.content) ? m.content : [])
+			.filter((block) => (block as { type?: string }).type === "toolCall").length;
+		assert.equal(toolCallCount, 3, "every original loop tool call survives below Tier 2");
 	});
 
 	// ─── Default-ON regression (gap this issue closes) ────────────
@@ -1361,9 +1389,9 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		return n;
 	}
 
-	// ── (a) cap = 1: only the last thinking block survives into the three-tier trim ──
+	// ── (a) cap = 1 applies after the local Tier 2 reset ──
 
-	it("cap = 1: only the last thinking block survives into the three-tier trim", async () => {
+	it("cap = 1: keeps only the last thinking block after the local Tier 2 reset", async () => {
 		// Build a stream with 4 thinking blocks spread across 2
 		// assistant messages. With cap = 1, only the LAST thinking
 		// block (the last block of the last message) survives.
@@ -1374,14 +1402,11 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		const pi = await loadExtension();
 		const event = {
-			messages: [
+			messages: withTier2Boundary([
 				userMsg("dispatch"),
-				// Two thinking blocks on the first assistant.
 				{ role: "assistant", content: thinkingBlocks(2, 10) },
-				// Two thinking blocks on the second assistant (the
-				// last block of the stream is the second of these).
 				{ role: "assistant", content: thinkingBlocks(2, 10) },
-			],
+			]),
 		};
 		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// (i) Only ONE thinking block survives across the whole
@@ -1493,48 +1518,32 @@ describe("context handler — reasoning-block cap (AC-4)", () => {
 		assert.equal(countThinkingBlocksIn(result.messages), 4, "default (-1 passthrough) keeps every thinking block when neither channel is configured");
 	});
 
-	// ── Bonus: cap runs before the three-tier trim — the post-cap mass reaches the budget ──
-
-	it("cap runs BEFORE the three-tier trim — the budget accounts for the post-cap mass (cap = 0 → all thinking blocks dropped before the budget is read)", async () => {
-		// Build a stream with 4 large thinking blocks (~15k tokens
-		// each) plus a small assistant turn. With cap = 0, every
-		// thinking block is dropped BEFORE the three-tier budget
-		// is computed. The post-cap trimmable mass is just the
-		// small assistant turn — well under the 50k verbatim cap
-		// — so the session lands in tier 1 (verbatim) instead of
-		// tier 2 (where the full ~60k thinking-block mass would
-		// have pushed the budget). The cap's "run before the
-		// three-tier trim" ordering is the structural fact under
-		// test: the budget sees the post-cap mass.
+	it("cap = 0 leaves thinking intact below the local Tier 2 boundary", async () => {
 		process.env[CONFIG_ENV.reasoningBlockCap] = "0";
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		const pi = await loadExtension();
-		const event = {
+		const result = (await invokeContext(pi, {
 			messages: [
 				userMsg("dispatch"),
-				// Two thinking blocks × 15k tokens = 30k.
-				{ role: "assistant", content: thinkingBlocks(2, 15_000) },
-				// Two more thinking blocks × 15k tokens = 30k.
-				{ role: "assistant", content: thinkingBlocks(2, 15_000) },
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
 			],
-		};
-		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// (i) Every thinking block is dropped (cap = 0).
-		assert.equal(countThinkingBlocksIn(result.messages), 0, "cap=0 drops every thinking block across the stream");
-		// (ii) The session lands in the verbatim tier (no
-		// drop) because the post-cap trimmable mass
-		// is zero — the budget sees the post-cap mass, not the
-		// pre-cap mass. The result has 3 messages: pinned +
-		// dispatch + (the two assistant messages with empty
-		// content arrays, since the cap emptied them).
-		// The behavioral proof: a tier-2 session that would
-		// have dropped the 30k thinking-block content lands
-		// in tier 1 with cap=0 because the cap empties the
-		// content arrays before the budget is read.
-		const verbatimBlocks = result.messages
-			.flatMap((m) => (Array.isArray(m.content) ? (m.content as Array<{ type: string; text?: string }>) : []))
-			.filter((b) => typeof b.text === "string" && b.text.startsWith("[summa:"));
-		assert.equal(verbatimBlocks.length, 0, "verbatim — the session is in tier 1 (post-cap mass is zero, well under the 50k verbatim cap)");
+		})) as { messages: Array<Record<string, unknown>> };
+		assert.equal(countThinkingBlocksIn(result.messages), 4, "the cap cannot rewrite thinking below Tier 2");
+	});
+
+	it("cap = 0 removes thinking after the local Tier 2 reset", async () => {
+		process.env[CONFIG_ENV.reasoningBlockCap] = "0";
+		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+		const pi = await loadExtension();
+		const result = (await invokeContext(pi, {
+			messages: withTier2Boundary([
+				userMsg("dispatch"),
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+				{ role: "assistant", content: thinkingBlocks(2, 10) },
+			]),
+		})) as { messages: Array<Record<string, unknown>> };
+		assert.equal(countThinkingBlocksIn(result.messages), 0, "the cap runs only after the local reset");
 	});
 });
 
@@ -1614,16 +1623,12 @@ describe("persistence seam — appendEntry records drop state", () => {
 	});
 });
 
-// ─── Pre-budget collapse — gating + placement (AC-8 integration) ───
+// ─── Tier 2 cleanup — extension gating ─────────────────────────────
 //
-// End-to-end tests for the pre-budget collapse rules (Rules 1, 2,
-// 3) and their extension-gating detection. The mock pi here exposes
-// a configurable `getAllTools()` so each test can register the
-// `intercom` and/or `subagent` tool independently and assert the
-// gate fires (or does not fire) accordingly. The rules run on `base`
-// before `applyReasoningBlockCap` and before pinned injection; the
-// tests assert the collapsed entries are visible in the trimmed
-// output the handler returns.
+// End-to-end tests for transcript cleanup Rules 1, 2, and 3. The mock
+// Pi exposes `getAllTools()` so tests can register `intercom` and
+// `subagent` independently. The rules run only after the local reset.
+// The tests assert the returned stream reflects that gate.
 
 function createMockPiWithTools(toolNames: readonly string[]) {
 	const handlers: Record<string, Handler[]> = {};
@@ -1769,7 +1774,7 @@ async function fireContextBasic(pi: ReturnType<typeof createMockPiWithTools>, ev
 	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
 }
 
-describe("pre-budget collapse — gating detection (AC-1 end-to-end)", () => {
+describe("Tier 2 cleanup — extension-gating detection", () => {
 	let sConfigPath: string | undefined;
 
 	beforeEach(() => {
@@ -1787,13 +1792,13 @@ describe("pre-budget collapse — gating detection (AC-1 end-to-end)", () => {
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		const pi = await loadExtensionWithTools(["intercom"]);
 		const event = {
-			messages: [
+			messages: withTier2Boundary([
 				userMsg("dispatch"),
 				{ role: "custom", content: "icm-1", customType: "intercom_message" },
 				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
 				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
 				{ role: "custom", content: "icm-2", customType: "intercom_message" },
-			],
+			]),
 		};
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// After Rule 1 (keepLast=-1 passthrough, no intercom_message
@@ -1826,12 +1831,12 @@ describe("pre-budget collapse — gating detection (AC-1 end-to-end)", () => {
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		const pi = await loadExtensionWithTools(["subagent"]);
 		const event = {
-			messages: [
+			messages: withTier2Boundary([
 				userMsg("dispatch"),
 				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
 				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
 				{ role: "toolResult", content: "sub-3", toolName: "subagent" },
-			],
+			]),
 		};
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		// After Rule 3, only the LATEST toolResult:subagent survives.
@@ -1888,7 +1893,7 @@ describe("pre-budget collapse — gating detection (AC-1 end-to-end)", () => {
 	});
 });
 
-describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () => {
+describe("Tier 2 cleanup — post-reset behavior", () => {
 	let sConfigPath: string | undefined;
 	let sIntercomKeepLast: string | undefined;
 
@@ -1915,7 +1920,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		for (let i = 1; i <= 30; i++) {
 			messages.push({ role: "custom", content: `icm-${i}`, customType: "intercom_message" });
 		}
-		const event = { messages };
+		const event = { messages: withTier2Boundary(messages) };
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingIcm = result.messages.filter((m) => m.customType === "intercom_message");
 		assert.equal(survivingIcm.length, 5, "keepLast=5 yields exactly 5 intercom_message entries");
@@ -1926,24 +1931,26 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		);
 	});
 
-	// Pinned synthetic survives the pre-budget passes.
-	it("pinned synthetic survives the pre-budget collapse passes (the pin is injected AFTER the pre-budget window)", async () => {
+	// Pinned synthetic survives the post-reset cleanup passes.
+	it("pinned synthetic survives the post-reset cleanup passes", async () => {
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		const pi = await loadExtensionWithTools(["intercom", "subagent"]);
 		const event = {
-			messages: [
+			messages: withTier2Boundary([
 				userMsg("dispatch"),
 				{ role: "custom", content: "icm-1", customType: "intercom_message" },
 				{ role: "custom", content: "n1-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
 				{ role: "custom", content: "n1-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
 				{ role: "toolResult", content: "sub-1", toolName: "subagent" },
 				{ role: "toolResult", content: "sub-2", toolName: "subagent" },
-			],
+			]),
 		};
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
-		// (i) The pinned synthetic is the FIRST message in the result
-		// (the wiring prepends it after the pre-budget window).
-		assert.equal(result.messages[0].customType, "context-trimmer-pinned", "the pinned synthetic is at the top of the result");
+		// (i) The pinned synthetic survives the local-boundary cleanup.
+		assert.ok(
+			result.messages.some((message) => message.customType === "context-trimmer-pinned"),
+			"the pinned synthetic survives the reset and cleanup passes",
+		);
 		// (ii) The duplicate subagent-notify is dropped (Rule 2).
 		const survivingNotifies = result.messages.filter((m) => m.customType === "subagent-notify");
 		assert.equal(survivingNotifies.length, 1);
@@ -1966,8 +1973,8 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		// still an `intercom_message` and is subject to Rule 1.
 		// The existing 'in-memory cache skips
 		// messages on the next context event' suite is the structural
-		// test for cache preservation; this test pins the pre-budget
-		// pass behavior on a cache-substituted entry.
+		// test for cache preservation; this test covers the cleanup
+		// behavior on a cache-substituted entry.
 		process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
 		process.env[CONFIG_ENV.intercomKeepLast] = "0"; // drop ALL intercom_message entries.
 		const pi = await loadExtensionWithTools(["intercom"]);
@@ -1975,10 +1982,10 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		// (no prior cache entry), so the input message is
 		// the one Rule 1 sees. The Rule 1 collapse drops it.
 		const event = {
-			messages: [
+			messages: withTier2Boundary([
 				userMsg("dispatch"),
 				{ role: "custom", content: "icm-1", customType: "intercom_message" },
-			],
+			]),
 		};
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingIcm = result.messages.filter((m) => m.customType === "intercom_message");
@@ -1986,7 +1993,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		// The dispatch survives (the pin is prepended; the dispatch
 		// is the only trimmable user message).
 		const dispatch = result.messages.find((m) => m.role === "user" && m.content === "dispatch");
-		assert.ok(dispatch, "the dispatch user message survives the pre-budget passes");
+		assert.ok(dispatch, "the dispatch user message survives the cleanup passes");
 	});
 
 	// ── subagentNotifyKeepLast integration ────────────────────────
@@ -1999,7 +2006,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		for (let i = 1; i <= 30; i++) {
 			messages.push({ role: "custom", content: `notify-${i}`, customType: "subagent-notify", details: { sessionValue: `run-${i}` } });
 		}
-		const event = { messages };
+		const event = { messages: withTier2Boundary(messages) };
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
 		assert.equal(survivingNotify.length, 5, "subagentNotifyKeepLast=5 yields exactly 5 subagent-notify entries");
@@ -2018,7 +2025,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 			{ role: "custom", content: "n1", customType: "subagent-notify", details: { sessionValue: "run-1" } },
 			{ role: "custom", content: "n2", customType: "subagent-notify", details: { sessionValue: "run-2" } },
 		];
-		const event = { messages };
+		const event = { messages: withTier2Boundary(messages) };
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
 		assert.equal(survivingNotify.length, 0, "subagentNotifyKeepLast=0 drops every subagent-notify entry");
@@ -2034,7 +2041,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 		for (let i = 1; i <= 10; i++) {
 			messages.push({ role: "custom", content: `notify-${i}`, customType: "subagent-notify", details: { sessionValue: `run-${i}` } });
 		}
-		const event = { messages };
+		const event = { messages: withTier2Boundary(messages) };
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
 		assert.equal(survivingNotify.length, 3, "unset subagentNotifyKeepLast falls through to intercomKeepLast=3");
@@ -2058,7 +2065,7 @@ describe("pre-budget collapse — pre-budget placement (AC-6 end-to-end)", () =>
 			{ role: "custom", content: "n2", customType: "subagent-notify", details: { sessionValue: "run-2" } },
 			{ role: "custom", content: "n3", customType: "subagent-notify", details: { sessionValue: "run-3" } },
 		];
-		const event = { messages };
+		const event = { messages: withTier2Boundary(messages) };
 		const result = (await fireContextBasic(pi, event)) as { messages: Array<Record<string, unknown>> };
 		const survivingNotify = result.messages.filter((m) => m.customType === "subagent-notify");
 		assert.equal(survivingNotify.length, 2, "dedup first (3 distinct), then keep-last=2 → 2 survive");
@@ -2642,11 +2649,10 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 	});
 });
 
-// Provider totals come from the preceding request. A trimmed request can
-// therefore report a smaller total while the next context event still
-// carries the full session stream.
-describe("context handler: provider totals do not suppress the current stream", () => {
-	it("keeps consecutive over-budget events trimmed when the preceding total falls", async () => {
+// Provider reports can disagree with the current stream. The local
+// estimated stream is the only reset authority.
+describe("context handler: local Tier 2 reset boundary", () => {
+	it("uses the current stream when provider totals change", async () => {
 		const pi = await loadExtension();
 		const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
 		const newAssistantText = "new-assistant-" + "b".repeat(180_000);
@@ -2724,120 +2730,94 @@ describe("context handler: provider totals do not suppress the current stream", 
 		);
 	});
 
-	it("does not reuse an oversized provider total after its reset", async () => {
-		const savedTier2MaxTokens = process.env[CONFIG_ENV.tier2MaxTokens];
-		process.env[CONFIG_ENV.tier2MaxTokens] = "150000";
+	it("defers every content cleanup until a later local Tier 2 crossing", async () => {
+		const saved = [
+			[CONFIG_ENV.reasoningBlockCap, process.env[CONFIG_ENV.reasoningBlockCap]],
+			[CONFIG_ENV.intercomKeepLast, process.env[CONFIG_ENV.intercomKeepLast]],
+			[CONFIG_ENV.subagentNotifyKeepLast, process.env[CONFIG_ENV.subagentNotifyKeepLast]],
+			["PI_CONTEXT_TRIMMER_CONFIG_PATH", process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH],
+		] as const;
 		try {
-			const pi = await loadExtension();
-			const entries: Array<{ customType: string; data?: unknown }> = [];
-			(pi as unknown as {
-				appendEntry: (customType: string, data?: unknown) => void;
-			}).appendEntry = (customType, data) => entries.push({ customType, data });
-			const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
-			const retainedAssistantText = "retained-assistant-" + "b".repeat(180_000);
-			const firstResult = (await invokeContext(pi, {
-				messages: [
-					userMsg("dispatch"),
-					assistantMsg(oldAssistantText),
-					userMsg("follow-up"),
-					assistantMsg(retainedAssistantText),
-					userMsg("provider-report"),
-					{
-						role: "assistant",
-						content: "provider report",
-						usage: { totalTokens: 150_000 },
-						stopReason: "stop",
-						timestamp: 1,
-					},
-				],
-			})) as { messages: Array<Record<string, unknown>> };
-			assert.equal(firstResult.messages.some((message) => message.content === oldAssistantText), false);
-			assert.equal(firstResult.messages.some((message) => message.content === retainedAssistantText), true);
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
+			process.env[CONFIG_ENV.reasoningBlockCap] = "0";
+			process.env[CONFIG_ENV.intercomKeepLast] = "0";
+			process.env[CONFIG_ENV.subagentNotifyKeepLast] = "1";
+			process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+			const pi = await loadExtensionWithTools(["intercom", "subagent"]);
+			const skillPath = "/tmp/skills/example/SKILL.md";
+			const messages: Array<Record<string, unknown>> = [
+				userMsg("dispatch"),
+				{ role: "assistant", content: [{ type: "toolCall", id: "old-read", name: "read", arguments: { path: skillPath } }] },
+				{ role: "toolResult", content: "old skill contents", toolCallId: "old-read" },
+				{ role: "assistant", content: [{ type: "toolCall", id: "new-read", name: "read", arguments: { path: skillPath } }] },
+				{ role: "toolResult", content: "new skill contents", toolCallId: "new-read" },
+				{ role: "custom", content: "intercom", customType: "intercom_message" },
+				{ role: "custom", content: "notify-first", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "notify-redeliver", customType: "subagent-notify", details: { sessionValue: "run-1" } },
+				{ role: "custom", content: "notify-latest", customType: "subagent-notify", details: { sessionValue: "run-2" } },
+				{ role: "toolResult", content: "subagent-old", toolName: "subagent" },
+				{ role: "toolResult", content: "subagent-new", toolName: "subagent" },
+				{ role: "assistant", content: [{ type: "thinking", thinking: "keep below boundary" }] },
+				{ role: "assistant", content: "provider report", usage: { totalTokens: 500_000 }, stopReason: "stop" },
+			];
+			const below = (await fireContextBasic(pi, { messages })) as { messages: Array<Record<string, unknown>> };
+			const belowToolCallIds = below.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+				.filter((block) => (block as { type?: string }).type === "toolCall")
+				.map((block) => (block as { id?: string }).id);
+			assert.deepEqual(belowToolCallIds, ["old-read", "new-read"], "the stale provider total cannot collapse duplicate reads");
+			assert.equal(below.messages.some((message) => message.content === "intercom"), true);
+			assert.equal(below.messages.filter((message) => message.customType === "subagent-notify").length, 3);
+			assert.equal(below.messages.filter((message) => (message as { toolName?: string }).toolName === "subagent").length, 2);
+			assert.equal(below.messages.some((message) => message.content === "old skill contents"), true);
 
-			const secondResult = (await invokeContext(pi, {
-				messages: [
-					...firstResult.messages,
-					userMsg("later turn"),
-					assistantMsg("later-assistant-" + "c".repeat(180_000)),
-				],
-			})) as { messages: Array<Record<string, unknown>> };
-			assert.equal(secondResult.messages.some((message) => message.content === retainedAssistantText), true);
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
-
-			await invokeContext(pi, {
-				messages: [
-					...secondResult.messages,
-					userMsg("fresh provider report"),
-					{
-						role: "assistant",
-						content: "fresh provider report",
-						usage: { totalTokens: 150_000 },
-						stopReason: "stop",
-						timestamp: 2,
-					},
-				],
-			});
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 2);
+			const above = (await fireContextBasic(pi, { messages: withTier2Boundary(messages) })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			const aboveToolCallIds = above.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+				.filter((block) => (block as { type?: string }).type === "toolCall")
+				.map((block) => (block as { id?: string }).id);
+			assert.deepEqual(aboveToolCallIds, ["new-read"], "the local crossing collapses the older duplicate first");
+			assert.equal(above.messages.some((message) => message.content === "tier2-reset-old"), false, "the ordered reset then drops the oldest turn");
+			assert.equal(above.messages.some((message) => message.content === "old skill contents"), false);
+			assert.equal(above.messages.some((message) => message.content === "new skill contents"), true);
+			assert.equal(above.messages.some((message) => message.content === "intercom"), false);
+			assert.deepEqual(
+				above.messages.filter((message) => message.customType === "subagent-notify").map((message) => message.content),
+				["notify-latest"],
+			);
+			assert.deepEqual(
+				above.messages.filter((message) => (message as { toolName?: string }).toolName === "subagent").map((message) => message.content),
+				["subagent-new"],
+			);
+			const thinkingBlocks = above.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+				.filter((block) => (block as { type?: string }).type === "thinking");
+			assert.equal(thinkingBlocks.length, 0, "the local crossing authorizes the configured reasoning cap");
 		} finally {
-			if (savedTier2MaxTokens === undefined) delete process.env[CONFIG_ENV.tier2MaxTokens];
-			else process.env[CONFIG_ENV.tier2MaxTokens] = savedTier2MaxTokens;
+			for (const [key, value] of saved) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 		}
 	});
 
-	it("keeps a duplicate fallback report consumed after an earlier duplicate drops", async () => {
-		const savedTier2MaxTokens = process.env[CONFIG_ENV.tier2MaxTokens];
-		process.env[CONFIG_ENV.tier2MaxTokens] = "150000";
-		try {
-			const pi = await loadExtension();
-			const entries: Array<{ customType: string; data?: unknown }> = [];
-			(pi as unknown as {
-				appendEntry: (customType: string, data?: unknown) => void;
-			}).appendEntry = (customType, data) => entries.push({ customType, data });
-			const duplicateProviderReport = () => ({
-				role: "assistant",
-				content: "duplicate provider report",
-				usage: { totalTokens: 150_000 },
-				stopReason: "stop",
-			});
-			const oldAssistantText = "old-assistant-" + "a".repeat(180_000);
-			const retainedAssistantText = "retained-assistant-" + "b".repeat(180_000);
-			const firstResult = (await invokeContext(pi, {
+	it("keeps duplicate skill reads intact across repeated oversized reports below the boundary", async () => {
+		const pi = await loadExtension();
+		const skillPath = "/tmp/skills/repeated/SKILL.md";
+		for (const totalTokens of [150_000, 500_000]) {
+			const result = (await invokeContext(pi, {
 				messages: [
 					userMsg("dispatch"),
-					assistantMsg(oldAssistantText),
-					userMsg("first provider report"),
-					duplicateProviderReport(),
-					userMsg("retained turn"),
-					assistantMsg(retainedAssistantText),
-					userMsg("latest provider report"),
-					duplicateProviderReport(),
+					{ role: "assistant", content: [{ type: "toolCall", id: "old", name: "read", arguments: { path: skillPath } }] },
+					{ role: "toolResult", content: "old result", toolCallId: "old" },
+					{ role: "assistant", content: [{ type: "toolCall", id: "new", name: "read", arguments: { path: skillPath } }] },
+					{ role: "toolResult", content: "new result", toolCallId: "new" },
+					{ role: "assistant", content: "provider report", usage: { totalTokens }, stopReason: "stop" },
 				],
 			})) as { messages: Array<Record<string, unknown>> };
-			assert.equal(firstResult.messages.filter((message) => message.content === "duplicate provider report").length, 1);
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
-
-			const secondResult = (await invokeContext(pi, {
-				messages: [
-					...firstResult.messages,
-					userMsg("later turn"),
-					assistantMsg("later-assistant-" + "c".repeat(180_000)),
-				],
-			})) as { messages: Array<Record<string, unknown>> };
-			assert.equal(secondResult.messages.some((message) => message.content === retainedAssistantText), true);
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 1);
-
-			await invokeContext(pi, {
-				messages: [
-					...secondResult.messages,
-					userMsg("fresh identical provider report"),
-					duplicateProviderReport(),
-				],
-			});
-			assert.equal(entries.filter((entry) => entry.customType === "context-trimmer-dropped").length, 2);
-		} finally {
-			if (savedTier2MaxTokens === undefined) delete process.env[CONFIG_ENV.tier2MaxTokens];
-			else process.env[CONFIG_ENV.tier2MaxTokens] = savedTier2MaxTokens;
+			const ids = result.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
+				.filter((block) => (block as { type?: string }).type === "toolCall")
+				.map((block) => (block as { id?: string }).id);
+			assert.deepEqual(ids, ["old", "new"]);
+			assert.equal(result.messages.some((message) => message.content === "old result"), true);
 		}
 	});
 });

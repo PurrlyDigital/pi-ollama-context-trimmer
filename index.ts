@@ -70,7 +70,6 @@ import {
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
 	REASONING_BLOCK_CAP_DEFAULT,
-	SUMMARIZE_TIER_MAX_TOKENS,
 	VERBATIM_TIER_MAX_TOKENS,
 	shouldHardBlock,
 	type TrimmableMessage,
@@ -159,75 +158,6 @@ function usableAssistantUsage(msg: Record<string, unknown>): { promptTokens: num
 		promptTokens += value;
 	}
 	return Number.isFinite(promptTokens) && promptTokens > 0 ? { promptTokens } : undefined;
-}
-
-type ProviderTotal = {
-	totalTokens: number;
-	reportKey: string;
-};
-
-type ProviderReportIdentityStore = {
-	fallbackId(message: Record<string, unknown>): string;
-	copyFallbackId(source: object, target: object): void;
-};
-
-function createProviderReportIdentityStore(): ProviderReportIdentityStore {
-	const fallbackIds = new WeakMap<object, string>();
-	let nextFallbackId = 0;
-	return {
-		fallbackId(message) {
-			let id = fallbackIds.get(message);
-			if (id === undefined) {
-				id = `fallback-${nextFallbackId}`;
-				nextFallbackId += 1;
-				fallbackIds.set(message, id);
-			}
-			return id;
-		},
-		copyFallbackId(source, target) {
-			const id = fallbackIds.get(source);
-			if (id !== undefined) fallbackIds.set(target, id);
-		},
-	};
-}
-
-function providerReportIdentity(
-	msg: Record<string, unknown>,
-	totalTokens: number,
-	identityStore: ProviderReportIdentityStore,
-): string {
-	const timestamp = msg.timestamp;
-	const validTimestamp = typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : undefined;
-	const responseId = msg.responseId;
-	if (typeof responseId === "string" && responseId.length > 0) {
-		return JSON.stringify(["response", responseId, validTimestamp, totalTokens]);
-	}
-	if (validTimestamp !== undefined) {
-		return JSON.stringify(["timestamp", validTimestamp, totalTokens]);
-	}
-	return JSON.stringify(["fallback", identityStore.fallbackId(msg), totalTokens]);
-}
-
-/** Return the latest usable provider aggregate and its stable report identity. */
-function latestProviderTotalTokens(
-	rawMessages: ReadonlyArray<Record<string, unknown>>,
-	identityStore: ProviderReportIdentityStore,
-): ProviderTotal | undefined {
-	let latest: ProviderTotal | undefined;
-	for (const msg of rawMessages) {
-		if (msg.role !== "assistant") continue;
-		const stopReason = msg.stopReason;
-		if (stopReason === "aborted" || stopReason === "error") continue;
-		const usage = msg.usage;
-		if (typeof usage !== "object" || usage === null) continue;
-		const totalTokens = (usage as Record<string, unknown>).totalTokens;
-		if (typeof totalTokens !== "number" || !Number.isFinite(totalTokens) || totalTokens <= 0) continue;
-		latest = {
-			totalTokens,
-			reportKey: providerReportIdentity(msg, totalTokens, identityStore),
-		};
-	}
-	return latest;
 }
 
 /**
@@ -334,7 +264,7 @@ function readConfigFile(path: string | undefined): ReturnType<typeof parseConfig
  * by association via the `isProtectedSlot` branch added in
  * `policy.ts`. The matching `toolCall` block survives inside its
  * assistant message via the block-level carve-out in
- * `dropOldestTurns` and `summarizeOldestUntilUnder`. The
+ * `dropOldestTurns`. The
  * `path-stamp.ts` `details.sourcePath` seam remains the
  * resume-compatibility fallback (an older `toolResult` whose
  * matching `toolCall` was in a prior turn and was re-derivable via
@@ -412,8 +342,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const pinnedTier = createPinnedTier({
 		personalityPath: cfg.personalityPath,
 	});
-	const providerReportIdentities = createProviderReportIdentityStore();
-	let lastResetProviderReportKey: string | undefined;
 
 	// Subagent-context pin decision. Resolved once at load — the
 	// inputs (the `PI_SUBAGENT_CHILD` env var + the resolved
@@ -474,19 +402,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		return loopGuardResolved;
 	}
 
-	// Pre-budget-collapse extension-gating resolvers. Resolved lazily
-	// on the first `context` call and cached for the session, mirroring
-	// the existing `resolveProtectDispatch` pattern. Each gates one or
-	// more pre-budget collapse rules:
-	//   - `intercomInstalled` → Rules 1 + 2 (applyIntercomKeepLast,
-	//     dedupSubagentNotify) — both ride the pi-intercom extension.
-	//   - `subagentsInstalled` → Rule 3 (keepLatestSubagentToolResult) —
-	//     rides the pi-subagents extension.
-	// Two independent resolvers rather than one combined flag: the
-	// gates are distinct and a combined flag would couple unrelated
-	// extensions. The probes reuse `safeGetAllTools(pi)` so a minimal
-	// or unavailable API degrades to `[]` (inert) rather than
-	// throwing.
+	// Tier-2 cleanup extension gates resolve lazily and remain fixed for
+	// the session. The local trim policy must reach Tier 2 before either
+	// gate can authorize content cleanup. `intercomInstalled` controls
+	// Rules 1 and 2. `subagentsInstalled` controls Rule 3.
 	let intercomInstalledResolved: boolean | undefined;
 	function resolveIntercomInstalled(): boolean {
 		if (intercomInstalledResolved !== undefined) return intercomInstalledResolved;
@@ -516,8 +435,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const loopGuardHardBlock =
 		rawHardBlock !== undefined && rawHardBlock < loopGuardThreshold ? loopGuardThreshold : rawHardBlock;
 
-	pi.on("session_start", async (event, ctx) => {
-		lastResetProviderReportKey = undefined;
+	pi.on("session_start", async () => {
 		pinnedTier.refresh();
 	});
 
@@ -573,10 +491,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// Derive it once per hook and thread it through every downstream
 		// token-count call. No calibration state is retained between hooks.
 		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
-		const providerTotal = latestProviderTotalTokens(rawMessages, providerReportIdentities);
-		const authoritativeTotalTokens = providerTotal?.reportKey === lastResetProviderReportKey
-			? undefined
-			: providerTotal?.totalTokens;
 		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
 		const systemPromptTokens = approximateTextTokens(systemPromptString, effectiveDivisor);
 		// Stamp userTurnAge on every message. The stamp is the source
@@ -637,7 +551,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				userTurnAge: stampedAges[i].userTurnAge,
 				customType: typeof m.customType === "string" ? m.customType : undefined,
 			};
-			providerReportIdentities.copyFallbackId(m, trimmable);
 			return trimmable;
 		});
 		const duplicateSkillReadIds = findDuplicateSkillReadIds(base);
@@ -673,53 +586,17 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		//       `toolCall` block survives inside the dropped
 		//       assistant message; `text`/`thinking` and unprotected
 		//       `toolCall` blocks are dropped).
-		// Computed BEFORE the pre-budget transforms and the
-		// reasoning-block cap so the set reflects the assistant
-		// messages as the model emitted them (the cap / pre-budget
-		// transforms may drop assistant message content, but the
-		// set is already computed against the source stream).
+		// Compute this before the reset and cleanup passes so it reflects
+		// the tool calls the model emitted in the current source stream.
 		const protectedToolCallIds = extractProtectedToolCallIds(base, expandedPreservedPatterns);
-		// Apply the reasoning-block-count cap to the base message
-		// stream BEFORE the three-tier trim. The cap keeps the
-		// last N `type:"thinking"` content blocks across the
-		// stream and drops the rest; the three-tier budget then
-		// accounts against the post-cap mass so dropped reasoning
-		// blocks do not inflate the budget. The cap is global
-		// (no `ctx.model` branching); `cfg.reasoningBlockCap` is
-		// already resolved at handler entry via `resolveConfig`
-		// (env > JSON > compile-time default precedence in
-		// `config.ts`). When the resolver returns `undefined` the
-		// compile-time default `REASONING_BLOCK_CAP_DEFAULT = -1`
-		// (passthrough — every reasoning block survives) applies,
-		// so existing operators see no behavior change when
-		// upgrading. `cap === -1` is a pure passthrough inside the
-		// policy (no overhead beyond the call). The cap runs on
-		// `base` (the stream before pinned injection) so the
-		// pinned synthetic is never at risk of being dropped.
-		const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
-		const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;
-		const subagentNotifyKeepLast = cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : intercomKeepLast;
-		const intercomInstalled = resolveIntercomInstalled();
-		const subagentsInstalled = resolveSubagentsInstalled();
-		const afterRule1: TrimmableMessage[] = intercomInstalled
-			? applyIntercomKeepLast(base, intercomKeepLast)
-			: base;
-		const afterRule2: TrimmableMessage[] = intercomInstalled
-			? dedupSubagentNotify(afterRule1)
-			: afterRule1;
-		const afterRule2b: TrimmableMessage[] = intercomInstalled
-			? applySubagentNotifyKeepLast(afterRule2, subagentNotifyKeepLast)
-			: afterRule2;
-		const afterRule3: TrimmableMessage[] = subagentsInstalled
-			? keepLatestSubagentToolResult(afterRule2b)
-			: afterRule2b;
-		const cappedBase: TrimmableMessage[] = applyReasoningBlockCap(afterRule3, reasoningBlockCap);
+		// The policy sees the complete current stream. It alone decides
+		// whether the local estimate reached Tier 2 before any content
+		// transform can run.
 		const withPinned: TrimmableMessage[] = pinned
-			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...cappedBase]
-			: cappedBase;
-		// Run the three-tier trim. Production uses defaultSummaSummarizer
-		// (a Python `summa` subprocess). The pinned synthetic (when
-		// present) and any preserved-path message are excluded from
+			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...base]
+			: base;
+		// Run the three-tier trim against the complete local stream. The
+		// pinned synthetic and any preserved-path message are excluded from
 		// the budget via `protectedCustomTypes`. Dispatch protection
 		// is resolved from config (auto/true/false). The preserved-
 		// paths channel is resolved from config (`preservedPaths`),
@@ -753,21 +630,36 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectedToolCallIds,
 			duplicateSkillReadIds,
 			tokenEstimatorDivisor: effectiveDivisor,
-			authoritativeTotalTokens,
 			systemPromptTokens,
 			keepLastUserPrompts,
 			keepOriginalPrompt,
 		});
-		if (
-			providerTotal !== undefined &&
-			providerTotal.reportKey !== lastResetProviderReportKey &&
-			providerTotal.totalTokens >= (cfg.tier2MaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS)
-		) {
-			lastResetProviderReportKey = providerTotal.reportKey;
+
+		// Content cleanup is a Tier 2 action. Running it after the
+		// ordered policy reset keeps duplicate-pair collapse and oldest-turn
+		// dropping ahead of every other content-changing pass.
+		let cleaned: TrimmableMessage[] = result.messages;
+		if (result.reachedTier2) {
+			const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
+			const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;
+			const subagentNotifyKeepLast = cfg.subagentNotifyKeepLast !== undefined ? Math.trunc(cfg.subagentNotifyKeepLast) : intercomKeepLast;
+			const intercomInstalled = resolveIntercomInstalled();
+			const subagentsInstalled = resolveSubagentsInstalled();
+			const afterRule1 = intercomInstalled
+				? applyIntercomKeepLast(cleaned, intercomKeepLast)
+				: cleaned;
+			const afterRule2 = intercomInstalled
+				? dedupSubagentNotify(afterRule1)
+				: afterRule1;
+			const afterRule2b = intercomInstalled
+				? applySubagentNotifyKeepLast(afterRule2, subagentNotifyKeepLast)
+				: afterRule2;
+			const afterRule3 = subagentsInstalled
+				? keepLatestSubagentToolResult(afterRule2b)
+				: afterRule2b;
+			cleaned = applyReasoningBlockCap(afterRule3, reasoningBlockCap);
 		}
-		// Persist the fingerprints of messages summarized in this
-		// pass. The pure policy emits `summarizedFingerprints` as
-		// Persisted drop marker: when the tier-3 drop path fired
+		// Persist a drop marker when the tier-3 drop path fired
 		// (any non-zero `droppedTurns`), write a
 		// `context-trimmer-dropped` entry carrying the count and a
 		// timestamp. The marker is diagnostic only — it is not
@@ -793,7 +685,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// because stripping the tool call breaks the fingerprint
 		// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
 		// signature → the run resets on the next invocation).
-		const out: TrimmableMessage[] = applyLoopGuard(result.messages);
+		const out: TrimmableMessage[] = applyLoopGuard(cleaned, result.reachedTier2);
 		// Cast back to the session message shape and return. The
 		// pinned message rides out at the top (when injected); the rest
 		// are the trimmed trimmable messages. The double-cast mirrors the
@@ -810,18 +702,20 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	 * guard is OFF, returns the input unchanged (the existing path).
 	 * When ON, computes the run-length and the flat-input-token
 	 * co-signal; on a qualifying run, prepends a `role: "user"`
-	 * synthetic with the nudge or block text. The hard-block path
-	 * additionally strips the last assistant turn's `toolCall`
-	 * blocks (preserving any textual / thinking content) so the
-	 * model must proceed via text. Hard-block is a strict superset
-	 * of soft-nudge — when both fire, emit ONLY the block text.
+	 * synthetic with the nudge or block text. The hard-block path can
+	 * strip the last assistant turn's `toolCall` blocks only after the
+	 * local trim policy reaches Tier 2. Below that boundary, it emits the
+	 * non-destructive nudge instead.
 	 */
-	function applyLoopGuard(trimmed: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
+	function applyLoopGuard(
+		trimmed: ReadonlyArray<TrimmableMessage>,
+		allowHardBlock: boolean,
+	): TrimmableMessage[] {
 		if (!resolveLoopGuard()) return trimmed.slice();
 		const { runLength } = detectConsecutiveIdenticalToolCalls(trimmed, loopGuardThreshold);
 		if (runLength < loopGuardThreshold) return trimmed.slice();
 		const { flat: flatInputTokens } = computeFlatInputTokenSignal(trimmed);
-		const hardBlock = shouldHardBlock(runLength, loopGuardHardBlock);
+		const hardBlock = allowHardBlock && shouldHardBlock(runLength, loopGuardHardBlock);
 		const out = trimmed.slice();
 		if (hardBlock) {
 			// Strip the last assistant turn's `toolCall` blocks,

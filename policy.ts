@@ -107,14 +107,6 @@ export type TrimOptions = {
 	summarizeMaxTokens?: number;
 
 	/**
-	 * Provider-reported aggregate token total from the preceding provider
-	 * request. When finite and positive, this value can force a tier when
-	 * it shows an overage against the raw caps. It cannot suppress the
-	 * current event's visible-content estimate because that estimate may
-	 * represent a larger untrimmed session stream.
-	 */
-	authoritativeTotalTokens?: number;
-	/**
 	 * The set of `customType` values that mark a message as a protected
 	 * slot (e.g. the agent-def / pinned-tier synthetic). Protected
 	 * custom-type messages are excluded from the budget, never
@@ -186,7 +178,7 @@ export type TrimOptions = {
 	 */
 	protectedToolCallIds?: ReadonlySet<string>;
 	/**
-	 * Older completed skill-read IDs found before pre-budget transforms.
+	 * Older completed skill-read IDs found before the local reset.
 	 * At the Tier 2 boundary, the policy removes their paired tool calls
 	 * and results before resetting eligible context toward Tier 1.
 	 */
@@ -261,10 +253,8 @@ export type TrimResult = {
 	 * informational only).
 	 */
 	totalTokens: number;
-};
-
-type InternalTrimOptions = TrimOptions & {
-	tier2Reset?: boolean;
+	/** Whether the original local stream reached the Tier 2 reset boundary. */
+	reachedTier2: boolean;
 };
 
 // ─── Per-message token accounting (chars / divisor) ─────────────────────
@@ -642,6 +632,14 @@ export async function applyThreeTierTrim(
 	messages: ReadonlyArray<TrimmableMessage>,
 	options: TrimOptions = {},
 ): Promise<TrimResult> {
+	return applyThreeTierTrimInternal(messages, options, false);
+}
+
+async function applyThreeTierTrimInternal(
+	messages: ReadonlyArray<TrimmableMessage>,
+	options: TrimOptions,
+	forceTier2Reset: boolean,
+): Promise<TrimResult> {
 	const verbatimMax = options.verbatimMaxTokens ?? VERBATIM_TIER_MAX_TOKENS;
 	const summarizeMax = options.summarizeMaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS;
 	const protectedCustomTypes = new Set(options.protectedCustomTypes ?? []);
@@ -689,13 +687,6 @@ export async function applyThreeTierTrim(
 		? undefined
 		: Math.max(0, dropFloorTokens - systemPromptTokens - protectedMass);
 
-	// Provider totals describe the preceding provider request, which may
-	// have received a trimmed view while this event still carries the
-	// full session stream. They can force a trim when they show an
-	// overage, but a smaller prior-request total cannot suppress the
-	// current stream's visible estimate. This keeps consecutive context
-	// events monotonic instead of alternating between full and trimmed
-	// output.
 	const estimatedTotal = totalTrimmableTokens(
 		messages,
 		protectedCustomTypes,
@@ -706,36 +697,27 @@ export async function applyThreeTierTrim(
 		keepOriginalPrompt,
 		divisor,
 	);
-	const authoritativeTotal = options.authoritativeTotalTokens;
-	const hasAuthoritativeTotal = Number.isFinite(authoritativeTotal) && authoritativeTotal! > 0;
-	const providerOverVerbatim = hasAuthoritativeTotal && authoritativeTotal! > verbatimMax;
-	const total = hasAuthoritativeTotal ? authoritativeTotal! : estimatedTotal;
-	const needsHold = estimatedTotal > effectiveVerbatimMax || providerOverVerbatim;
+	const needsHold = estimatedTotal > effectiveVerbatimMax;
 	const duplicateSkillReadIds = options.duplicateSkillReadIds ?? findDuplicateSkillReadIds(messages);
 	const removableDuplicateSkillReadIds = new Set(
 		[...duplicateSkillReadIds].filter((id) => !protectedToolCallIds.has(id)),
 	);
-	const forceTier2Reset = (options as InternalTrimOptions).tier2Reset === true;
 	const reachesTier2ResetBoundary =
-		forceTier2Reset ||
-		(estimatedTotal > 0 && estimatedTotal >= effectiveSummarizeMax) ||
-		(hasAuthoritativeTotal && authoritativeTotal! >= summarizeMax);
+		forceTier2Reset || (estimatedTotal > 0 && estimatedTotal >= effectiveSummarizeMax);
 	if (removableDuplicateSkillReadIds.size > 0 && reachesTier2ResetBoundary) {
-		const resetOptions: InternalTrimOptions = {
+		const resetOptions: TrimOptions = {
 			...options,
 			duplicateSkillReadIds: new Set(),
-			tier2Reset: true,
 		};
-		return applyThreeTierTrim(
+		return applyThreeTierTrimInternal(
 			collapseDuplicateSkillReads(messages, removableDuplicateSkillReadIds),
 			resetOptions,
+			true,
 		);
 	}
 
-	// At the Tier 2 ceiling, reset the eligible context toward the
-	// effective Tier 1 target. An authoritative provider total can
-	// trigger the reset even when opaque content leaves the visible
-	// estimate below that target.
+	// At the local Tier 2 ceiling, reset the eligible context toward the
+	// effective Tier 1 target.
 	if (reachesTier2ResetBoundary) {
 		const resetDropFloor = effectiveDropFloor;
 		const { messages: dropped, droppedTurns } = dropOldestTurns(
@@ -749,7 +731,6 @@ export async function applyThreeTierTrim(
 			keepLastUserPromptsProtectedIndices,
 			keepOriginalPrompt,
 			divisor,
-			hasAuthoritativeTotal && authoritativeTotal! >= summarizeMax && estimatedTotal <= effectiveVerbatimMax,
 		);
 		const postDropTotal = totalTrimmableTokens(
 			dropped,
@@ -765,6 +746,7 @@ export async function applyThreeTierTrim(
 			messages: dropped,
 			droppedTurns,
 			totalTokens: postDropTotal,
+			reachedTier2: true,
 		};
 	}
 
@@ -773,7 +755,8 @@ export async function applyThreeTierTrim(
 		return {
 			messages: messages.slice(),
 			droppedTurns: 0,
-			totalTokens: total,
+			totalTokens: estimatedTotal,
+			reachedTier2: false,
 		};
 	}
 
@@ -781,7 +764,8 @@ export async function applyThreeTierTrim(
 	return {
 		messages: messages.slice(),
 		droppedTurns: 0,
-		totalTokens: total,
+		totalTokens: estimatedTotal,
+		reachedTier2: false,
 	};
 }
 
@@ -810,7 +794,6 @@ function dropOldestTurns(
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
 	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
-	forceFirstDrop = false,
 ): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
 	// First pass: identify trimmable turns and their token mass.
 	// A follow-up user message starts a complete interactive turn so
@@ -892,7 +875,7 @@ function dropOldestTurns(
 	const dropSet = new Set<number>();
 	let shouldFallThrough = false;
 	for (const t of turns) {
-		if (remaining <= cap && !(forceFirstDrop && dropSet.size === 0)) break;
+		if (remaining <= cap) break;
 		if (dropFloorTokens !== undefined && remaining - t.tokens < dropFloorTokens) {
 			shouldFallThrough = true;
 			break;
@@ -1156,9 +1139,8 @@ export function countReasoningBlocks(messages: ReadonlyArray<TrimmableMessage>):
  *     removed) so the message order and the wiring layer's
  *     downstream consumers see a stable index space.
  *
- * Pure: no I/O, no `process.*`. Operates only on the message
- * array shape. Called by the wiring layer (Unit 3) at the
- * context handler before `applyThreeTierTrim`.
+ * Pure: no I/O and no `process.*`. The wiring layer calls this
+ * after the local Tier 2 reset.
  */
 export function applyReasoningBlockCap(
 	messages: ReadonlyArray<TrimmableMessage>,
@@ -1234,12 +1216,13 @@ export function applyReasoningBlockCap(
 
 // ─── Transcript cleanup ───────────────────────────────────────────
 //
-// Three pure array-in/array-out transforms collapse transcript entries
-// before the three-tier budget. Skill-read detection records duplicate
-// pairs here for removal at the Tier 2 boundary.
+// Three pure array-in/array-out transforms collapse transcript entries.
+// Skill-read detection records duplicate pairs for removal at the Tier 2
+// boundary. The wiring layer invokes each cleanup transform after the
+// local reset.
 //
 // Purity: each function is a pure array transform — no `process.*`,
-// no Node I/O, no `pi` reference. The wiring layer owns extension
+// no Node I/O, and no `pi` reference. The wiring layer owns extension
 // detection and ordering.
 
 /**
@@ -1594,7 +1577,7 @@ export function dedupSubagentNotify(messages: ReadonlyArray<TrimmableMessage>): 
  * `role === "toolResult" && toolName === "subagent"`.
  * Non-`subagent` `toolResult` entries are preserved untouched. No
  * knob — prior subagent tool results are not needed once a newer
- * one exists. Tier-blind — drops regardless of three-tier budget slot.
+ * one exists. The wiring layer calls this only after the local Tier 2 reset.
  */
 export function keepLatestSubagentToolResult(messages: ReadonlyArray<TrimmableMessage>): TrimmableMessage[] {
 	const total = messages.length;
