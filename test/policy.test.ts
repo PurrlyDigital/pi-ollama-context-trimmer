@@ -920,10 +920,10 @@ describe("dedupSubagentNotify — production-shaped (no-details) records", () =>
 	});
 });
 
-// ─── Pre-budget collapse — keepLatestSubagentToolResult (AC-5) ────
+// ─── Transcript cleanup — keepLatestSubagentToolResult ─────────────
 //
-// `keepLatestSubagentToolResult` is the Rule 3 pre-budget collapse
-// for `toolResult:subagent` entries. Drop every such entry except
+// `keepLatestSubagentToolResult` is Rule 3 for `toolResult:subagent`
+// entries. Drop every such entry except
 // the LAST one (by stream order). No knob — prior subagent tool
 // results are not needed once a newer one exists. Identification:
 // `role === "toolResult" && toolName === "subagent"`.
@@ -1030,16 +1030,14 @@ describe("keepLatestSubagentToolResult", () => {
 	});
 });
 
-// ─── Pre-budget collapse — pipeline composition (AC-6) ──────────────
+// ─── Transcript cleanup — pure composition ─────────────────────────
 //
-// Pins the AC-6 ordering of the three pre-budget collapse rules +
-// `applyReasoningBlockCap` against a mixed stream, then verifies the
-// composed output feeds a clean three-tier trim. The wiring layer's
-// call-site ordering (Rule 1 → Rule 2 → Rule 3 → reasoning cap →
-// pinned → three-tier) is replicated here as a pure composition.
+// Verifies the relative order of the cleanup transforms. Integration
+// tests verify that the wiring runs this sequence only after a local
+// Tier 2 reset.
 
-describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
-	it("all three pre-budget rules + reasoning cap + three-tier trim compose cleanly", async () => {
+describe("transcript cleanup — pure composition", () => {
+	it("cleanup transforms compose cleanly", async () => {
 		// 30 intercom_message entries interleaved with 2 subagent-
 		// notify duplicates and 3 toolResult:subagent echoes. With
 		// keepLast=5, after Rule 1 only 5 intercom_message entries
@@ -1062,9 +1060,8 @@ describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
 			subagentToolResult("sub-echo-3"),
 		];
 
-		// Replicate the AC-6 ordering on the pure layer. The wiring
-		// is responsible for the gate checks; this test pins the
-		// pure-pipeline composition.
+		// The pure sequence preserves the cleanup order. The wiring owns
+		// the local Tier 2 gate.
 		const afterRule1 = applyIntercomKeepLast(messages, 5);
 		const afterRule2 = dedupSubagentNotify(afterRule1);
 		const afterRule3 = keepLatestSubagentToolResult(afterRule2);
@@ -1091,9 +1088,7 @@ describe("pre-budget collapse — pipeline composition (AC-6 ordering)", () => {
 		assert.equal(survivingSubagentToolResults.length, 1, "only the latest toolResult:subagent survives Rule 3");
 		assert.equal(survivingSubagentToolResults[0].content, "sub-echo-3", "the LATEST survives");
 
-		// The composed output feeds a clean three-tier trim (the
-		// post-cap mass is well under the 50k verbatim cap, so the
-		// trim is a no-op passthrough).
+		// The pure output remains valid input for the trim policy.
 		const result = await applyThreeTierTrim(afterCap, {
 		});
 		assert.equal(result.messages.length, afterCap.length, "tier 1 (verbatim): every message survives");
@@ -1574,7 +1569,7 @@ describe("pair-atomic toolCall/toolResult protection — AC-1 through AC-7", () 
 
 describe("applyThreeTierTrim — effective budget with protected mass + system-prompt term", () => {
 
-	it("uses an authoritative aggregate total at the reset boundary", async () => {
+	it("holds a local stream below the reset boundary", async () => {
 		const messages: TrimmableMessage[] = [
 			userMsg("old user turn", 1),
 			assistantMsg("old assistant turn"),
@@ -1584,16 +1579,14 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 		const result = await applyThreeTierTrim(messages, {
 			verbatimMaxTokens: 50,
 			summarizeMaxTokens: 100,
-			authoritativeTotalTokens: 100,
 			protectDispatch: false,
 		});
-		assert.equal(result.droppedTurns, 1, "provider total at the ceiling triggers a whole-turn reset");
-		assert.ok(result.totalTokens < 100, "the returned estimate is not the unchanged provider total");
-		assert.equal(result.messages.some((m) => m.content === "old user turn"), false, "oldest candidate is removed");
-		assert.equal(result.messages.some((m) => m.content === "new assistant turn"), true, "newest candidate survives");
+		assert.equal(result.droppedTurns, 0, "only the local estimate can start a reset");
+		assert.equal(result.reachedTier2, false);
+		assert.deepEqual(result.messages, messages, "all below-boundary messages survive in order");
 	});
 
-	it("does not let a smaller preceding provider total suppress an over-budget current estimate", async () => {
+	it("resets from an over-budget local estimate", async () => {
 		const messages: TrimmableMessage[] = [
 			assistantMsg("a".repeat(180)),
 			assistantMsg("b".repeat(180)),
@@ -1601,11 +1594,11 @@ describe("applyThreeTierTrim — effective budget with protected mass + system-p
 		const result = await applyThreeTierTrim(messages, {
 			verbatimMaxTokens: 50,
 			summarizeMaxTokens: 100,
-			authoritativeTotalTokens: 90,
 			dropFloorTokens: 50,
 			protectDispatch: false,
 		});
-		assert.equal(result.droppedTurns, 1, "the current visible estimate still triggers tier 3");
+		assert.equal(result.droppedTurns, 1, "the current visible estimate triggers the reset");
+		assert.equal(result.reachedTier2, true);
 		assert.equal(result.messages.some((m) => m.content === "a".repeat(180)), false, "the oldest current message is dropped");
 		assert.equal(result.messages.some((m) => m.content === "b".repeat(180)), true, "the newest current message survives");
 	});
