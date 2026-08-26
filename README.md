@@ -261,6 +261,8 @@ The test runner is `tsx --test`. Do not use `node --test` on `.ts` files. Native
 
 Tests use deterministic in-process stubs.
 
+For the guarded final-review closure procedure and its disposable check, see [Close an approved pull request](docs/guarded-pr-closure.md).
+
 Project structure:
 
 ```
