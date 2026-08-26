@@ -1768,10 +1768,14 @@ describe("context handler — Tier 3 assistant-anchored drop (autonomous session
 	});
 });
 
-async function fireContextBasic(pi: ReturnType<typeof createMockPiWithTools>, event: unknown) {
+async function fireContextBasic(
+	pi: ReturnType<typeof createMockPiWithTools>,
+	event: unknown,
+	ctx: unknown = { hasUI: false, ui: { setStatus: () => {} } },
+) {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
-	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
+	return handlers[0](event, ctx);
 }
 
 describe("Tier 2 cleanup — extension-gating detection", () => {
@@ -2730,7 +2734,7 @@ describe("context handler: local Tier 2 reset boundary", () => {
 		);
 	});
 
-	it("defers every content cleanup until a later local Tier 2 crossing", async () => {
+	it("defers every content cleanup despite a stale status-line percentage", async () => {
 		const saved = [
 			[CONFIG_ENV.reasoningBlockCap, process.env[CONFIG_ENV.reasoningBlockCap]],
 			[CONFIG_ENV.intercomKeepLast, process.env[CONFIG_ENV.intercomKeepLast]],
@@ -2759,11 +2763,15 @@ describe("context handler: local Tier 2 reset boundary", () => {
 				{ role: "assistant", content: [{ type: "thinking", thinking: "keep below boundary" }] },
 				{ role: "assistant", content: "provider report", usage: { totalTokens: 500_000 }, stopReason: "stop" },
 			];
-			const below = (await fireContextBasic(pi, { messages })) as { messages: Array<Record<string, unknown>> };
+			const below = (await fireContextBasic(pi, { messages }, {
+				hasUI: false,
+				ui: { setStatus: () => {} },
+				getContextUsage: () => ({ tokens: 150_000, contextWindow: 100_000, percent: 150 }),
+			})) as { messages: Array<Record<string, unknown>> };
 			const belowToolCallIds = below.messages.flatMap((message) => Array.isArray(message.content) ? message.content : [])
 				.filter((block) => (block as { type?: string }).type === "toolCall")
 				.map((block) => (block as { id?: string }).id);
-			assert.deepEqual(belowToolCallIds, ["old-read", "new-read"], "the stale provider total cannot collapse duplicate reads");
+			assert.deepEqual(belowToolCallIds, ["old-read", "new-read"], "the stale status-line percentage and provider total cannot collapse duplicate reads");
 			assert.equal(below.messages.some((message) => message.content === "intercom"), true);
 			assert.equal(below.messages.filter((message) => message.customType === "subagent-notify").length, 3);
 			assert.equal(below.messages.filter((message) => (message as { toolName?: string }).toolName === "subagent").length, 2);
