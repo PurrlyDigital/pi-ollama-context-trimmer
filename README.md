@@ -258,7 +258,7 @@ The loop guard has its own informational token signal. It samples up to the last
 
 ## Development
 
-Run the test suite. It currently contains 388 tests and takes a few seconds on a modern laptop.
+Run the test suite. It currently contains 390 tests and takes a few seconds on a modern laptop.
 
 ```bash
 npm install   # installs tsx as a dev dependency

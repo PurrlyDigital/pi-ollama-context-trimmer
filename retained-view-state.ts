@@ -5,7 +5,7 @@ import {
 } from "./policy.ts";
 
 export const RETAINED_VIEW_CUSTOM_TYPE = "context-trimmer-retained-view";
-export const RETAINED_VIEW_STATE_VERSION = 1;
+export const RETAINED_VIEW_STATE_VERSION = 2;
 export const RETAINED_SOURCE_INDEX = Symbol("context-trimmer-source-index");
 
 export type RetainedSourceMessage = Record<string, unknown> & {
@@ -19,11 +19,11 @@ export type RetainedContentOverride = {
 
 export type RetainedVirtualEntry = {
 	position: number;
-	kind: "prune-reminder";
+	kind: "prune-reminder" | "pinned-slot";
 };
 
 export type RetainedViewState = {
-	version: 1;
+	version: 2;
 	sessionId: string;
 	policyFingerprint: string;
 	sourceCount: number;
@@ -39,6 +39,7 @@ type CreateRetainedViewStateInput = {
 	sourceDigest: string;
 	rawMessages: ReadonlyArray<Record<string, unknown>>;
 	outputMessages: ReadonlyArray<Record<string, unknown>>;
+	pinnedCustomType?: string;
 };
 
 type ReconstructRetainedViewInput = {
@@ -47,6 +48,7 @@ type ReconstructRetainedViewInput = {
 	policyFingerprint: string;
 	currentPrefixDigest: string | undefined;
 	rawMessages: ReadonlyArray<Record<string, unknown>>;
+	pinnedMessage?: Record<string, unknown>;
 };
 
 const SHA256 = /^[a-f0-9]{64}$/;
@@ -103,7 +105,7 @@ export function parseRetainedViewState(value: unknown): RetainedViewState | unde
 	if (typeof value.sourceDigest !== "string" || !SHA256.test(value.sourceDigest)) return undefined;
 	if (!Array.isArray(value.retainedSourceIndices) || value.retainedSourceIndices.length > value.sourceCount) return undefined;
 	if (!Array.isArray(value.contentOverrides) || value.contentOverrides.length > value.retainedSourceIndices.length) return undefined;
-	if (!Array.isArray(value.virtualEntries) || value.virtualEntries.length > 1) return undefined;
+	if (!Array.isArray(value.virtualEntries) || value.virtualEntries.length > 2) return undefined;
 
 	const retainedSourceIndices: number[] = [];
 	let previous = -1;
@@ -126,10 +128,16 @@ export function parseRetainedViewState(value: unknown): RetainedViewState | unde
 	contentOverrides.sort((left, right) => left.sourceIndex - right.sourceIndex);
 
 	const virtualEntries: RetainedVirtualEntry[] = [];
+	const virtualKinds = new Set<RetainedVirtualEntry["kind"]>();
 	for (const candidate of value.virtualEntries) {
-		if (!isRecord(candidate) || candidate.kind !== "prune-reminder") return undefined;
+		if (
+			!isRecord(candidate) ||
+			(candidate.kind !== "prune-reminder" && candidate.kind !== "pinned-slot")
+		) return undefined;
 		if (!isIndex(candidate.position) || candidate.position > retainedSourceIndices.length) return undefined;
-		virtualEntries.push({ position: candidate.position, kind: "prune-reminder" });
+		if (virtualKinds.has(candidate.kind)) return undefined;
+		virtualKinds.add(candidate.kind);
+		virtualEntries.push({ position: candidate.position, kind: candidate.kind });
 	}
 
 	return {
@@ -155,6 +163,7 @@ export function createRetainedViewState(
 	const virtualEntries: RetainedVirtualEntry[] = [];
 	let previous = -1;
 	let sawPruneReminder = false;
+	let sawPinnedSlot = false;
 
 	for (const message of input.outputMessages) {
 		const sourceIndex = retainedSourceIndex(message);
@@ -173,6 +182,12 @@ export function createRetainedViewState(
 			if (sawPruneReminder) continue;
 			sawPruneReminder = true;
 			virtualEntries.push({ position: retainedSourceIndices.length, kind: "prune-reminder" });
+			continue;
+		}
+		if (input.pinnedCustomType !== undefined && message.customType === input.pinnedCustomType) {
+			if (sawPinnedSlot) continue;
+			sawPinnedSlot = true;
+			virtualEntries.push({ position: retainedSourceIndices.length, kind: "pinned-slot" });
 		}
 	}
 
@@ -204,7 +219,11 @@ export function reconstructRetainedView(
 	const virtualByPosition = new Map<number, RetainedSourceMessage[]>();
 	for (const virtual of state.virtualEntries) {
 		const entries = virtualByPosition.get(virtual.position) ?? [];
-		entries.push(createPruneReminderMessage() as unknown as RetainedSourceMessage);
+		if (virtual.kind === "prune-reminder") {
+			entries.push(createPruneReminderMessage() as unknown as RetainedSourceMessage);
+		} else if (input.pinnedMessage !== undefined) {
+			entries.push({ ...input.pinnedMessage } as RetainedSourceMessage);
+		}
 		virtualByPosition.set(virtual.position, entries);
 	}
 

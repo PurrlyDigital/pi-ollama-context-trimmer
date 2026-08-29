@@ -574,6 +574,11 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const currentSession = sessionInfo(ctx);
 		const expandedPreservedPatterns = expandPreservedPaths(cfg.preservedPaths, homedir());
 		const currentPolicyFingerprint = policyFingerprint(expandedPreservedPatterns);
+		const pinned = shouldPinForCurrentContext ? pinnedTier.buildPinnedMessage() : null;
+		const pinnedMessage: TrimmableMessage | undefined = pinned
+			? { role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }
+			: undefined;
+		let retainedPinnedSlot = false;
 		let sourceMessages: RetainedSourceMessage[] = rawMessages.map((message, sourceIndex) =>
 			withRetainedSourceIndex(message, sourceIndex),
 		);
@@ -584,9 +589,13 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				policyFingerprint: currentPolicyFingerprint,
 				currentPrefixDigest: identityDigest(identities, retainedViewState.sourceCount),
 				rawMessages,
+				pinnedMessage,
 			});
 			if (reconstructed === undefined) retainedViewState = undefined;
-			else sourceMessages = reconstructed;
+			else {
+				sourceMessages = reconstructed;
+				retainedPinnedSlot = retainedViewState.virtualEntries.some((entry) => entry.kind === "pinned-slot");
+			}
 		}
 		sourceMessages = sourceMessages.filter(
 			(message) => message.customType !== RETAINED_VIEW_CUSTOM_TYPE,
@@ -637,14 +646,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const stampedAges = stampUserTurnAge(
 			rawMessages.map((message) => ({ role: String(message.role ?? "user") })),
 		);
-		// Build the pinned-tier synthetic (the agent def). Opt-in: may
-		// return `null` when personality is not configured / resolves
-		// empty. Skipped entirely in child/subagent sessions unless an
-		// override channel (`PI_CONTEXT_TRIMMER_PIN_SUBAGENT` env var
-		// or `pinSubagent` JSON key) has re-enabled the pin — the
-		// parent persona must not cross the dispatch boundary by
-		// default.
-		const pinned = shouldPinForCurrentContext ? pinnedTier.buildPinnedMessage() : null;
 		// Stamp each trimmable message with its source path so the
 		// preserved-paths predicate (pure, in `policy.ts`) can match
 		// by `details.sourcePath`. The source path is the union of:
@@ -658,6 +659,15 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// wins. The stamp is on `details.sourcePath` (the locked
 		// decision — `details` over a new top-level field).
 		const base: TrimmableMessage[] = sourceMessages.map((m) => {
+			const sourceIndex = retainedSourceIndex(m);
+			if (sourceIndex === undefined) {
+				return {
+					...m,
+					role: String(m.role ?? "user") as TrimmableMessage["role"],
+					content: m.content,
+					customType: typeof m.customType === "string" ? m.customType : undefined,
+				} as TrimmableMessage;
+			}
 			// Source-path extraction: read from `details.sourcePath` first,
 			// fall back to the re-derived stamp for `m.toolCallId`.
 			const detailsObj = m.details;
@@ -682,8 +692,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				m as RetainedSourceMessage & { details?: Record<string, unknown> },
 				sourcePath,
 			) as TrimmableMessage;
-			const sourceIndex = retainedSourceIndex(m);
-			const sourceAge = sourceIndex === undefined ? undefined : stampedAges[sourceIndex];
+			const sourceAge = stampedAges[sourceIndex];
 			const trimmable: TrimmableMessage = {
 				...stamped,
 				role: String(m.role ?? "user") as TrimmableMessage["role"],
@@ -732,8 +741,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// The policy sees the complete current stream. It alone decides
 		// whether the local estimate reached Tier 2 before any content
 		// transform can run.
-		const withPinned: TrimmableMessage[] = pinned
-			? [{ role: "custom", content: pinned.content, customType: PINNED_CUSTOM_TYPE }, ...base]
+		const withPinned: TrimmableMessage[] = pinnedMessage !== undefined && !retainedPinnedSlot
+			? [pinnedMessage, ...base]
 			: base;
 		// Run the three-tier trim against the complete local stream. The
 		// pinned synthetic and any preserved-path message are excluded from
@@ -809,10 +818,11 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				policyFingerprint: currentPolicyFingerprint,
 				sourceDigest: fullSourceDigest,
 				rawMessages,
+				pinnedCustomType: PINNED_CUSTOM_TYPE,
 			};
 			const candidateState = createRetainedViewState({
 				...stateInput,
-				outputMessages: sourceMessages,
+				outputMessages: withPinned as unknown as ReadonlyArray<Record<string, unknown>>,
 			});
 			const nextState = createRetainedViewState({
 				...stateInput,

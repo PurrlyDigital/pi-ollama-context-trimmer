@@ -13,7 +13,7 @@ import contextTrimmerExtension from "../index.ts";
 import { CONFIG_ENV } from "../index.ts";
 import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
 import { PRESERVED_CUSTOM_TYPE } from "../path-stamp.ts";
-import { RETAINED_VIEW_CUSTOM_TYPE } from "../retained-view-state.ts";
+import { RETAINED_VIEW_CUSTOM_TYPE, RETAINED_VIEW_STATE_VERSION } from "../retained-view-state.ts";
 import {
 	PRUNE_REMINDER_CUSTOM_TYPE,
 	VERBATIM_TIER_MAX_TOKENS,
@@ -2939,14 +2939,23 @@ describe("context handler: retained-view hysteresis", () => {
 			assert.equal(first.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
 			assert.equal(first.messages.some((message) => message.customType === RETAINED_VIEW_CUSTOM_TYPE), false);
 			assert.equal(first.messages.some((message) => Object.getOwnPropertySymbols(message).length > 0), false);
+			const firstDispatchIndex = first.messages.findIndex((message) => message.content === "dispatch");
+			assert.ok(firstDispatchIndex >= 0);
+			const firstStablePrefix = first.messages.slice(0, firstDispatchIndex + 1);
+			assert.deepEqual(
+				firstStablePrefix.map((message) => message.customType ?? message.content),
+				[PRUNE_REMINDER_CUSTOM_TYPE, PINNED_CUSTOM_TYPE, "dispatch"],
+			);
 
 			const firstStateCount = pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length;
 			const firstDropCount = pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length;
 			assert.equal(firstStateCount, 1);
 			assert.equal(firstDropCount, 1);
 			const retainedData = pi.__getAppendEntries().find((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE)?.data;
+			assert.equal((retainedData as { version?: unknown } | undefined)?.version, RETAINED_VIEW_STATE_VERSION);
 			assert.equal(JSON.stringify(retainedData).includes(droppedSentinel), false);
 			assert.equal(JSON.stringify(retainedData).includes(retainedSentinel), false);
+			assert.equal(JSON.stringify(retainedData).includes("test personality substrate"), false);
 
 			const secondRaw = [
 				...raw,
@@ -2964,6 +2973,9 @@ describe("context handler: retained-view hysteresis", () => {
 			assert.equal(second.messages.some((message) => message.content === droppedSentinel), false);
 			assert.equal(second.messages.some((message) => message.content === retainedSentinel), true);
 			assert.equal(second.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+			const secondDispatchIndex = second.messages.findIndex((message) => message.content === "dispatch");
+			assert.equal(secondDispatchIndex, firstDispatchIndex);
+			assert.deepEqual(second.messages.slice(0, secondDispatchIndex + 1), firstStablePrefix);
 			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, firstStateCount);
 			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, firstDropCount);
 
@@ -2982,11 +2994,116 @@ describe("context handler: retained-view hysteresis", () => {
 		});
 	});
 
+	it("rebuilds changed pinned content in the retained slot", async () => {
+		await withRetainedConfig(async () => {
+			const personalityPath = join(fixtureDir, "personality.md");
+			const pi = await loadExtensionWithPersistence();
+			const { raw } = retainedFixture();
+			const first = (await fireContextWithCtx(pi, { messages: raw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			const firstStateCount = pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length;
+			writeFileSync(personalityPath, "changed personality substrate\n");
+			try {
+				const turnEndHandlers = pi.getHandlers("turn_end");
+				assert.equal(turnEndHandlers.length, 1);
+				await turnEndHandlers[0]({}, {});
+				const second = (await fireContextWithCtx(pi, {
+					messages: [
+						...raw,
+						{
+							role: "assistant",
+							content: "provider response",
+							timestamp: 6,
+							usage: { input: 350, output: 1, totalTokens: 351 },
+							stopReason: "stop",
+						},
+					],
+				})) as { messages: Array<Record<string, unknown>> };
+				const firstDispatchIndex = first.messages.findIndex((message) => message.content === "dispatch");
+				const secondDispatchIndex = second.messages.findIndex((message) => message.content === "dispatch");
+				assert.equal(secondDispatchIndex, firstDispatchIndex);
+				assert.deepEqual(
+					second.messages.slice(0, secondDispatchIndex + 1).map((message) => message.customType ?? message.content),
+					[PRUNE_REMINDER_CUSTOM_TYPE, PINNED_CUSTOM_TYPE, "dispatch"],
+				);
+				const secondPin = second.messages.find((message) => message.customType === PINNED_CUSTOM_TYPE);
+				assert.equal(typeof secondPin?.content === "string" && secondPin.content.includes("changed personality substrate"), true);
+				assert.equal(typeof secondPin?.content === "string" && secondPin.content.includes("test personality substrate"), false);
+				assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, firstStateCount);
+			} finally {
+				writeFileSync(personalityPath, "test personality substrate\n");
+			}
+		});
+	});
+
+	it("preserves reminder and source order when pinning is unavailable", async () => {
+		await withRetainedConfig(async () => {
+			const savedPersonalityPath = process.env[CONFIG_ENV.personalityPath];
+			const savedChild = process.env.PI_SUBAGENT_CHILD;
+			const savedPinSubagent = process.env[CONFIG_ENV.pinSubagent];
+			async function assertStableWithoutPin(): Promise<void> {
+				const pi = await loadExtensionWithPersistence();
+				const { raw } = retainedFixture();
+				const first = (await fireContextWithCtx(pi, { messages: raw })) as {
+					messages: Array<Record<string, unknown>>;
+				};
+				const firstDispatchIndex = first.messages.findIndex((message) => message.content === "dispatch");
+				assert.ok(firstDispatchIndex >= 0);
+				const firstPrefix = first.messages.slice(0, firstDispatchIndex + 1);
+				assert.deepEqual(
+					firstPrefix.map((message) => message.customType ?? message.content),
+					[PRUNE_REMINDER_CUSTOM_TYPE, "dispatch"],
+				);
+				const firstStateCount = pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length;
+				const second = (await fireContextWithCtx(pi, {
+					messages: [
+						...raw,
+						{
+							role: "assistant",
+							content: "provider response",
+							timestamp: 6,
+							usage: { input: 350, output: 1, totalTokens: 351 },
+							stopReason: "stop",
+						},
+					],
+				})) as { messages: Array<Record<string, unknown>> };
+				assert.deepEqual(second.messages.slice(0, firstDispatchIndex + 1), firstPrefix);
+				assert.equal(second.messages.some((message) => message.customType === PINNED_CUSTOM_TYPE), false);
+				assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, firstStateCount);
+			}
+			try {
+				delete process.env[CONFIG_ENV.personalityPath];
+				delete process.env.PI_SUBAGENT_CHILD;
+				process.env[CONFIG_ENV.pinSubagent] = "1";
+				await assertStableWithoutPin();
+
+				if (savedPersonalityPath === undefined) delete process.env[CONFIG_ENV.personalityPath];
+				else process.env[CONFIG_ENV.personalityPath] = savedPersonalityPath;
+				process.env.PI_SUBAGENT_CHILD = "1";
+				delete process.env[CONFIG_ENV.pinSubagent];
+				await assertStableWithoutPin();
+			} finally {
+				if (savedPersonalityPath === undefined) delete process.env[CONFIG_ENV.personalityPath];
+				else process.env[CONFIG_ENV.personalityPath] = savedPersonalityPath;
+				if (savedChild === undefined) delete process.env.PI_SUBAGENT_CHILD;
+				else process.env.PI_SUBAGENT_CHILD = savedChild;
+				if (savedPinSubagent === undefined) delete process.env[CONFIG_ENV.pinSubagent];
+				else process.env[CONFIG_ENV.pinSubagent] = savedPinSubagent;
+			}
+		});
+	});
+
 	it("restores a branch-valid retained checkpoint after reload", async () => {
 		await withRetainedConfig(async () => {
 			const firstPi = await loadExtensionWithPersistence();
 			const { raw, droppedSentinel } = retainedFixture();
-			await fireContextWithCtx(firstPi, { messages: raw });
+			const first = (await fireContextWithCtx(firstPi, { messages: raw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			const firstDispatchIndex = first.messages.findIndex((message) => message.content === "dispatch");
+			assert.ok(firstDispatchIndex >= 0);
+			const firstPrefix = first.messages.slice(0, firstDispatchIndex + 1);
 
 			const resumedPi = createMockPiWithPersistence("test-session");
 			resumedPi.__setSessionEntries(firstPi.sessionManager.getBranch());
@@ -3010,6 +3127,7 @@ describe("context handler: retained-view hysteresis", () => {
 			})) as { messages: Array<Record<string, unknown>> };
 			assert.equal(result.messages.some((message) => message.content === droppedSentinel), false);
 			assert.equal(result.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+			assert.deepEqual(result.messages.slice(0, firstDispatchIndex + 1), firstPrefix);
 		});
 	});
 
