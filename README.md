@@ -26,7 +26,9 @@ The extension uses its estimate of the current LLM-bound stream as the only rese
 
 After a reset, the current stream is the saved retained view plus messages added later. Messages removed by the reset do not return on the next call. The retained view grows through the hold band until it reaches Tier 2 again.
 
-The saved state does not enter model context. On reload, resume, or tree navigation, the extension restores state only from the active branch when the session, source history, and trim settings match. If validation fails, the extension ignores the state and recalculates from the current session without throwing.
+The saved state does not enter model context. On reload, resume, or tree navigation, the extension restores state only from the active branch when the session, source history, and trim settings match. The state selects raw messages and records removed content-block positions. It cannot supply replacement text. Restore also requires every source protected by the current policy and enforces the reminder and pinned-slot order. If validation fails, the extension ignores the state and recalculates from the current session without throwing.
+
+Pi's active session branch is the host record for both raw messages and extension state. The extension does not cryptographically authenticate the local session file. An actor who can rewrite that file can also rewrite its raw messages. Signing, secrets, and key management require a separate Pi host contract.
 
 Below Tier 2, reusing a retained view writes no new state or drop diagnostic. A reset updates state only when it changes retained messages. The extension writes a drop diagnostic only when it drops at least one turn.
 
@@ -258,7 +260,7 @@ The loop guard has its own informational token signal. It samples up to the last
 
 ## Development
 
-Run the test suite. It currently contains 390 tests and takes a few seconds on a modern laptop.
+Run the test suite. It currently contains 395 tests and takes a few seconds on a modern laptop.
 
 ```bash
 npm install   # installs tsx as a dev dependency

@@ -3037,6 +3037,53 @@ describe("context handler: retained-view hysteresis", () => {
 		});
 	});
 
+	it("adds newly available pinned content after the retained reminder", async () => {
+		await withRetainedConfig(async () => {
+			const personalityPath = join(fixtureDir, "late-personality.md");
+			const savedPersonalityPath = process.env[CONFIG_ENV.personalityPath];
+			rmSync(personalityPath, { force: true });
+			try {
+				process.env[CONFIG_ENV.personalityPath] = personalityPath;
+				const pi = await loadExtensionWithPersistence();
+				const { raw } = retainedFixture();
+				const first = (await fireContextWithCtx(pi, { messages: raw })) as {
+					messages: Array<Record<string, unknown>>;
+				};
+				assert.deepEqual(
+					first.messages.slice(0, first.messages.findIndex((message) => message.content === "dispatch") + 1)
+						.map((message) => message.customType ?? message.content),
+					[PRUNE_REMINDER_CUSTOM_TYPE, "dispatch"],
+				);
+
+				writeFileSync(personalityPath, "late personality substrate\n");
+				const turnEndHandlers = pi.getHandlers("turn_end");
+				assert.equal(turnEndHandlers.length, 1);
+				await turnEndHandlers[0]({}, {});
+				const second = (await fireContextWithCtx(pi, {
+					messages: [
+						...raw,
+						{
+							role: "assistant",
+							content: "provider response",
+							timestamp: 6,
+							usage: { input: 350, output: 1, totalTokens: 351 },
+							stopReason: "stop",
+						},
+					],
+				})) as { messages: Array<Record<string, unknown>> };
+				const dispatchIndex = second.messages.findIndex((message) => message.content === "dispatch");
+				assert.deepEqual(
+					second.messages.slice(0, dispatchIndex + 1).map((message) => message.customType ?? message.content),
+					[PRUNE_REMINDER_CUSTOM_TYPE, PINNED_CUSTOM_TYPE, "dispatch"],
+				);
+			} finally {
+				rmSync(personalityPath, { force: true });
+				if (savedPersonalityPath === undefined) delete process.env[CONFIG_ENV.personalityPath];
+				else process.env[CONFIG_ENV.personalityPath] = savedPersonalityPath;
+			}
+		});
+	});
+
 	it("preserves reminder and source order when pinning is unavailable", async () => {
 		await withRetainedConfig(async () => {
 			const savedPersonalityPath = process.env[CONFIG_ENV.personalityPath];
@@ -3128,6 +3175,133 @@ describe("context handler: retained-view hysteresis", () => {
 			assert.equal(result.messages.some((message) => message.content === droppedSentinel), false);
 			assert.equal(result.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
 			assert.deepEqual(result.messages.slice(0, firstDispatchIndex + 1), firstPrefix);
+		});
+	});
+
+	it("rejects a semantically unsafe checkpoint from the matching active branch", async () => {
+		await withRetainedConfig(async () => {
+			const firstPi = await loadExtensionWithPersistence();
+			const { raw } = retainedFixture();
+			await fireContextWithCtx(firstPi, { messages: raw });
+			const tamperedEntries = firstPi.sessionManager.getBranch().map((entry) => {
+				if (entry.type !== "custom" || entry.customType !== RETAINED_VIEW_CUSTOM_TYPE) return entry;
+				return {
+					...entry,
+					data: {
+						...(entry.data as Record<string, unknown>),
+						retainedSourceIndices: [3],
+						contentReductions: [],
+						contentOverrides: [{ sourceIndex: 3, content: "ATTACKER-CONTROLLED INSTRUCTION" }],
+					},
+				};
+			});
+
+			const resumedPi = createMockPiWithPersistence("test-session");
+			resumedPi.__setSessionEntries(tamperedEntries);
+			await contextTrimmerExtension(resumedPi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+			await fireSessionStart(resumedPi, { reason: "reload" }, {
+				sessionManager: resumedPi.sessionManager,
+				hasUI: false,
+				ui: { setStatus: () => {} },
+			});
+			const result = (await fireContextWithCtx(resumedPi, {
+				messages: [
+					...raw,
+					{
+						role: "assistant",
+						content: "response after reload",
+						timestamp: 6,
+						usage: { input: 350, output: 1, totalTokens: 351 },
+						stopReason: "stop",
+					},
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(result.messages.some((message) => message.content === "dispatch"), true);
+			assert.equal(JSON.stringify(result.messages).includes("ATTACKER-CONTROLLED INSTRUCTION"), false);
+			assert.equal(
+				resumedPi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length,
+				1,
+			);
+		});
+	});
+
+	it("rejects a checkpoint that omits a protected tool-call and result pair", async () => {
+		await withRetainedConfig(async () => {
+			const savedPreservedPaths = process.env[CONFIG_ENV.preservedPaths];
+			try {
+				process.env[CONFIG_ENV.preservedPaths] = "AGENTS.md";
+				const protectedCall = {
+					type: "toolCall",
+					id: "protected-read",
+					name: "read",
+					arguments: { path: join(fixtureDir, "AGENTS.md") },
+				};
+				const raw = [
+					{ role: "user", content: "dispatch", timestamp: 1 },
+					{ role: "user", content: "older request", timestamp: 2 },
+					{
+						role: "assistant",
+						content: [{ type: "text", text: "old-" + "x".repeat(600) }, protectedCall],
+						timestamp: 3,
+					},
+					{
+						role: "toolResult",
+						toolCallId: "protected-read",
+						toolName: "read",
+						content: "protected result",
+						details: { sourcePath: join(fixtureDir, "AGENTS.md") },
+						timestamp: 4,
+					},
+					{ role: "user", content: "newer request", timestamp: 5 },
+					{ role: "assistant", content: "new-" + "y".repeat(600), timestamp: 6 },
+				];
+				const firstPi = await loadExtensionWithPersistence();
+				await fireContextWithCtx(firstPi, { messages: raw });
+				const tamperedEntries = firstPi.sessionManager.getBranch().map((entry) => {
+					if (entry.type !== "custom" || entry.customType !== RETAINED_VIEW_CUSTOM_TYPE) return entry;
+					const data = entry.data as {
+						retainedSourceIndices: number[];
+						contentReductions: Array<{ sourceIndex: number }>;
+					};
+					return {
+						...entry,
+						data: {
+							...data,
+							retainedSourceIndices: data.retainedSourceIndices.filter((index) => index !== 2 && index !== 3),
+							contentReductions: data.contentReductions.filter((reduction) => reduction.sourceIndex !== 2),
+						},
+					};
+				});
+
+				const resumedPi = createMockPiWithPersistence("test-session");
+				resumedPi.__setSessionEntries(tamperedEntries);
+				await contextTrimmerExtension(resumedPi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+				await fireSessionStart(resumedPi, { reason: "reload" }, {
+					sessionManager: resumedPi.sessionManager,
+					hasUI: false,
+					ui: { setStatus: () => {} },
+				});
+				const result = (await fireContextWithCtx(resumedPi, {
+					messages: [
+						...raw,
+						{
+							role: "assistant",
+							content: "response after reload",
+							timestamp: 7,
+							usage: { input: 350, output: 1, totalTokens: 351 },
+							stopReason: "stop",
+						},
+					],
+				})) as { messages: Array<Record<string, unknown>> };
+				assert.equal(result.messages.some((message) => message.toolCallId === "protected-read"), true);
+				assert.equal(result.messages.some((message) =>
+					Array.isArray(message.content) && message.content.some((block) =>
+						(block as { id?: unknown }).id === "protected-read"),
+				), true);
+			} finally {
+				if (savedPreservedPaths === undefined) delete process.env[CONFIG_ENV.preservedPaths];
+				else process.env[CONFIG_ENV.preservedPaths] = savedPreservedPaths;
+			}
 		});
 	});
 
@@ -3257,9 +3431,9 @@ describe("context handler: retained-view hysteresis", () => {
 			};
 			assert.equal(first.messages.some((message) => typeof message.content === "string" && message.content.includes("blocked")), true);
 			const stateData = pi.__getAppendEntries().find((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE)?.data as {
-				contentOverrides?: unknown[];
+				contentReductions?: unknown[];
 			} | undefined;
-			assert.ok((stateData?.contentOverrides?.length ?? 0) >= 1);
+			assert.ok((stateData?.contentReductions?.length ?? 0) >= 1);
 
 			const second = (await fireContextWithCtx(pi, {
 				messages: [
