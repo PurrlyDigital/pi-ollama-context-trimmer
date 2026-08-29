@@ -13,7 +13,12 @@ import contextTrimmerExtension from "../index.ts";
 import { CONFIG_ENV } from "../index.ts";
 import { PINNED_CUSTOM_TYPE } from "../pinned-tier.ts";
 import { PRESERVED_CUSTOM_TYPE } from "../path-stamp.ts";
-import { VERBATIM_TIER_MAX_TOKENS, SUMMARIZE_TIER_MAX_TOKENS } from "../policy.ts";
+import { RETAINED_VIEW_CUSTOM_TYPE } from "../retained-view-state.ts";
+import {
+	PRUNE_REMINDER_CUSTOM_TYPE,
+	VERBATIM_TIER_MAX_TOKENS,
+	SUMMARIZE_TIER_MAX_TOKENS,
+} from "../policy.ts";
 
 // ─── Pinned-tier opt-in fixture ────────────────────────────────────────
 //
@@ -153,6 +158,13 @@ describe("extension wiring", () => {
 		const pi = await loadExtension();
 		const handlers = pi.getHandlers("turn_end");
 		assert.ok(handlers.length > 0, "expected at least one turn_end handler");
+	});
+
+	it("registers retained-state invalidation handlers", async () => {
+		const pi = await loadExtension();
+		assert.equal(pi.getHandlers("session_tree").length, 1);
+		assert.equal(pi.getHandlers("session_compact").length, 1);
+		assert.equal(pi.getHandlers("model_select").length, 1);
 	});
 });
 
@@ -1279,16 +1291,30 @@ describe("context handler — duplicate skill reads", () => {
 type AppendEntry = { customType: string; data?: unknown };
 type SessionEntry = {
 	type?: string;
+	id?: string;
+	parentId?: string | null;
 	customType?: string;
 	data?: unknown;
 	[k: string]: unknown;
 };
 
-function createMockPiWithPersistence() {
+function createMockPiWithPersistence(initialSessionId = "test-session") {
 	const handlers: Record<string, Handler[]> = {};
 	const appendEntries: AppendEntry[] = [];
 	let entries: SessionEntry[] = [];
+	let sessionId = initialSessionId;
+	let leafId: string | null = null;
+	let nextEntry = 1;
 	const sessionManager = {
+		getSessionId(): string {
+			return sessionId;
+		},
+		getLeafId(): string | null {
+			return leafId;
+		},
+		getBranch(): SessionEntry[] {
+			return entries;
+		},
 		getEntries(): SessionEntry[] {
 			return entries;
 		},
@@ -1303,14 +1329,20 @@ function createMockPiWithPersistence() {
 		},
 		appendEntry(customType: string, data?: unknown): void {
 			appendEntries.push({ customType, data });
+			const id = `custom-${nextEntry++}`;
+			entries = [...entries, { type: "custom", id, parentId: leafId, customType, data }];
+			leafId = id;
 		},
 		sessionManager,
-		// Test-only mutators (not part of the pi contract).
 		__getAppendEntries(): AppendEntry[] {
 			return appendEntries;
 		},
-		__setSessionEntries(e: SessionEntry[]): void {
-			entries = e;
+		__setSessionEntries(nextEntries: SessionEntry[]): void {
+			entries = [...nextEntries];
+			leafId = entries.at(-1)?.id ?? null;
+		},
+		__setSessionId(nextSessionId: string): void {
+			sessionId = nextSessionId;
 		},
 	};
 	return pi;
@@ -1335,10 +1367,16 @@ async function fireSessionStart(
 async function fireContextWithCtx(
 	pi: ReturnType<typeof createMockPiWithPersistence>,
 	event: unknown,
+	ctx: Record<string, unknown> = {},
 ): Promise<unknown> {
 	const handlers = pi.getHandlers("context");
 	assert.ok(handlers.length > 0, "context handler must be registered");
-	return handlers[0](event, { hasUI: false, ui: { setStatus: () => {} } });
+	return handlers[0](event, {
+		hasUI: false,
+		ui: { setStatus: () => {} },
+		sessionManager: pi.sessionManager,
+		...ctx,
+	});
 }
 
 describe("context handler — reasoning-block cap (AC-4)", () => {
@@ -2475,46 +2513,31 @@ describe("context handler — keepLastUserPrompts + keepOriginalPrompt (wiring e
 	});
 
 });
-// ─── Calibrated token-estimator divisor from usage ────────────────────
-//
-// The wiring layer derives a rough chars-per-prompt-token divisor from
-// the latest usable assistant usage in the stream. It includes cache
-// reads and writes when present, and falls back to the configured
-// divisor when no usable usage exists. Calibration runs per hook and
-// retains no state between context events.
-//
-// Observable signal: the tier boundary. The tier-2 cap is 100k tokens;
-// the tier-3 drop fires above it. Two assistants of 180k chars each
-// (360k total) read as 60k tokens at divisor 6 (tier 2, hold → both
-// survive) and 120k tokens at divisor 3 (tier 3, drop → the oldest
-// 180k assistant is dropped, the youngest survives; remaining 60k >
-// the 50k drop floor so the drop is not floor-blocked). The survival
-// flip of the oldest 180k assistant distinguishes the divisors.
-//
-// Four paths:
-//   (a) usage-carrying stream → calibrated divisor 6 derived from
-//       the provider's prompt-token usage; the oldest 180k assistant
-//       survives (tier 2 hold).
-//   (b) no-usage fallback → configured divisor (env > JSON > 3)
-//       applies; the oldest 180k assistant is dropped (tier 3).
-//   (c) resumed session with multiple assistants carrying `usage` →
-//       the LATEST assistant is the calibration point, so the estimate
-//       follows the current provider/model behavior without retained
-//       calibration state.
-//   (d) aborted/error assistant → unusable usage is skipped; the
-//       fallback divisor applies.
+// ─── Paired token-estimator calibration from prior outbound ───────────
 
-describe("context handler — calibrated token estimator divisor from usage", () => {
+describe("context handler — paired token estimator calibration", () => {
 	let savedDivisorEnv: string | undefined;
+	let savedTier1Env: string | undefined;
+	let savedTier2Env: string | undefined;
 
 	beforeEach(() => {
 		savedDivisorEnv = process.env[CONFIG_ENV.tokenEstimatorDivisor];
+		savedTier1Env = process.env[CONFIG_ENV.tier1MaxTokens];
+		savedTier2Env = process.env[CONFIG_ENV.tier2MaxTokens];
 		delete process.env[CONFIG_ENV.tokenEstimatorDivisor];
+		delete process.env[CONFIG_ENV.tier1MaxTokens];
+		delete process.env[CONFIG_ENV.tier2MaxTokens];
 	});
 
 	afterEach(() => {
-		if (savedDivisorEnv === undefined) delete process.env[CONFIG_ENV.tokenEstimatorDivisor];
-		else process.env[CONFIG_ENV.tokenEstimatorDivisor] = savedDivisorEnv;
+		for (const [key, value] of [
+			[CONFIG_ENV.tokenEstimatorDivisor, savedDivisorEnv],
+			[CONFIG_ENV.tier1MaxTokens, savedTier1Env],
+			[CONFIG_ENV.tier2MaxTokens, savedTier2Env],
+		] as const) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
 	});
 
 	async function invokeWithSystemPrompt(
@@ -2524,50 +2547,47 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 	): Promise<{ messages: Array<Record<string, unknown>> }> {
 		const handlers = pi.getHandlers("context");
 		assert.ok(handlers.length > 0, "context handler must be registered");
-		const ctx = {
+		return (await handlers[0](event, {
 			hasUI: false,
 			ui: { setStatus: () => {} },
 			getSystemPrompt: () => systemPrompt,
-		};
-		return (await handlers[0](event, ctx)) as { messages: Array<Record<string, unknown>> };
+		})) as { messages: Array<Record<string, unknown>> };
 	}
 
-	// (a) usage-carrying stream: the calibrated divisor is derived from
-	// the latest assistant's prompt-token usage. System prompt (6,000 chars) +
-	// user message before the assistant (6,000 chars) = 12,000 chars;
-	// input (1,500) + cacheRead (400) + cacheWrite (100) = 2,000
-	// prompt tokens → divisor = 6.0. Two 180k-char assistants
-	// after the calibration point → 360k chars / 6 = 60k tokens → tier 2
-	// hold → the oldest 180k assistant survives.
-	it("(a) usage-carrying stream: calibrated divisor holds mass that the /3 fallback would drop", async () => {
+	function pairedPrefix() {
+		return [{ role: "user", content: "u".repeat(6_000), timestamp: 1 }];
+	}
+
+	function largeResults() {
+		return [
+			{ role: "toolResult", content: "a".repeat(180_000), toolCallId: "a", timestamp: 3 },
+			{ role: "toolResult", content: "b".repeat(180_000), toolCallId: "b", timestamp: 4 },
+		];
+	}
+
+	it("pairs input, cache-read, and cache-write usage with the exact prior outbound prompt", async () => {
 		const pi = await loadExtension();
 		const systemPrompt = "s".repeat(6_000);
-		const userContent = "u".repeat(6_000);
-		const event = {
+		const prefix = pairedPrefix();
+		await invokeWithSystemPrompt(pi, { messages: prefix }, systemPrompt);
+		const result = await invokeWithSystemPrompt(pi, {
 			messages: [
-				userMsg(userContent),
-				{ role: "assistant", content: "calibration point", usage: { input: 1_500, cacheRead: 400, cacheWrite: 100, output: 1, totalTokens: 2_001 }, stopReason: "stop" },
-				assistantMsg("a".repeat(180_000)),
-				assistantMsg("b".repeat(180_000)),
+				...prefix,
+				{
+					role: "assistant",
+					content: "provider response",
+					timestamp: 2,
+					usage: { input: 1_500, cacheRead: 400, cacheWrite: 100, output: 1, totalTokens: 2_001 },
+					stopReason: "stop",
+				},
+				...largeResults(),
 			],
-		};
-		const result = await invokeWithSystemPrompt(pi, event, systemPrompt);
-		const oldestBig = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(180_000));
-		// Calibrated divisor 6.0 → 360k / 6 = 60k tokens → tier 2 hold
-		// → the oldest 180k assistant survives. (Under the /3 fallback
-		// it would be 120k tokens → tier 3 → dropped.)
-		assert.ok(oldestBig.length === 1, "calibrated divisor (6.0) holds the oldest 180k assistant in tier 2; the /3 fallback would drop it");
+		}, systemPrompt);
+		assert.equal(result.messages.some((message) => message.content === "a".repeat(180_000)), true);
+		assert.equal(result.messages.some((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE), false);
 	});
 
-	// (b) no-usage fallback: when no assistant carries usable `usage`,
-	// the configured divisor applies. The env var is read at extension-
-	// load time, so set it BEFORE loadExtension. With env divisor 2,
-	// two 120k-char assistants → 240k / 2 = 120k tokens → tier 3 →
-	// oldest dropped (remaining 60k > 50k floor). With the default /3,
-	// 240k / 3 = 80k tokens → tier 2 → both survive.
-	it("(b) no-usage fallback: configured divisor applies when no usable usage is present", async () => {
-		// (b-i) Default divisor /3: 240k / 3 = 80k tokens → tier 2 →
-		// both 120k assistants survive.
+	it("uses the configured fallback when no exact usable pairing exists", async () => {
 		const piDefault = await loadExtension();
 		const event = {
 			messages: [
@@ -2577,79 +2597,73 @@ describe("context handler — calibrated token estimator divisor from usage", ()
 			],
 		};
 		const resultDefault = await invokeWithSystemPrompt(piDefault, event, "");
-		const oldestDefault = resultDefault.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
-		assert.ok(oldestDefault.length === 1, "default divisor /3 holds both 120k assistants (80k tokens, tier 2)");
+		assert.equal(resultDefault.messages.some((message) => message.content === "a".repeat(120_000)), true);
 
-		// (b-ii) Env divisor = 2: set BEFORE loadExtension. 240k / 2 =
-		// 120k tokens → tier 3 → oldest 120k assistant dropped
-		// (remaining 60k > 50k floor).
 		process.env[CONFIG_ENV.tokenEstimatorDivisor] = "2";
 		const piDivisor2 = await loadExtension();
-		const event2 = {
-			messages: [
-				userMsg("dispatch"),
-				assistantMsg("a".repeat(120_000)),
-				assistantMsg("b".repeat(120_000)),
-			],
-		};
-		const resultDivisor2 = await invokeWithSystemPrompt(piDivisor2, event2, "");
-		const oldestDivisor2 = resultDivisor2.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
-		assert.ok(oldestDivisor2.length === 0, "env divisor 2 drops the oldest 120k assistant (120k tokens, tier 3); the default /3 holds it");
+		const resultDivisor2 = await invokeWithSystemPrompt(piDivisor2, event, "");
+		assert.equal(resultDivisor2.messages.some((message) => message.content === "a".repeat(120_000)), false);
 	});
 
-	// (c) resumed session: multiple assistants carrying `usage`. The
-	// LATEST assistant is the calibration point. First assistant:
-	// usage.input = 400 → divisor = 2,400 / 400 = 6.0. Second assistant:
-	// usage.input = 800 → divisor is about 3.0 at the latest point.
-	// Two 180k-char assistants after → 360k chars. The latest divisor
-	// reads this as over 100k tokens, so the oldest assistant drops.
-	it("(c) resumed session: latest assistant supplies the calibration", async () => {
+	it("falls back when more than one assistant follows the recorded source prefix", async () => {
 		const pi = await loadExtension();
-		const systemPrompt = "s".repeat(1_200);
-		const userContent = "u".repeat(1_200);
-		const event = {
+		const systemPrompt = "s".repeat(6_000);
+		const prefix = pairedPrefix();
+		await invokeWithSystemPrompt(pi, { messages: prefix }, systemPrompt);
+		const result = await invokeWithSystemPrompt(pi, {
 			messages: [
-				userMsg(userContent),
-				{ role: "assistant", content: "first turn", usage: { input: 400, output: 1, totalTokens: 401 }, stopReason: "stop" },
-				userMsg("second turn user"),
-				{ role: "assistant", content: "second turn", usage: { input: 800, output: 1, totalTokens: 801 }, stopReason: "stop" },
-				userMsg("third turn user"),
-				assistantMsg("a".repeat(180_000)),
-				userMsg("fourth turn user"),
-				assistantMsg("b".repeat(180_000)),
+				...prefix,
+				{
+					role: "assistant",
+					content: "first response",
+					timestamp: 2,
+					usage: { input: 2_000, output: 1, totalTokens: 2_001 },
+					stopReason: "stop",
+				},
+				{
+					role: "assistant",
+					content: "second response",
+					timestamp: 2.5,
+					usage: { input: 2_000, output: 1, totalTokens: 2_001 },
+					stopReason: "stop",
+				},
+				...largeResults(),
 			],
-		};
-		const result = await invokeWithSystemPrompt(pi, event, systemPrompt);
-		const oldestBig = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(180_000));
-		// Latest assistant's divisor (about 3.0) → over 100k tokens →
-		// tier 3 → oldest dropped. This confirms the calibration follows
-		// the latest usable provider usage in the current stream.
-		assert.equal(oldestBig.length, 0, "latest assistant usage supplies the current calibration; the older divisor does not remain in force");
+		}, systemPrompt);
+		assert.equal(result.messages.some((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE), true);
 	});
 
-	// (d) aborted assistant: `usage` on an aborted assistant is not a
-	// usable calibration point (mirrors the harness compaction module's
-	// `getAssistantUsage` predicate). The fallback divisor applies.
-	it("(d) aborted/error assistant: unusable usage is skipped; fallback divisor applies", async () => {
-		const pi = await loadExtension();
-		// First assistant is aborted (usage present but stopReason =
-		// "aborted") → not a calibration point. No other assistant
-		// carries usable usage → fallback to the default /3. Two 120k
-		// assistants → 240k / 3 = 80k tokens → tier 2 → both survive.
-		// If the aborted assistant's usage.input (1,000) were used as
-		// the calibration point, the divisor would be tiny → the mass
-		// would read as a huge token count → tier 3 drop.
-		const event = {
-			messages: [
-				userMsg("dispatch"),
-				{ role: "assistant", content: "aborted turn", usage: { input: 1_000, output: 0, totalTokens: 1_000 }, stopReason: "aborted" },
-				assistantMsg("a".repeat(120_000)),
-				assistantMsg("b".repeat(120_000)),
-			],
-		};
-		const result = await invokeWithSystemPrompt(pi, event, "");
-		const oldest = result.messages.filter((m) => m.role === "assistant" && m.content === "a".repeat(120_000));
-		assert.ok(oldest.length === 1, "aborted assistant's usage is skipped; default /3 divisor holds both 120k assistants (80k tokens, tier 2)");
+	it("falls back for an aborted assistant and after a model-selection boundary", async () => {
+		const systemPrompt = "s".repeat(6_000);
+		for (const boundary of ["aborted", "model-select"] as const) {
+			const pi = await loadExtension();
+			const prefix = pairedPrefix();
+			await invokeWithSystemPrompt(pi, { messages: prefix }, systemPrompt);
+			if (boundary === "model-select") {
+				const handlers = pi.getHandlers("model_select");
+				assert.equal(handlers.length, 1);
+				await handlers[0]({ model: { provider: "other", id: "other" }, source: "set" }, {});
+			}
+			const result = await invokeWithSystemPrompt(pi, {
+				messages: [
+					...prefix,
+					{
+						role: "assistant",
+						content: "provider response",
+						timestamp: 2,
+						usage: { input: 2_000, output: 1, totalTokens: 2_001 },
+						stopReason: boundary === "aborted" ? "aborted" : "stop",
+					},
+					{ role: "user", content: "tool phase", timestamp: 2.75 },
+					...largeResults(),
+				],
+			}, systemPrompt);
+			assert.equal(
+				result.messages.some((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE),
+				true,
+				boundary,
+			);
+		}
 	});
 });
 
@@ -2862,5 +2876,291 @@ describe("context handler: transport boundary", () => {
 			if (originalWebSocket === undefined) delete globals.WebSocket;
 			else globals.WebSocket = originalWebSocket;
 		}
+	});
+});
+
+describe("context handler: retained-view hysteresis", () => {
+	const retainedConfigKeys = [
+		CONFIG_ENV.tier1MaxTokens,
+		CONFIG_ENV.tier2MaxTokens,
+		CONFIG_ENV.tokenEstimatorDivisor,
+		CONFIG_ENV.reasoningBlockCap,
+		CONFIG_ENV.loopGuard,
+		CONFIG_ENV.loopGuardThreshold,
+		CONFIG_ENV.loopGuardHardBlock,
+		"PI_CONTEXT_TRIMMER_CONFIG_PATH",
+	] as const;
+
+	async function withRetainedConfig(run: () => Promise<void>): Promise<void> {
+		const saved = retainedConfigKeys.map((key) => [key, process.env[key]] as const);
+		try {
+			process.env[CONFIG_ENV.tier1MaxTokens] = "200";
+			process.env[CONFIG_ENV.tier2MaxTokens] = "500";
+			process.env[CONFIG_ENV.tokenEstimatorDivisor] = "1";
+			delete process.env[CONFIG_ENV.reasoningBlockCap];
+			delete process.env[CONFIG_ENV.loopGuard];
+			delete process.env[CONFIG_ENV.loopGuardThreshold];
+			delete process.env[CONFIG_ENV.loopGuardHardBlock];
+			process.env.PI_CONTEXT_TRIMMER_CONFIG_PATH = join(fixtureDir, "does-not-exist.json");
+			await run();
+		} finally {
+			for (const [key, value] of saved) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+		}
+	}
+
+	function retainedFixture(size = 300) {
+		const droppedSentinel = "dropped-sentinel-" + "a".repeat(size);
+		const retainedSentinel = "retained-sentinel-" + "b".repeat(size);
+		return {
+			droppedSentinel,
+			retainedSentinel,
+			raw: [
+				{ role: "user", content: "dispatch", timestamp: 1 },
+				{ role: "user", content: "older turn", timestamp: 2 },
+				{ role: "assistant", content: droppedSentinel, timestamp: 3 },
+				{ role: "user", content: "newer turn", timestamp: 4 },
+				{ role: "assistant", content: retainedSentinel, timestamp: 5 },
+			],
+		};
+	}
+
+	it("holds the retained view below Tier 2 and records one later independent reset", async () => {
+		await withRetainedConfig(async () => {
+			const pi = await loadExtensionWithPersistence();
+			const { raw, droppedSentinel, retainedSentinel } = retainedFixture();
+			const first = (await fireContextWithCtx(pi, { messages: raw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(first.messages.some((message) => message.content === droppedSentinel), false);
+			assert.equal(first.messages.some((message) => message.content === retainedSentinel), true);
+			assert.equal(first.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+			assert.equal(first.messages.some((message) => message.customType === RETAINED_VIEW_CUSTOM_TYPE), false);
+			assert.equal(first.messages.some((message) => Object.getOwnPropertySymbols(message).length > 0), false);
+
+			const firstStateCount = pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length;
+			const firstDropCount = pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length;
+			assert.equal(firstStateCount, 1);
+			assert.equal(firstDropCount, 1);
+			const retainedData = pi.__getAppendEntries().find((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE)?.data;
+			assert.equal(JSON.stringify(retainedData).includes(droppedSentinel), false);
+			assert.equal(JSON.stringify(retainedData).includes(retainedSentinel), false);
+
+			const secondRaw = [
+				...raw,
+				{
+					role: "assistant",
+					content: "provider response",
+					timestamp: 6,
+					usage: { input: 350, cacheRead: 0, cacheWrite: 0, output: 1, totalTokens: 351 },
+					stopReason: "stop",
+				},
+			];
+			const second = (await fireContextWithCtx(pi, { messages: secondRaw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(second.messages.some((message) => message.content === droppedSentinel), false);
+			assert.equal(second.messages.some((message) => message.content === retainedSentinel), true);
+			assert.equal(second.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, firstStateCount);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, firstDropCount);
+
+			const thirdRaw = [
+				...secondRaw,
+				{ role: "user", content: "independent request", timestamp: 7 },
+				{ role: "assistant", content: "new-mass-" + "c".repeat(600), timestamp: 8 },
+			];
+			const third = (await fireContextWithCtx(pi, { messages: thirdRaw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(third.messages.some((message) => message.content === droppedSentinel), false);
+			assert.equal(third.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, firstStateCount + 1);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, firstDropCount + 1);
+		});
+	});
+
+	it("restores a branch-valid retained checkpoint after reload", async () => {
+		await withRetainedConfig(async () => {
+			const firstPi = await loadExtensionWithPersistence();
+			const { raw, droppedSentinel } = retainedFixture();
+			await fireContextWithCtx(firstPi, { messages: raw });
+
+			const resumedPi = createMockPiWithPersistence("test-session");
+			resumedPi.__setSessionEntries(firstPi.sessionManager.getBranch());
+			await contextTrimmerExtension(resumedPi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+			await fireSessionStart(resumedPi, { reason: "reload" }, {
+				sessionManager: resumedPi.sessionManager,
+				hasUI: false,
+				ui: { setStatus: () => {} },
+			});
+			const result = (await fireContextWithCtx(resumedPi, {
+				messages: [
+					...raw,
+					{
+						role: "assistant",
+						content: "response after reload",
+						timestamp: 6,
+						usage: { input: 350, output: 1, totalTokens: 351 },
+						stopReason: "stop",
+					},
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(result.messages.some((message) => message.content === droppedSentinel), false);
+			assert.equal(result.messages.filter((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE).length, 1);
+		});
+	});
+
+	it("invalidates retained state when tree navigation leaves the state entry's branch", async () => {
+		await withRetainedConfig(async () => {
+			const pi = await loadExtensionWithPersistence();
+			const { raw, droppedSentinel } = retainedFixture(160);
+			const first = (await fireContextWithCtx(pi, { messages: raw }, {
+				getSystemPrompt: () => "s".repeat(300),
+			})) as { messages: Array<Record<string, unknown>> };
+			assert.equal(first.messages.some((message) => message.content === droppedSentinel), false);
+
+			pi.__setSessionEntries([]);
+			const treeHandlers = pi.getHandlers("session_tree");
+			assert.equal(treeHandlers.length, 1);
+			await treeHandlers[0]({ previousLeafId: "custom-1", newLeafId: "sibling" }, {
+				sessionManager: pi.sessionManager,
+				hasUI: false,
+				ui: { setStatus: () => {} },
+			});
+			const sibling = (await fireContextWithCtx(pi, { messages: raw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(sibling.messages.some((message) => message.content === droppedSentinel), true);
+		});
+	});
+
+	it("rejects a persisted checkpoint after a policy configuration change", async () => {
+		await withRetainedConfig(async () => {
+			const firstPi = await loadExtensionWithPersistence();
+			const { raw, droppedSentinel } = retainedFixture();
+			await fireContextWithCtx(firstPi, { messages: raw });
+
+			process.env[CONFIG_ENV.tokenEstimatorDivisor] = "2";
+			const resumedPi = createMockPiWithPersistence("test-session");
+			resumedPi.__setSessionEntries(firstPi.sessionManager.getBranch());
+			await contextTrimmerExtension(resumedPi as unknown as Parameters<typeof contextTrimmerExtension>[0]);
+			await fireSessionStart(resumedPi, { reason: "reload" }, {
+				sessionManager: resumedPi.sessionManager,
+				hasUI: false,
+				ui: { setStatus: () => {} },
+			});
+			const result = (await fireContextWithCtx(resumedPi, { messages: raw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(result.messages.some((message) => message.content === droppedSentinel), true);
+		});
+	});
+
+	it("persists transformed reset state independently from zero-drop diagnostics", async () => {
+		await withRetainedConfig(async () => {
+			process.env[CONFIG_ENV.reasoningBlockCap] = "0";
+			const pi = await loadExtensionWithPersistence();
+			const raw = [
+				{ role: "user", content: "dispatch", timestamp: 1 },
+				{
+					role: "assistant",
+					content: [{ type: "thinking", thinking: "one-whole-turn-" + "x".repeat(600) }],
+					timestamp: 2,
+				},
+			];
+			await fireContextWithCtx(pi, { messages: raw });
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, 1);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, 0);
+			await fireContextWithCtx(pi, {
+				messages: [
+					...raw,
+					{
+						role: "assistant",
+						content: "provider response",
+						timestamp: 3,
+						usage: { input: 100, output: 1, totalTokens: 101 },
+						stopReason: "stop",
+					},
+				],
+			});
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, 1);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, 0);
+		});
+	});
+
+	it("does not write retained state repeatedly when a zero-drop reset changes nothing", async () => {
+		await withRetainedConfig(async () => {
+			const pi = await loadExtensionWithPersistence();
+			const raw = [
+				{ role: "user", content: "dispatch", timestamp: 1 },
+				{ role: "assistant", content: "one-whole-turn-" + "x".repeat(600), timestamp: 2 },
+			];
+			await fireContextWithCtx(pi, { messages: raw });
+			await fireContextWithCtx(pi, {
+				messages: [
+					...raw,
+					{
+						role: "assistant",
+						content: "provider response",
+						timestamp: 3,
+						usage: { input: 600, output: 1, totalTokens: 601 },
+						stopReason: "stop",
+					},
+				],
+			});
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE).length, 0);
+			assert.equal(pi.__getAppendEntries().filter((entry) => entry.customType === "context-trimmer-dropped").length, 0);
+		});
+	});
+
+	it("persists a Tier 2 hard-block content rewrite without persisting its notice", async () => {
+		await withRetainedConfig(async () => {
+			process.env[CONFIG_ENV.tier1MaxTokens] = "1000";
+			process.env[CONFIG_ENV.tier2MaxTokens] = "2000";
+			process.env[CONFIG_ENV.loopGuard] = "1";
+			process.env[CONFIG_ENV.loopGuardThreshold] = "3";
+			process.env[CONFIG_ENV.loopGuardHardBlock] = "3";
+			const pi = await loadExtensionWithPersistence();
+			const loopRaw = withTier2Boundary([
+				userMsg("dispatch"),
+				...Array.from({ length: 3 }, (_, index) => ({
+					role: "assistant",
+					content: [
+						{ type: "text", text: `loop-${index + 1}` },
+						{ type: "toolCall", name: "search", arguments: { q: "same" } },
+					],
+				})),
+			]).map((message, index) => ({ ...message, timestamp: index + 1 }));
+			const first = (await fireContextWithCtx(pi, { messages: loopRaw })) as {
+				messages: Array<Record<string, unknown>>;
+			};
+			assert.equal(first.messages.some((message) => typeof message.content === "string" && message.content.includes("blocked")), true);
+			const stateData = pi.__getAppendEntries().find((entry) => entry.customType === RETAINED_VIEW_CUSTOM_TYPE)?.data as {
+				contentOverrides?: unknown[];
+			} | undefined;
+			assert.ok((stateData?.contentOverrides?.length ?? 0) >= 1);
+
+			const second = (await fireContextWithCtx(pi, {
+				messages: [
+					...loopRaw,
+					{
+						role: "assistant",
+						content: "provider response",
+						timestamp: loopRaw.length + 1,
+						usage: { input: 350, output: 1, totalTokens: 351 },
+						stopReason: "stop",
+					},
+				],
+			})) as { messages: Array<Record<string, unknown>> };
+			const rewritten = second.messages.find((message) =>
+				Array.isArray(message.content) && message.content.some((block) => (block as { text?: unknown }).text === "loop-3"),
+			);
+			assert.ok(rewritten && Array.isArray(rewritten.content));
+			assert.equal(rewritten.content.some((block) => (block as { type?: unknown }).type === "toolCall"), false);
+			assert.equal(second.messages.some((message) => typeof message.content === "string" && message.content.includes("blocked")), false);
+		});
 	});
 });

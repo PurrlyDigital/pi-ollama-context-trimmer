@@ -2063,6 +2063,17 @@ describe("applyThreeTierTrim — keepLastUserPrompts protect-list-only invariant
 		assert.ok(result.droppedTurns >= 1);
 		assert.ok(result.totalTokens <= 100);
 		assert.equal(result.messages.filter((m) => m.customType === "context-trimmer-prune-reminder").length, 1);
+		const repeated = await applyThreeTierTrim(
+			[...result.messages, userMsg("third", 3), assistantMsg(body.repeat(2))],
+			{
+				verbatimMaxTokens: 10,
+				summarizeMaxTokens: 100,
+				dropFloorTokens: 0,
+				protectDispatch: false,
+			},
+		);
+		assert.ok(repeated.droppedTurns >= 1);
+		assert.equal(repeated.messages.filter((m) => m.customType === "context-trimmer-prune-reminder").length, 1);
 	});
 
 	it("drops the oldest reasoning and retained prompt content above tier 2", async () => {

@@ -33,8 +33,10 @@
     "./config.ts",
     "./index.ts",
     "./pinned-tier.ts",
+    "./retained-view-state.ts",
     "./test/policy.test.ts",
     "./test/config.test.ts",
+    "./test/retained-view-state.test.ts",
     "./test/integration.test.ts",
     "./test/guarded-closure-reproduction.test.ts"
   ]

@@ -30,7 +30,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "tsx --test test/policy.test.ts test/config.test.ts test/integration.test.ts test/guarded-closure-reproduction.test.ts"
+    "test": "tsx --test test/policy.test.ts test/config.test.ts test/retained-view-state.test.ts test/integration.test.ts test/guarded-closure-reproduction.test.ts"
   },
   "pi": {
     "extensions": [

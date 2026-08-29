@@ -48,7 +48,8 @@
 // layer; `config.ts` (parse + resolve) and `pinned-tier.ts` stay
 // process-free and node-I/O-free.
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -70,6 +71,7 @@ import {
 	LOOP_GUARD_BLOCK_TEXT,
 	LOOP_GUARD_NUDGE_TEXT,
 	REASONING_BLOCK_CAP_DEFAULT,
+	SUMMARIZE_TIER_MAX_TOKENS,
 	VERBATIM_TIER_MAX_TOKENS,
 	shouldHardBlock,
 	type TrimmableMessage,
@@ -89,6 +91,17 @@ import {
 	rederiveStamp,
 	PRESERVED_CUSTOM_TYPE,
 } from "./path-stamp.ts";
+import {
+	RETAINED_VIEW_CUSTOM_TYPE,
+	createRetainedViewState,
+	parseRetainedViewState,
+	reconstructRetainedView,
+	retainedSourceIndex,
+	stripRetainedSourceIndex,
+	withRetainedSourceIndex,
+	type RetainedSourceMessage,
+	type RetainedViewState,
+} from "./retained-view-state.ts";
 
 // ─── Per-message stamp: userTurnAge ────────────────────────────────────
 
@@ -124,23 +137,14 @@ function stampUserTurnAge<T extends { role: string }>(messages: ReadonlyArray<T>
 	return out;
 }
 
-// ─── Calibrated token-estimator divisor (derived from real usage) ───────
-// The trimmer's per-message token estimator is `chars / divisor`. The
-// compile-time default is `TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3`; the
-// operator knob (`tokenEstimatorDivisor` env/JSON) overrides it. This
-// helper derives a rough chars-per-prompt-token divisor from the latest
-// usable assistant usage already attached to the stream. It uses Pi's
-// provider-neutral prompt-token components, including cache reads and
-// writes when present, instead of guessing how a provider encodes opaque
-// reasoning. The current stream is recalculated on every context event;
-// no calibration state is retained.
+type PriorOutbound = {
+	sessionId: string;
+	sourceCount: number;
+	sourceDigest: string;
+	promptCharacters: number;
+	modelIdentity?: string;
+};
 
-/**
- * Return the prompt-token total reported by a usable assistant message.
- * Mirrors the harness compaction module's validity checks while using the
- * prompt components rather than output-inclusive `totalTokens`. Cache
- * fields are optional because some providers do not report them.
- */
 function usableAssistantUsage(msg: Record<string, unknown>): { promptTokens: number } | undefined {
 	if (msg.role !== "assistant") return undefined;
 	const stopReason = msg.stopReason;
@@ -160,39 +164,85 @@ function usableAssistantUsage(msg: Record<string, unknown>): { promptTokens: num
 	return Number.isFinite(promptTokens) && promptTokens > 0 ? { promptTokens } : undefined;
 }
 
-/**
- * Derive a calibrated chars-per-token divisor from the latest assistant
- * message in the stream that carries usable prompt-token usage. The
- * numerator is the character count the provider saw for that turn: the
- * system prompt plus every message before the calibration-point assistant.
- * The denominator is `input + cacheRead + cacheWrite`, using the standard
- * Pi usage fields that are present. The current assistant is not part of
- * that prompt, so its output does not distort the calibration.
- *
- * Returns `undefined` when no usable usage is present. The caller then
- * falls back to the configured divisor. No calibration state is retained
- * between context events.
- *
- * Pure: reads `systemPromptChars` (a number) and the raw message array,
- * returns a number or undefined. No I/O, no `process.*`. Kept in the
- * wiring layer because it reads the harness `usage` field; the pure
- * module's estimator signatures remain unchanged.
- */
-function deriveCalibratedDivisor(
-	rawMessages: ReadonlyArray<Record<string, unknown>>,
-	systemPromptChars: number,
-): number | undefined {
-	for (let i = rawMessages.length - 1; i >= 0; i--) {
-		const usage = usableAssistantUsage(rawMessages[i]!);
-		if (usage === undefined) continue;
-		let chars = systemPromptChars;
-		for (let j = 0; j < i; j++) {
-			chars += extractText(rawMessages[j]!.content).length;
-		}
-		const divisor = chars / usage.promptTokens;
-		if (Number.isFinite(divisor) && divisor > 0) return divisor;
+function hashText(value: string): string {
+	return createHash("sha256").update(value).digest("hex");
+}
+
+function hashJson(value: unknown): string | undefined {
+	try {
+		const encoded = JSON.stringify(value);
+		return encoded === undefined ? undefined : hashText(encoded);
+	} catch {
+		return undefined;
 	}
-	return undefined;
+}
+
+function rawMessageIdentities(
+	messages: ReadonlyArray<Record<string, unknown>>,
+): string[] | undefined {
+	const identities: string[] = [];
+	for (const message of messages) {
+		if (typeof message.timestamp !== "number" || !Number.isFinite(message.timestamp)) return undefined;
+		const identity = hashJson(message);
+		if (identity === undefined) return undefined;
+		identities.push(identity);
+	}
+	return identities;
+}
+
+function identityDigest(
+	identities: ReadonlyArray<string> | undefined,
+	count: number,
+): string | undefined {
+	if (identities === undefined || !Number.isSafeInteger(count) || count < 0 || count > identities.length) {
+		return undefined;
+	}
+	return hashJson(identities.slice(0, count));
+}
+
+function contextModelIdentity(ctx: ExtensionContext): string | undefined {
+	const model = (ctx as unknown as { model?: { provider?: unknown; id?: unknown } }).model;
+	if (typeof model?.provider !== "string" || typeof model.id !== "string") return undefined;
+	return `${model.provider}/${model.id}`;
+}
+
+function assistantModelIdentity(message: Record<string, unknown>): string | undefined {
+	if (typeof message.provider !== "string" || typeof message.model !== "string") return undefined;
+	return `${message.provider}/${message.model}`;
+}
+
+function derivePairedCalibratedDivisor(
+	rawMessages: ReadonlyArray<Record<string, unknown>>,
+	identities: ReadonlyArray<string> | undefined,
+	sessionId: string,
+	currentModelIdentity: string | undefined,
+	prior: PriorOutbound | undefined,
+): number | undefined {
+	if (prior === undefined || prior.sessionId !== sessionId) return undefined;
+	if (identityDigest(identities, prior.sourceCount) !== prior.sourceDigest) return undefined;
+	const assistants = rawMessages
+		.slice(prior.sourceCount)
+		.filter((message) => message.role === "assistant");
+	if (assistants.length !== 1) return undefined;
+	const assistant = assistants[0]!;
+	const usage = usableAssistantUsage(assistant);
+	if (usage === undefined) return undefined;
+	const responseModelIdentity = assistantModelIdentity(assistant);
+	if (prior.modelIdentity !== undefined && responseModelIdentity !== prior.modelIdentity) return undefined;
+	if (prior.modelIdentity !== undefined && currentModelIdentity !== undefined && currentModelIdentity !== prior.modelIdentity) {
+		return undefined;
+	}
+	const divisor = prior.promptCharacters / usage.promptTokens;
+	return Number.isFinite(divisor) && divisor > 0 ? divisor : undefined;
+}
+
+function outboundPromptCharacters(
+	messages: ReadonlyArray<Record<string, unknown>>,
+	systemPrompt: string,
+): number {
+	let characters = systemPrompt.length;
+	for (const message of messages) characters += extractText(message.content).length;
+	return characters;
 }
 
 // ─── Config file reader (the only file-I/O for config) ─────────────────
@@ -434,9 +484,82 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const rawHardBlock = cfg.loopGuardHardBlock !== undefined ? Math.trunc(cfg.loopGuardHardBlock) : undefined;
 	const loopGuardHardBlock =
 		rawHardBlock !== undefined && rawHardBlock < loopGuardThreshold ? loopGuardThreshold : rawHardBlock;
+	const runtimeSessionId = `runtime:${randomUUID()}`;
+	let retainedViewState: RetainedViewState | undefined;
+	let priorOutbound: PriorOutbound | undefined;
 
-	pi.on("session_start", async () => {
+	function sessionInfo(ctx: ExtensionContext): { id: string; persistable: boolean } {
+		const manager = (ctx as unknown as {
+			sessionManager?: { getSessionId?: () => string; getBranch?: () => unknown[] };
+		}).sessionManager;
+		try {
+			const id = manager?.getSessionId?.();
+			if (typeof id === "string" && id.length > 0) {
+				return { id, persistable: typeof manager?.getBranch === "function" };
+			}
+		} catch {
+			return { id: runtimeSessionId, persistable: false };
+		}
+		return { id: runtimeSessionId, persistable: false };
+	}
+
+	function restoreRetainedView(ctx: ExtensionContext): void {
+		priorOutbound = undefined;
+		retainedViewState = undefined;
+		const manager = (ctx as unknown as {
+			sessionManager?: { getSessionId?: () => string; getBranch?: () => unknown[] };
+		}).sessionManager;
+		if (typeof manager?.getSessionId !== "function" || typeof manager.getBranch !== "function") return;
+		try {
+			const sessionId = manager.getSessionId();
+			for (const entry of manager.getBranch()) {
+				if (
+					typeof entry !== "object" ||
+					entry === null ||
+					(entry as { type?: unknown }).type !== "custom" ||
+					(entry as { customType?: unknown }).customType !== RETAINED_VIEW_CUSTOM_TYPE
+				) continue;
+				const parsed = parseRetainedViewState((entry as { data?: unknown }).data);
+				retainedViewState = parsed?.sessionId === sessionId ? parsed : undefined;
+			}
+		} catch {
+			retainedViewState = undefined;
+		}
+	}
+
+	function policyFingerprint(expandedPreservedPatterns: ReadonlyArray<string>): string {
+		return hashJson({
+			config: cfg,
+			tier1MaxTokens: cfg.tier1MaxTokens ?? VERBATIM_TIER_MAX_TOKENS,
+			tier2MaxTokens: cfg.tier2MaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS,
+			tokenEstimatorDivisor: cfg.tokenEstimatorDivisor ?? TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
+			protectDispatch: resolveProtectDispatch(),
+			pinCurrentContext: shouldPinForCurrentContext,
+			loopGuard: resolveLoopGuard(),
+			loopGuardThreshold,
+			loopGuardHardBlock: loopGuardHardBlock ?? null,
+			intercomInstalled: resolveIntercomInstalled(),
+			subagentsInstalled: resolveSubagentsInstalled(),
+			expandedPreservedPatterns: [...expandedPreservedPatterns].sort(),
+		}) ?? hashText("context-trimmer-policy-unavailable");
+	}
+
+	pi.on("session_start", async (_event, ctx) => {
+		restoreRetainedView(ctx);
 		pinnedTier.refresh();
+	});
+
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreRetainedView(ctx);
+	});
+
+	pi.on("model_select", async () => {
+		priorOutbound = undefined;
+	});
+
+	pi.on("session_compact", async () => {
+		priorOutbound = undefined;
+		retainedViewState = undefined;
 	});
 
 	pi.on("turn_end", async () => {
@@ -445,8 +568,29 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("context", async (event, ctx) => {
-		// Read the current message stream.
 		const rawMessages = (event.messages ?? []) as unknown as ReadonlyArray<Record<string, unknown>>;
+		const identities = rawMessageIdentities(rawMessages);
+		const fullSourceDigest = identityDigest(identities, rawMessages.length);
+		const currentSession = sessionInfo(ctx);
+		const expandedPreservedPatterns = expandPreservedPaths(cfg.preservedPaths, homedir());
+		const currentPolicyFingerprint = policyFingerprint(expandedPreservedPatterns);
+		let sourceMessages: RetainedSourceMessage[] = rawMessages.map((message, sourceIndex) =>
+			withRetainedSourceIndex(message, sourceIndex),
+		);
+		if (retainedViewState !== undefined) {
+			const reconstructed = reconstructRetainedView({
+				state: retainedViewState,
+				sessionId: currentSession.id,
+				policyFingerprint: currentPolicyFingerprint,
+				currentPrefixDigest: identityDigest(identities, retainedViewState.sourceCount),
+				rawMessages,
+			});
+			if (reconstructed === undefined) retainedViewState = undefined;
+			else sourceMessages = reconstructed;
+		}
+		sourceMessages = sourceMessages.filter(
+			(message) => message.customType !== RETAINED_VIEW_CUSTOM_TYPE,
+		);
 		// Capture the fully assembled system prompt the LLM will see
 		// for this turn, then approximate its token count using the
 		// same text-level estimator the policy uses for message
@@ -481,24 +625,17 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// background-promise `.then()` — hoisted to a single const.
 		const tokenEstimatorDivisor =
 			cfg.tokenEstimatorDivisor !== undefined ? Math.trunc(cfg.tokenEstimatorDivisor) : TOKEN_ESTIMATOR_DIVISOR_DEFAULT;
-		// Calibrate the divisor from the latest usable assistant usage in the
-		// stream. The prompt-token total includes cache reads and writes when
-		// the provider reports them, so opaque reasoning already present in a
-		// resumed stream contributes to the same rough estimate without a
-		// provider-specific conversion. When no usable usage is present
-		// (pre-first-turn hooks, test mocks without `usage`, aborted/error
-		// turns), the configured `tokenEstimatorDivisor` above is the fallback.
-		// Derive it once per hook and thread it through every downstream
-		// token-count call. No calibration state is retained between hooks.
-		const calibratedDivisor = deriveCalibratedDivisor(rawMessages, systemPromptString.length);
+		const calibratedDivisor = derivePairedCalibratedDivisor(
+			rawMessages,
+			identities,
+			currentSession.id,
+			contextModelIdentity(ctx),
+			priorOutbound,
+		);
 		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
 		const systemPromptTokens = approximateTextTokens(systemPromptString, effectiveDivisor);
-		// Stamp userTurnAge on every message. The stamp is the source
-		// of truth for the dispatch-task protection; we pass the
-		// minimum shape (role) to the stampee and use the original
-		// content/customType downstream.
 		const stampedAges = stampUserTurnAge(
-			rawMessages.map((m) => ({ role: String(m.role ?? "user") })),
+			rawMessages.map((message) => ({ role: String(message.role ?? "user") })),
 		);
 		// Build the pinned-tier synthetic (the agent def). Opt-in: may
 		// return `null` when personality is not configured / resolves
@@ -520,9 +657,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// Either path yields the source path; the first non-empty
 		// wins. The stamp is on `details.sourcePath` (the locked
 		// decision — `details` over a new top-level field).
-		const home = homedir();
-		const expandedPreservedPatterns = expandPreservedPaths(cfg.preservedPaths, home);
-		const base: TrimmableMessage[] = rawMessages.map((m, i) => {
+		const base: TrimmableMessage[] = sourceMessages.map((m) => {
 			// Source-path extraction: read from `details.sourcePath` first,
 			// fall back to the re-derived stamp for `m.toolCallId`.
 			const detailsObj = m.details;
@@ -543,12 +678,17 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			// preserve all pi-specific fields), then layer the trim
 			// stamps on top. The source-path stamp goes via the seam
 			// helper so the type contract is enforced.
-			const stamped = stampSourcePath(m, sourcePath) as TrimmableMessage;
+			const stamped = stampSourcePath(
+				m as RetainedSourceMessage & { details?: Record<string, unknown> },
+				sourcePath,
+			) as TrimmableMessage;
+			const sourceIndex = retainedSourceIndex(m);
+			const sourceAge = sourceIndex === undefined ? undefined : stampedAges[sourceIndex];
 			const trimmable: TrimmableMessage = {
 				...stamped,
-				role: stampedAges[i].role as TrimmableMessage["role"],
+				role: String(m.role ?? "user") as TrimmableMessage["role"],
 				content: m.content,
-				userTurnAge: stampedAges[i].userTurnAge,
+				userTurnAge: sourceAge?.userTurnAge,
 				customType: typeof m.customType === "string" ? m.customType : undefined,
 			};
 			return trimmable;
@@ -659,41 +799,65 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 				: afterRule2b;
 			cleaned = applyReasoningBlockCap(afterRule3, reasoningBlockCap);
 		}
-		// Persist a drop marker when the tier-3 drop path fired
-		// (any non-zero `droppedTurns`), write a
-		// `context-trimmer-dropped` entry carrying the count and a
-		// timestamp. The marker is diagnostic only — it is not
-		// used for policy decisions. The pure `policy.ts` module
-		// only carries the `droppedTurns` counter; the wiring
-		// layer is responsible for persistence. The try/catch
-		// degrades silently when `pi.appendEntry` is unavailable
-		// (tests, minimal mocks).
-		if (result.droppedTurns > 0) {
-			const appendEntry = (pi as unknown as { appendEntry?: (customType: string, data?: unknown) => void }).appendEntry;
-			if (typeof appendEntry === "function") {
-				try {
-					appendEntry("context-trimmer-dropped", { droppedTurns: result.droppedTurns, timestamp: Date.now() });
-				} catch {
-					// Best-effort: degrade silently
+		const out: TrimmableMessage[] = applyLoopGuard(cleaned, result.reachedTier2);
+		const appendEntry = (pi as unknown as {
+			appendEntry?: (customType: string, data?: unknown) => void;
+		}).appendEntry;
+		if (result.reachedTier2 && fullSourceDigest !== undefined) {
+			const stateInput = {
+				sessionId: currentSession.id,
+				policyFingerprint: currentPolicyFingerprint,
+				sourceDigest: fullSourceDigest,
+				rawMessages,
+			};
+			const candidateState = createRetainedViewState({
+				...stateInput,
+				outputMessages: sourceMessages,
+			});
+			const nextState = createRetainedViewState({
+				...stateInput,
+				outputMessages: out as unknown as ReadonlyArray<Record<string, unknown>>,
+			});
+			const stateChanged =
+				nextState !== undefined &&
+				hashJson(nextState) !== hashJson(candidateState);
+			if (stateChanged) {
+				retainedViewState = nextState;
+				if (currentSession.persistable && typeof appendEntry === "function") {
+					try {
+						appendEntry.call(pi, RETAINED_VIEW_CUSTOM_TYPE, nextState);
+					} catch {
+						// Best-effort persistence; the validated runtime state remains active.
+					}
 				}
 			}
 		}
-		// Loop-guard integration. Runs AFTER the trim (operates on
-		// the trimmed view the LLM is about to see) and BEFORE the
-		// handler returns. Re-injection on every qualifying turn is
-		// the simpler safe default; the hard-block naturally dedupes
-		// because stripping the tool call breaks the fingerprint
-		// (`type: "toolCall"` blocks absent → `\0__no_tool_calls__`
-		// signature → the run resets on the next invocation).
-		const out: TrimmableMessage[] = applyLoopGuard(cleaned, result.reachedTier2);
-		// Cast back to the session message shape and return. The
-		// pinned message rides out at the top (when injected); the rest
-		// are the trimmed trimmable messages. The double-cast mirrors the
-		// pattern in the prior wiring: `TrimmableMessage` and
-		// `AgentMessage` share a structural core (role, content, etc.)
-		// but the session type carries provider-specific fields the
-		// policy does not inspect.
-		const outCasted = out.map((m) => m as unknown as Record<string, unknown>);
+		if (result.droppedTurns > 0 && typeof appendEntry === "function") {
+			try {
+				appendEntry.call(pi, "context-trimmer-dropped", {
+					droppedTurns: result.droppedTurns,
+					timestamp: Date.now(),
+				});
+			} catch {
+				// Best-effort diagnostic.
+			}
+		}
+
+		priorOutbound = fullSourceDigest === undefined
+			? undefined
+			: {
+				sessionId: currentSession.id,
+				sourceCount: rawMessages.length,
+				sourceDigest: fullSourceDigest,
+				promptCharacters: outboundPromptCharacters(
+					out as unknown as ReadonlyArray<Record<string, unknown>>,
+					systemPromptString,
+				),
+				modelIdentity: contextModelIdentity(ctx),
+			};
+		const outCasted = out.map((message) =>
+			stripRetainedSourceIndex(message as unknown as Record<string, unknown>),
+		);
 		return { messages: outCasted as unknown as typeof event.messages };
 	});
 
