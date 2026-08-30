@@ -10,7 +10,7 @@ It sorts trimmable messages into three bands. Each band has its own rule.
 
 The extension works with any provider or model. It does not require cache reporting.
 
-At the reset boundary, it makes a larger safe cut so cache-enabled providers can reuse the smaller context for more turns. Providers without cache reporting also receive smaller context windows.
+At the reset boundary, it makes a larger safe cut and saves the retained outbound view as branch-local extension state. Later calls reuse that view and add new messages. The complete session history stays intact.
 
 ## What it does
 
@@ -23,6 +23,14 @@ On each LLM call, the extension inspects the message stream and applies one of t
 | Reset | 100k or more | Remove duplicate skill-read pairs, then drop the oldest eligible turns toward tier 1. Stop before the configured tier 1 floor is undershot. |
 
 The extension uses its estimate of the current LLM-bound stream as the only reset trigger. Provider status percentages, aggregate totals, cache-hit statistics, and report identity cannot independently remove, rewrite, or reorder existing context. Cache-aware prompt usage can still calibrate the local estimate. Below Tier 2, the extension keeps the existing stream intact and in order.
+
+After a reset, the current stream is the saved retained view plus messages added later. Messages removed by the reset do not return on the next call. The retained view grows through the hold band until it reaches Tier 2 again.
+
+The saved state does not enter model context. On reload, resume, or tree navigation, the extension restores state only from the active branch when the session, source history, and trim settings match. The state selects raw messages and records removed content-block positions. It cannot supply replacement text. Restore also requires every source protected by the current policy and enforces the reminder and pinned-slot order. If validation fails, the extension ignores the state and recalculates from the current session without throwing.
+
+Pi's active session branch is the host record for both raw messages and extension state. The extension does not cryptographically authenticate the local session file. An actor who can rewrite that file can also rewrite its raw messages. Signing, secrets, and key management require a separate Pi host contract.
+
+Below Tier 2, reusing a retained view writes no new state or drop diagnostic. A reset updates state only when it changes retained messages. The extension writes a drop diagnostic only when it drops at least one turn.
 
 Protected subagent inputs never count toward this budget, and never get dropped.
 
@@ -236,9 +244,11 @@ The trimmer estimates tokens with `Math.ceil(text.length / divisor)`. The defaul
 
 String content is counted as-is. For array content, an object with a string `text` field contributes that text. Other object blocks contribute their `JSON.stringify()` output, and primitive blocks contribute their string value. The trimmer joins those pieces before counting them. This undercounts multimodal content, so it can trim earlier rather than later.
 
-The wiring layer can calibrate the divisor from provider usage. Once per context event, it looks for the latest assistant message that is not aborted or errored and has usable prompt usage. It adds the standard `input`, `cacheRead`, and `cacheWrite` fields when they are present, then divides the system-prompt character count plus the extracted text from every message before that assistant by that prompt-token total. The assistant message that supplies the usage is not included in the character count. This gives the current stream a rough, provider-informed estimate without trying to decode opaque reasoning or naming a provider's encryption format. The divisor is recalculated on each context event and is not retained.
+The wiring layer can calibrate the divisor from provider usage. It keeps the prior extension-produced prompt's estimator character count in memory for one request. On the next context event, calibration requires the same session, an unchanged raw source prefix, and exactly one following usable assistant response. The extension divides the saved prompt characters by that response's `input + cacheRead + cacheWrite` total.
 
-If no usable prompt usage appears, the configured divisor applies. This is the normal path for a new session's first turn, test messages without usage data, and streams whose assistant messages are aborted or errored. The configured divisor is the operator setting above, or `3` when neither configuration channel sets one.
+This pairing prevents a trimmed request's usage from being applied to the complete session's character count. The pairing is cleared on reload, tree navigation, compaction, and model changes. It is not persisted.
+
+If the extension cannot prove the pairing, the configured divisor applies. This includes a new session's first turn, reload, missing stable message identity, multiple following assistant messages, and assistant messages that are aborted, errored, or have invalid usage. The configured divisor is the operator setting above, or `3` when neither configuration channel sets one.
 
 `usage.totalTokens` does not trigger a reset. Pi exposes its status-line percentage through `ctx.getContextUsage().percent`. Providers can report stale totals, cache-inclusive totals, or a percentage that does not describe the current stream. The extension does not use that percentage as a reset trigger. The local visible-content estimate, after protected mass and system-prompt accounting, is the sole reset predicate.
 
@@ -250,7 +260,7 @@ The loop guard has its own informational token signal. It samples up to the last
 
 ## Development
 
-Run the test suite. It currently contains 370 tests and takes about one second on a modern laptop.
+Run the test suite. It currently contains 395 tests and takes a few seconds on a modern laptop.
 
 ```bash
 npm install   # installs tsx as a dev dependency
@@ -270,8 +280,10 @@ index.ts              # Extension wiring: registers session_start / turn_end / c
 config.ts             # Pure config resolver (parse file + merge env over file)
 policy.ts             # Three-tier trim policy (the trim algorithm)
 pinned-tier.ts        # Pinned content reader (personality)
+retained-view-state.ts # Pure retained-view state validation and reconstruction
 test/policy.test.ts   # Unit tests for the trim policy
 test/config.test.ts   # Unit tests for config resolution (precedence + parsing)
+test/retained-view-state.test.ts # Retained-state validation and reconstruction tests
 test/integration.test.ts # End-to-end tests for the context handler wiring
 tsconfig.json         # TypeScript config for the extension
 tsconfig.policy.json  # Narrower TypeScript config for the policy module

@@ -59,14 +59,21 @@ export const TOKEN_ESTIMATOR_DIVISOR_DEFAULT = 3;
  * The constant lives in `policy.ts` because the reminder is a
  * pure-policy concern: the string is a pure function of the drop
  * event, not of any operator state. No env reads, no fs I/O — the
- * purity contract (AGENTS.md rule 7) holds. The wiring layer does
- * not need to know about the constant; `result.messages` carries
- * the reminder out structurally.
+ * purity contract holds. The exported constructor keeps reset output
+ * and retained-view reconstruction on the same message shape.
  */
 const PRUNE_REMINDER_TEXT =
 	"The Context Trimmer extension has automatically pruned older things in context that weren't asked to be kept. " +
 	"If you need something that was cut, get it fresh.";
-const PRUNE_REMINDER_CUSTOM_TYPE = "context-trimmer-prune-reminder";
+export const PRUNE_REMINDER_CUSTOM_TYPE = "context-trimmer-prune-reminder";
+
+export function createPruneReminderMessage(): TrimmableMessage {
+	return {
+		role: "user",
+		content: PRUNE_REMINDER_TEXT,
+		customType: PRUNE_REMINDER_CUSTOM_TYPE,
+	};
+}
 
 // ─── Public types ──────────────────────────────────────────────────────
 
@@ -906,8 +913,11 @@ function dropOldestTurns(
 	// ordinals, no token mass. The "get it fresh" clause is
 	// conditional ("if you need …"), not a directive.
 	const out: TrimmableMessage[] = [];
-	if (dropSet.size > 0) {
-		out.push({ role: "user", content: PRUNE_REMINDER_TEXT, customType: PRUNE_REMINDER_CUSTOM_TYPE });
+	if (
+		dropSet.size > 0 &&
+		!messages.some((message) => message.customType === PRUNE_REMINDER_CUSTOM_TYPE)
+	) {
+		out.push(createPruneReminderMessage());
 	}
 	// Pair-atomic: when an assistant message sits inside a dropped
 	// turn, walk its `toolCall` blocks. Protected `toolCall` blocks
