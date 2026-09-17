@@ -1167,9 +1167,9 @@ describe("context handler — loop guard (AC-8 end-to-end regression)", () => {
 	});
 });
 
-// ─── Duplicate skill reads ────────────────────────────────────────────
+// ─── Duplicate file reads ─────────────────────────────────────────────
 
-describe("context handler — duplicate skill reads", () => {
+describe("context handler — duplicate file reads", () => {
 	it("keeps duplicate pairs below the Tier 2 ceiling", async () => {
 		const skillPath = "/home/operator/.pi/agent/skills/unslop/SKILL.md";
 		const pi = await loadExtension();
@@ -1195,6 +1195,30 @@ describe("context handler — duplicate skill reads", () => {
 			Array.isArray(message.content) ? message.content : [],
 		).filter((block) => (block as { type?: string }).type === "toolCall") as Array<{ id?: string }>;
 		assert.deepEqual(toolCalls.map((block) => block.id), ["old", "new"]);
+	});
+
+	it("keeps only the newest exact read of a preserved path", async () => {
+		const pi = await loadExtension();
+		const event = {
+			messages: [
+				userMsg("dispatch"),
+				assistantMsg(pad("tier2-old", 80_000)),
+				assistantMsg(pad("tier2-new", 40_000)),
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "old-preserved", name: "read", arguments: { path: "/repo/AGENTS.md" } }],
+				},
+				{ role: "toolResult", content: "old preserved contents", toolCallId: "old-preserved" },
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: "new-preserved", name: "read", arguments: { path: "/repo/AGENTS.md" } }],
+				},
+				{ role: "toolResult", content: "new preserved contents", toolCallId: "new-preserved" },
+			],
+		};
+		const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+		assert.equal(result.messages.some((message) => message.content === "old preserved contents"), false);
+		assert.equal(result.messages.some((message) => message.content === "new preserved contents"), true);
 	});
 
 	it("removes marked pairs, then resets eligible context toward Tier 1", async () => {
@@ -1378,6 +1402,126 @@ async function fireContextWithCtx(
 		...ctx,
 	});
 }
+
+describe("context handler — Jev retention", () => {
+	it("keeps a Jev-selected old turn while preserving the newest turn", async () => {
+		const saved = {
+			personalityPath: process.env[CONFIG_ENV.personalityPath],
+			jevRetention: process.env[CONFIG_ENV.jevRetention],
+			tier1: process.env[CONFIG_ENV.tier1MaxTokens],
+			tier2: process.env[CONFIG_ENV.tier2MaxTokens],
+			divisor: process.env[CONFIG_ENV.tokenEstimatorDivisor],
+			apiKey: process.env.TYPESAFE_API_KEY,
+			fetch: globalThis.fetch,
+		};
+		try {
+			delete process.env[CONFIG_ENV.personalityPath];
+			process.env[CONFIG_ENV.jevRetention] = "1";
+			process.env[CONFIG_ENV.tier1MaxTokens] = "40";
+			process.env[CONFIG_ENV.tier2MaxTokens] = "60";
+			process.env[CONFIG_ENV.tokenEstimatorDivisor] = "4";
+			process.env.TYPESAFE_API_KEY = "test-key";
+			let calls = 0;
+			globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+				calls++;
+				const body = JSON.parse(String(init?.body)) as { questions?: Record<string, unknown> };
+				const answers = Object.fromEntries(Object.keys(body.questions ?? {}).map((key) => [key, {
+					choice: "keep",
+					confidence: 0.9,
+					probabilities: { keep: 0.95, drop: 0.03, uncertain: 0.02 },
+				}]));
+				return new Response(JSON.stringify({ answers }), { status: 200 });
+			}) as typeof fetch;
+			const pi = await loadExtension();
+			const event = {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg(pad("old-important", 15)),
+					assistantMsg(pad("middle", 30)),
+					assistantMsg(pad("latest", 30)),
+				],
+			};
+			const result = (await invokeContext(pi, event)) as { messages: Array<Record<string, unknown>> };
+			const content = result.messages.map((message) => String(message.content));
+			assert.equal(calls, 1);
+			assert.equal(content.some((text) => text.startsWith("old-important")), true);
+			assert.equal(content.some((text) => text.startsWith("middle")), false);
+			assert.equal(content.some((text) => text.startsWith("latest")), true);
+		} finally {
+			for (const [key, value] of [
+				[CONFIG_ENV.personalityPath, saved.personalityPath],
+				[CONFIG_ENV.jevRetention, saved.jevRetention],
+				[CONFIG_ENV.tier1MaxTokens, saved.tier1],
+				[CONFIG_ENV.tier2MaxTokens, saved.tier2],
+				[CONFIG_ENV.tokenEstimatorDivisor, saved.divisor],
+				["TYPESAFE_API_KEY", saved.apiKey],
+			] as const) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
+			globalThis.fetch = saved.fetch;
+		}
+	});
+
+	it("reads TYPESAFE_API_KEY from the config file directory", async () => {
+		const savedJev = process.env[CONFIG_ENV.jevRetention];
+		const savedKey = process.env.TYPESAFE_API_KEY;
+		const savedFetch = globalThis.fetch;
+		const envPath = join(fixtureDir, ".env");
+		try {
+			process.env[CONFIG_ENV.jevRetention] = "1";
+			delete process.env.TYPESAFE_API_KEY;
+			writeFileSync(envPath, "TYPESAFE_API_KEY=file-key\n");
+			let authorization = "";
+			globalThis.fetch = (async (_input: string | URL | Request, init?: RequestInit) => {
+				authorization = String((init?.headers as Record<string, string> | undefined)?.authorization ?? "");
+				return new Response(JSON.stringify({ answers: {} }), { status: 200 });
+			}) as typeof fetch;
+			const pi = await loadExtension();
+			await invokeContext(pi, {
+				messages: [
+					userMsg("dispatch"),
+					assistantMsg(pad("old", 80_000)),
+					assistantMsg(pad("new", 40_000)),
+				],
+			});
+			assert.equal(authorization, "Bearer file-key");
+		} finally {
+			rmSync(envPath, { force: true });
+			if (savedJev === undefined) delete process.env[CONFIG_ENV.jevRetention];
+			else process.env[CONFIG_ENV.jevRetention] = savedJev;
+			if (savedKey === undefined) delete process.env.TYPESAFE_API_KEY;
+			else process.env.TYPESAFE_API_KEY = savedKey;
+			globalThis.fetch = savedFetch;
+		}
+	});
+
+	it("does not call TypeSafe when the key is unavailable", async () => {
+		const savedJev = process.env[CONFIG_ENV.jevRetention];
+		const savedKey = process.env.TYPESAFE_API_KEY;
+		const savedFetch = globalThis.fetch;
+		try {
+			process.env[CONFIG_ENV.jevRetention] = "1";
+			delete process.env.TYPESAFE_API_KEY;
+			let called = false;
+			globalThis.fetch = (async () => {
+				called = true;
+				throw new Error("unexpected fetch");
+			}) as typeof fetch;
+			const pi = await loadExtension();
+			await invokeContext(pi, {
+				messages: [userMsg("dispatch"), assistantMsg(pad("large", 120_000))],
+			});
+			assert.equal(called, false);
+		} finally {
+			if (savedJev === undefined) delete process.env[CONFIG_ENV.jevRetention];
+			else process.env[CONFIG_ENV.jevRetention] = savedJev;
+			if (savedKey === undefined) delete process.env.TYPESAFE_API_KEY;
+			else process.env.TYPESAFE_API_KEY = savedKey;
+			globalThis.fetch = savedFetch;
+		}
+	});
+});
 
 describe("context handler — reasoning-block cap (AC-4)", () => {
 	let sReasoningBlockCap: string | undefined;
@@ -2821,7 +2965,7 @@ describe("context handler: local Tier 2 reset boundary", () => {
 		}
 	});
 
-	it("keeps duplicate skill reads intact across repeated oversized reports below the boundary", async () => {
+	it("keeps duplicate file reads intact across repeated oversized reports below the boundary", async () => {
 		const pi = await loadExtension();
 		const skillPath = "/tmp/skills/repeated/SKILL.md";
 		for (const totalTokens of [150_000, 500_000]) {

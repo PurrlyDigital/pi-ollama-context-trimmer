@@ -4,7 +4,7 @@
 //
 //   0–50k          → verbatim, no action
 //   50k–100k       → hold middle-band messages untouched
-//   100k+          → remove duplicate skill reads, then drop the oldest
+//   100k+          → remove duplicate file reads, then drop the oldest
 //                    eligible whole turns toward the Tier 1 target
 //
 // Subagent protected inputs (subagent-only, excluded from the 50k/100k
@@ -66,6 +66,7 @@ const PRUNE_REMINDER_TEXT =
 	"The Context Trimmer extension has automatically pruned older things in context that weren't asked to be kept. " +
 	"If you need something that was cut, get it fresh.";
 export const PRUNE_REMINDER_CUSTOM_TYPE = "context-trimmer-prune-reminder";
+export const JEV_RETAINED_DETAIL_KEY = "contextTrimmerJevRetained";
 
 export function createPruneReminderMessage(): TrimmableMessage {
 	return {
@@ -185,11 +186,11 @@ export type TrimOptions = {
 	 */
 	protectedToolCallIds?: ReadonlySet<string>;
 	/**
-	 * Older completed skill-read IDs found before the local reset.
+	 * Older completed exact file-read IDs found before the local reset.
 	 * At the Tier 2 boundary, the policy removes their paired tool calls
 	 * and results before resetting eligible context toward Tier 1.
 	 */
-	duplicateSkillReadIds?: ReadonlySet<string>;
+	duplicateFileReadIds?: ReadonlySet<string>;
 	/**
 	 * Override the per-message token estimator divisor (default 3,
 	 * `TOKEN_ESTIMATOR_DIVISOR_DEFAULT`). Used by both
@@ -247,6 +248,9 @@ export type TrimOptions = {
 	 * `keepOriginalPrompt` JSON key, with default `true`.
 	 */
 	keepOriginalPrompt?: boolean;
+	/** Force a Tier 2 reset after the wiring layer has already confirmed
+	 *  the boundary and prepared a duplicate-free stream. */
+	forceTier2Reset?: boolean;
 };
 
 /** The return value. A fresh `messages` array (possibly shorter). */
@@ -262,6 +266,9 @@ export type TrimResult = {
 	totalTokens: number;
 	/** Whether the original local stream reached the Tier 2 reset boundary. */
 	reachedTier2: boolean;
+	/** Start indices of the turns removed by the reset, relative to the
+	 *  duplicate-free stream used for the final drop pass. */
+	droppedTurnStarts: number[];
 };
 
 // ─── Per-message token accounting (chars / divisor) ─────────────────────
@@ -534,6 +541,9 @@ export function isProtectedSlot(
 	if (msg.customType && protectedCustomTypes.has(msg.customType)) {
 		return true;
 	}
+	if (msg.details?.[JEV_RETAINED_DETAIL_KEY] === true) {
+		return true;
+	}
 	// Preserved-path slot: the message's stamped source path matches a
 	// preserved pattern. Independent of the dispatch / customType
 	// channels above — the OR is additive, the existing checks stay
@@ -628,7 +638,7 @@ export function totalTrimmableTokens(
  *      - total ≤ verbatimMaxTokens           → return messages as-is.
  *      - verbatimMaxTokens < total < summarizeMaxTokens
  *                                            → return messages as-is.
- *      - total ≥ summarizeMaxTokens          → remove duplicate skill-read
+ *      - total ≥ summarizeMaxTokens          → remove duplicate file-read
  *                                              pairs, then drop oldest
  *                                              whole turns toward Tier 1.
  *
@@ -639,7 +649,7 @@ export async function applyThreeTierTrim(
 	messages: ReadonlyArray<TrimmableMessage>,
 	options: TrimOptions = {},
 ): Promise<TrimResult> {
-	return applyThreeTierTrimInternal(messages, options, false);
+	return applyThreeTierTrimInternal(messages, options, options.forceTier2Reset ?? false);
 }
 
 async function applyThreeTierTrimInternal(
@@ -705,19 +715,16 @@ async function applyThreeTierTrimInternal(
 		divisor,
 	);
 	const needsHold = estimatedTotal > effectiveVerbatimMax;
-	const duplicateSkillReadIds = options.duplicateSkillReadIds ?? findDuplicateSkillReadIds(messages);
-	const removableDuplicateSkillReadIds = new Set(
-		[...duplicateSkillReadIds].filter((id) => !protectedToolCallIds.has(id)),
-	);
+	const duplicateFileReadIds = options.duplicateFileReadIds ?? findDuplicateFileReadIds(messages);
 	const reachesTier2ResetBoundary =
 		forceTier2Reset || (estimatedTotal > 0 && estimatedTotal >= effectiveSummarizeMax);
-	if (removableDuplicateSkillReadIds.size > 0 && reachesTier2ResetBoundary) {
+	if (duplicateFileReadIds.size > 0 && reachesTier2ResetBoundary) {
 		const resetOptions: TrimOptions = {
 			...options,
-			duplicateSkillReadIds: new Set(),
+			duplicateFileReadIds: new Set(),
 		};
 		return applyThreeTierTrimInternal(
-			collapseDuplicateSkillReads(messages, removableDuplicateSkillReadIds),
+			collapseDuplicateFileReads(messages, duplicateFileReadIds),
 			resetOptions,
 			true,
 		);
@@ -727,7 +734,7 @@ async function applyThreeTierTrimInternal(
 	// effective Tier 1 target.
 	if (reachesTier2ResetBoundary) {
 		const resetDropFloor = effectiveDropFloor;
-		const { messages: dropped, droppedTurns } = dropOldestTurns(
+		const { messages: dropped, droppedTurns, droppedTurnStarts } = dropOldestTurns(
 			messages,
 			effectiveVerbatimMax,
 			protectedCustomTypes,
@@ -754,6 +761,7 @@ async function applyThreeTierTrimInternal(
 			droppedTurns,
 			totalTokens: postDropTotal,
 			reachedTier2: true,
+			droppedTurnStarts,
 		};
 	}
 
@@ -764,6 +772,7 @@ async function applyThreeTierTrimInternal(
 			droppedTurns: 0,
 			totalTokens: estimatedTotal,
 			reachedTier2: false,
+			droppedTurnStarts: [],
 		};
 	}
 
@@ -773,10 +782,72 @@ async function applyThreeTierTrimInternal(
 		droppedTurns: 0,
 		totalTokens: estimatedTotal,
 		reachedTier2: false,
+		droppedTurnStarts: [],
 	};
 }
 
 // ─── Internal: turn boundaries and dropping ────────────────────────────
+
+export type TrimmableTurn = {
+	start: number;
+	end: number;
+	tokens: number;
+};
+
+export function listTrimmableTurns(
+	messages: ReadonlyArray<TrimmableMessage>,
+	protectedCustomTypes: ReadonlySet<string>,
+	protectDispatch: boolean,
+	preservedPatterns: ReadonlyArray<string>,
+	protectedToolCallIds: ReadonlySet<string> = new Set(),
+	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
+	keepOriginalPrompt = true,
+	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
+): TrimmableTurn[] {
+	const turns: TrimmableTurn[] = [];
+	let turnStart = -1;
+	for (let i = 0; i < messages.length; i++) {
+		const msg = messages[i];
+		const isDispatch = msg.role === "user" && protectDispatch && msg.userTurnAge === 0;
+		if (msg.role === "user" && !isDispatch) {
+			if (turnStart !== -1 && turnStart < i) {
+				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+			}
+			turnStart = i;
+			continue;
+		}
+		if (msg.role === "assistant") {
+			const currentStartsWithUser = turnStart !== -1 && messages[turnStart].role === "user";
+			if (turnStart === -1 || !currentStartsWithUser) {
+				if (turnStart !== -1 && turnStart < i) {
+					turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+				}
+				turnStart = i;
+			}
+		}
+	}
+	if (turnStart !== -1) {
+		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+	}
+	if (turns.length === 0 && protectDispatch) {
+		let dispatchIdx = -1;
+		for (let i = 0; i < messages.length; i++) {
+			if (messages[i].role === "user" && messages[i].userTurnAge === 0) {
+				dispatchIdx = i;
+				break;
+			}
+		}
+		const tailStart = dispatchIdx === -1 ? 0 : dispatchIdx + 1;
+		let trimmableCount = 0;
+		for (let i = tailStart; i < messages.length; i++) {
+			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) trimmableCount++;
+		}
+		if (trimmableCount >= 2 && tailStart < messages.length) {
+			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
+		}
+	}
+	return turns;
+}
 
 /**
  * Hard-drop the oldest whole trimmable turns until the trimmable
@@ -801,75 +872,17 @@ function dropOldestTurns(
 	keepLastUserPromptsProtectedIndices: ReadonlySet<number> = new Set(),
 	keepOriginalPrompt = true,
 	divisor: number = TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
-): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string> } {
-	// First pass: identify trimmable turns and their token mass.
-	// A follow-up user message starts a complete interactive turn so
-	// that retained user prompts participate in the same oldest-first
-	// eligibility order as their assistant and tool-result content.
-	// In an autonomous post-dispatch tail, each assistant starts a
-	// droppable unit so long tool-result tails can still be shed in
-	// bounded pieces. Permanent protected slots close a turn without
-	// becoming eligible content.
-	type Turn = { start: number; end: number; tokens: number };
-	const turns: Turn[] = [];
-	let turnStart = -1;
-	for (let i = 0; i < messages.length; i++) {
-		const msg = messages[i];
-		const isDispatch = msg.role === "user" && protectDispatch && msg.userTurnAge === 0;
-		if (msg.role === "user" && !isDispatch) {
-			if (turnStart !== -1 && turnStart < i) {
-				turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
-			}
-			turnStart = i;
-			continue;
-		}
-		if (msg.role === "assistant") {
-			const currentStartsWithUser = turnStart !== -1 && messages[turnStart].role === "user";
-			if (turnStart === -1 || !currentStartsWithUser) {
-				if (turnStart !== -1 && turnStart < i) {
-					turns.push(makeTurn(messages, turnStart, i, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
-				}
-				turnStart = i;
-			}
-			continue;
-		}
-	}
-	// Close the final open turn (if any).
-	if (turnStart !== -1) {
-		turns.push(makeTurn(messages, turnStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
-	}
-	// If no trimmable turn was identified but there is post-dispatch
-	// trimmable mass (the "mid-response tool result tail" case),
-	// synthesize a trimmable turn spanning the post-dispatch tail.
-	// This handles sessions where no follow-up user message has
-	// arrived yet — a real and common shape when the context
-	// handler runs mid-LLM-response. Only applies when dispatch
-	// protection is ON (the tail is "post-dispatch"); with protection
-	// OFF, any user message already anchored a turn above.
-	//
-	// Exception: a SINGLE trimmable message is left untouched
-	// (dropping the only trimmable content would leave the session
-	// empty). 2+ trimmable messages are bundled
-	// into a synthetic trimmable turn and dropped whole.
-	if (turns.length === 0 && protectDispatch) {
-		// Find the dispatch (first user message with userTurnAge === 0).
-		let dispatchIdx = -1;
-		for (let i = 0; i < messages.length; i++) {
-			if (messages[i].role === "user" && messages[i].userTurnAge === 0) {
-				dispatchIdx = i;
-				break;
-			}
-		}
-		const tailStart = dispatchIdx === -1 ? 0 : dispatchIdx + 1;
-		// Count trimmable messages in the post-dispatch tail.
-		let trimmableCount = 0;
-		for (let i = tailStart; i < messages.length; i++) {
-			if (!isProtectedSlot(messages[i], i, messages, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt)) trimmableCount++;
-		}
-		if (trimmableCount >= 2 && tailStart < messages.length) {
-			turns.push(makeTurn(messages, tailStart, messages.length, protectedCustomTypes, protectDispatch, preservedPatterns, protectedToolCallIds, keepLastUserPromptsProtectedIndices, keepOriginalPrompt, divisor));
-		}
-	}
+): { messages: TrimmableMessage[]; droppedTurns: number; shouldFallThrough: boolean; droppedToolCallIds: Set<string>; droppedTurnStarts: number[] } {
+	const turns = listTrimmableTurns(
+		messages,
+		protectedCustomTypes,
+		protectDispatch,
+		preservedPatterns,
+		protectedToolCallIds,
+		keepLastUserPromptsProtectedIndices,
+		keepOriginalPrompt,
+		divisor,
+	);
 	// Compute the total trimmable token mass of the input.
 	const totalMass = turns.reduce((s, t) => s + t.tokens, 0);
 	// Drop oldest turns until the remaining mass is ≤ cap.
@@ -988,7 +1001,13 @@ function dropOldestTurns(
 		}
 		out.push(msg);
 	}
-	return { messages: out, droppedTurns: dropSet.size, shouldFallThrough, droppedToolCallIds };
+	return {
+		messages: out,
+		droppedTurns: dropSet.size,
+		shouldFallThrough,
+		droppedToolCallIds,
+		droppedTurnStarts: [...dropSet],
+	};
 }
 
 /**
@@ -1227,25 +1246,15 @@ export function applyReasoningBlockCap(
 // ─── Transcript cleanup ───────────────────────────────────────────
 //
 // Three pure array-in/array-out transforms collapse transcript entries.
-// Skill-read detection records duplicate pairs for removal at the Tier 2
-// boundary. The wiring layer invokes each cleanup transform after the
-// local reset.
+// Exact file-read detection records duplicate pairs for removal at the
+// Tier 2 boundary. The wiring layer invokes each cleanup transform after
+// the local reset.
 //
-// Purity: each function is a pure array transform — no `process.*`,
-// no Node I/O, and no `pi` reference. The wiring layer owns extension
-// detection and ordering.
+// Purity: each function is a pure array transform. It has no `process.*`,
+// Node I/O, or `pi` reference. The wiring layer owns extension detection
+// and ordering.
 
-/**
- * Return whether a path points inside a skills directory. Skill paths
- * are identified structurally so the extension does not depend on one
- * operator's home directory.
- */
-function isSkillPath(sourcePath: string): boolean {
-	const normalized = sourcePath.replaceAll("\\", "/");
-	return normalized.split("/").includes("skills");
-}
-
-type SkillRead = {
+type FileRead = {
 	messageIndex: number;
 	blockIndex: number;
 	toolCallId: string;
@@ -1253,12 +1262,12 @@ type SkillRead = {
 };
 
 /**
- * Build an exact-read identity from a read tool call. A call without
- * offset or limit represents a whole-file read. Any bounded call is
- * identified by its exact offset and limit; overlapping ranges are not
- * treated as duplicates.
+ * Build an exact-read identity from a file read tool call. A call
+ * without offset or limit represents a whole-file read. Any bounded
+ * call is identified by its exact offset and limit. Overlapping ranges
+ * are not duplicates.
  */
-function skillReadKey(block: Record<string, unknown>): { toolCallId: string; key: string } | undefined {
+function fileReadKey(block: Record<string, unknown>): { toolCallId: string; key: string } | undefined {
 	if (block.type !== "toolCall") return undefined;
 	const name = block.name;
 	if (name !== "read" && name !== "functions.read") return undefined;
@@ -1268,7 +1277,7 @@ function skillReadKey(block: Record<string, unknown>): { toolCallId: string; key
 	if (!args || typeof args !== "object" || Array.isArray(args)) return undefined;
 	const record = args as Record<string, unknown>;
 	const sourcePath = record.path;
-	if (typeof sourcePath !== "string" || sourcePath.length === 0 || !isSkillPath(sourcePath)) return undefined;
+	if (typeof sourcePath !== "string" || sourcePath.length === 0) return undefined;
 
 	const hasOffset = record.offset !== undefined && record.offset !== null;
 	const hasLimit = record.limit !== undefined && record.limit !== null;
@@ -1285,11 +1294,11 @@ function skillReadKey(block: Record<string, unknown>): { toolCallId: string; key
 }
 
 /**
- * Find older completed reads of the same skill-file scope. A whole
- * file only duplicates another whole-file read. A ranged read only
- * duplicates the same path, offset, and limit.
+ * Find older completed reads of the same file and scope. A whole file
+ * only duplicates another whole-file read. A ranged read only duplicates
+ * the same path, offset, and limit.
  */
-export function findDuplicateSkillReadIds(
+export function findDuplicateFileReadIds(
 	messages: ReadonlyArray<TrimmableMessage>,
 ): Set<string> {
 	const resultIds = new Set<string>();
@@ -1303,7 +1312,7 @@ export function findDuplicateSkillReadIds(
 		}
 	}
 
-	const reads: SkillRead[] = [];
+	const reads: FileRead[] = [];
 	const toolCallCounts = new Map<string, number>();
 	const nonSkillToolCallIds = new Set<string>();
 	for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
@@ -1314,7 +1323,7 @@ export function findDuplicateSkillReadIds(
 			if (!block || typeof block !== "object") continue;
 			const record = block as Record<string, unknown>;
 			const id = record.id;
-			const read = skillReadKey(record);
+			const read = fileReadKey(record);
 			if (typeof id === "string" && id.length > 0) {
 				toolCallCounts.set(id, (toolCallCounts.get(id) ?? 0) + 1);
 				if (!read) nonSkillToolCallIds.add(id);
@@ -1341,12 +1350,12 @@ export function findDuplicateSkillReadIds(
 }
 
 /**
- * Remove marked duplicate skill-read pairs while keeping the newest
+ * Remove marked duplicate file-read pairs while keeping the newest
  * completed read for each exact path and scope.
  */
-export function collapseDuplicateSkillReads(
+export function collapseDuplicateFileReads(
 	messages: ReadonlyArray<TrimmableMessage>,
-	duplicateIds: ReadonlySet<string> = findDuplicateSkillReadIds(messages),
+	duplicateIds: ReadonlySet<string> = findDuplicateFileReadIds(messages),
 ): TrimmableMessage[] {
 	if (duplicateIds.size === 0) return messages.slice();
 

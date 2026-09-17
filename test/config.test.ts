@@ -120,6 +120,37 @@ describe("resolveConfig — precedence", () => {
 	});
 });
 
+describe("jevRetention", () => {
+	it("defaults off", () => {
+		assert.equal(resolveConfig({}).jevRetention, false);
+	});
+
+	it("accepts a file boolean and rejects other file values", () => {
+		assert.equal(parseConfigFile({ jevRetention: true }).jevRetention, true);
+		assert.equal(parseConfigFile({ jevRetention: false }).jevRetention, false);
+		assert.equal(parseConfigFile({ jevRetention: "true" }).jevRetention, undefined);
+	});
+
+	it("uses env over file and ignores unsupported env values", () => {
+		assert.equal(resolveConfig({
+			file: { jevRetention: false },
+			env: { [ENV.jevRetention]: "1" },
+		}).jevRetention, true);
+		assert.equal(resolveConfig({
+			file: { jevRetention: true },
+			env: { [ENV.jevRetention]: "0" },
+		}).jevRetention, false);
+		assert.equal(resolveConfig({
+			file: { jevRetention: true },
+			env: { [ENV.jevRetention]: "yes" },
+		}).jevRetention, true);
+	});
+
+	it("uses the documented env name", () => {
+		assert.equal(ENV.jevRetention, "PI_CONTEXT_TRIMMER_JEV_RETENTION");
+	});
+});
+
 describe("preservedPaths", () => {
 	// --- parseConfigFile (file channel) ---
 

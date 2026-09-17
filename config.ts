@@ -139,6 +139,10 @@ export interface ContextTrimmerConfig {
 	 *  `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` env var per
 	 *  Rule 9. */
 	readonly keepOriginalPrompt?: boolean;
+	/** Enable Jev-assisted retention ordering at the Tier 2 reset.
+	 *  Off by default. The wiring layer also requires a
+	 *  `TYPESAFE_API_KEY` before it sends any candidate content. */
+	readonly jevRetention: boolean;
 }
 
 /** Default dispatch-protection mode: auto-detect pi-subagents. */
@@ -175,6 +179,7 @@ export const ENV = {
 	subagentNotifyKeepLast: "PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST",
 	keepLastUserPrompts: "PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS",
 	keepOriginalPrompt: "PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT",
+	jevRetention: "PI_CONTEXT_TRIMMER_JEV_RETENTION",
 } as const;
 
 /** A minimal env record for the resolver (so tests can pass a plain
@@ -208,6 +213,8 @@ export interface ParsedConfigFile {
 	keepLastUserPrompts?: number;
 	/** Keep-original-prompt boolean (mirrors the config field). */
 	keepOriginalPrompt?: boolean;
+	/** Jev-assisted retention toggle (mirrors the config field). */
+	jevRetention?: boolean;
 }
 
 /**
@@ -268,6 +275,10 @@ export function parseConfigFile(obj: unknown): ParsedConfigFile {
 	const kop = o.keepOriginalPrompt;
 	if (kop === true || kop === false) {
 		out.keepOriginalPrompt = kop;
+	}
+	const jr = o.jevRetention;
+	if (jr === true || jr === false) {
+		out.jevRetention = jr;
 	}
 	return out;
 }
@@ -340,6 +351,18 @@ export function resolveConfig(opts: {
 		keepOriginalPrompt = undefined;
 	}
 
+	let jevRetention: boolean;
+	const envJr = env[ENV.jevRetention];
+	if (envJr === "1") {
+		jevRetention = true;
+	} else if (envJr === "0") {
+		jevRetention = false;
+	} else if (file.jevRetention === true || file.jevRetention === false) {
+		jevRetention = file.jevRetention;
+	} else {
+		jevRetention = false;
+	}
+
 	let pinSubagent: boolean | undefined;
 	const envPs = env[ENV.pinSubagent];
 	if (envPs === "1") {
@@ -380,6 +403,7 @@ export function resolveConfig(opts: {
 		subagentNotifyKeepLast,
 		keepLastUserPrompts,
 		keepOriginalPrompt,
+		jevRetention,
 	};
 }
 
