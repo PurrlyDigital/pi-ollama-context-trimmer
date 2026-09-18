@@ -52,14 +52,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import {
 	TOKEN_ESTIMATOR_DIVISOR_DEFAULT,
 	applyIntercomKeepLast,
-	findDuplicateFileReadIds,
-	collapseDuplicateFileReads,
-	listTrimmableTurns,
-	JEV_RETAINED_DETAIL_KEY,
+	findDuplicateSkillReadIds,
 	applyReasoningBlockCap,
 	applySubagentNotifyKeepLast,
 	applyThreeTierTrim,
@@ -97,7 +94,6 @@ import {
 	rederiveStamp,
 	PRESERVED_CUSTOM_TYPE,
 } from "./path-stamp.ts";
-import { classifyJevRetentionCandidates } from "./jev-retention.ts";
 import {
 	RETAINED_VIEW_CUSTOM_TYPE,
 	createRetainedViewState,
@@ -305,34 +301,6 @@ function readConfigFile(path: string | undefined): ReturnType<typeof parseConfig
 	}
 }
 
-function readDotEnvValue(path: string, key: string): string | undefined {
-	if (!existsSync(path)) return undefined;
-	try {
-		for (const line of readFileSync(path, "utf8").split(/\r?\n/)) {
-			const match = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-			if (!match || match[1] !== key) continue;
-			let value = match[2] ?? "";
-			if (
-				value.length >= 2 &&
-				((value.startsWith('"') && value.endsWith('"')) ||
-					(value.startsWith("'") && value.endsWith("'")))
-			) {
-				value = value.slice(1, -1);
-			}
-			return value.trim().length > 0 ? value.trim() : undefined;
-		}
-	} catch {
-		return undefined;
-	}
-	return undefined;
-}
-
-function resolveTypeSafeApiKey(configPath: string): string | undefined {
-	const fromEnvironment = process.env.TYPESAFE_API_KEY?.trim();
-	if (fromEnvironment) return fromEnvironment;
-	return readDotEnvValue(join(dirname(configPath), ".env"), "TYPESAFE_API_KEY");
-}
-
 /**
  * Pure-evaluating (no I/O, no `process.*`) protected-toolCall-id
  * extractor. Walks every assistant message's content blocks; for
@@ -446,15 +414,10 @@ function requiredRetainedSourceIndices(
 	protectedToolCallIds: ReadonlySet<string>,
 	keepLastUserPromptIndices: ReadonlySet<number>,
 	keepOriginalPrompt: boolean,
-	duplicateFileReadIds: ReadonlySet<string>,
 ): Set<number> {
 	const required = new Set<number>();
 	for (let index = 0; index < messages.length; index++) {
 		const message = messages[index]!;
-		if (message.role === "toolResult") {
-			const toolCallId = (message as { toolCallId?: unknown }).toolCallId;
-			if (typeof toolCallId === "string" && duplicateFileReadIds.has(toolCallId)) continue;
-		}
 		let isRequired = isProtectedSlot(
 			message,
 			index,
@@ -472,7 +435,6 @@ function requiredRetainedSourceIndices(
 				const candidate = block as { type?: unknown; id?: unknown };
 				return candidate.type === "toolCall" &&
 					typeof candidate.id === "string" &&
-					!duplicateFileReadIds.has(candidate.id) &&
 					protectedToolCallIds.has(candidate.id);
 			});
 		}
@@ -480,55 +442,6 @@ function requiredRetainedSourceIndices(
 		if (isRequired && sourceIndex !== undefined) required.add(sourceIndex);
 	}
 	return required;
-}
-
-function jevTaskContext(messages: ReadonlyArray<TrimmableMessage>): string {
-	const userMessages = messages.filter((message) => message.role === "user");
-	const selected = userMessages.length <= 4
-		? userMessages
-		: [userMessages[0]!, ...userMessages.slice(-3)];
-	return selected
-		.map((message, index) => `User message ${index + 1}:\n${extractText(message.content)}`)
-		.join("\n\n")
-		.slice(0, 12_000);
-}
-
-function jevTurnText(
-	messages: ReadonlyArray<TrimmableMessage>,
-	start: number,
-	end: number,
-): string {
-	return messages.slice(start, end).map((message) => {
-		const toolName = (message as { toolName?: unknown }).toolName;
-		const label = typeof toolName === "string" ? `${message.role}:${toolName}` : message.role;
-		return `[${label}]\n${extractText(message.content)}`;
-	}).join("\n\n");
-}
-
-function markJevRetainedTurns(
-	messages: ReadonlyArray<TrimmableMessage>,
-	turns: ReadonlyArray<{ start: number; end: number }>,
-	selectedStarts: ReadonlySet<number>,
-): TrimmableMessage[] {
-	const selectedIndices = new Set<number>();
-	for (const turn of turns) {
-		if (!selectedStarts.has(turn.start)) continue;
-		for (let index = turn.start; index < turn.end; index++) selectedIndices.add(index);
-	}
-	return messages.map((message, index) => {
-		if (!selectedIndices.has(index)) return message;
-		return {
-			...message,
-			details: { ...(message.details ?? {}), [JEV_RETAINED_DETAIL_KEY]: true },
-		};
-	});
-}
-
-function stripJevRetentionMarker(message: TrimmableMessage): TrimmableMessage {
-	if (message.details?.[JEV_RETAINED_DETAIL_KEY] !== true) return message;
-	const details = { ...message.details };
-	delete details[JEV_RETAINED_DETAIL_KEY];
-	return { ...message, details };
 }
 
 // ─── Extension entry point ─────────────────────────────────────────────
@@ -556,8 +469,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 	const configPath = process.env[CONFIG_PATH_ENV] ?? DEFAULT_CONFIG_PATH;
 	const file = readConfigFile(configPath);
 	const cfg: ContextTrimmerConfig = resolveConfig({ file, env: process.env });
-	const typeSafeApiKey = cfg.jevRetention ? resolveTypeSafeApiKey(configPath) : undefined;
-	const jevRetentionAvailable = cfg.jevRetention && typeSafeApiKey !== undefined;
 
 	const pinnedTier = createPinnedTier({
 		personalityPath: cfg.personalityPath,
@@ -710,8 +621,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			loopGuardHardBlock: loopGuardHardBlock ?? null,
 			intercomInstalled: resolveIntercomInstalled(),
 			subagentsInstalled: resolveSubagentsInstalled(),
-			jevRetentionAvailable,
-			jevRetentionModel: "jev-latest",
 			expandedPreservedPatterns: [...expandedPreservedPatterns].sort(),
 		}) ?? hashText("context-trimmer-policy-unavailable");
 	}
@@ -746,8 +655,8 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const currentSession = sessionInfo(ctx);
 		const expandedPreservedPatterns = expandPreservedPaths(cfg.preservedPaths, homedir());
 		const currentPolicyFingerprint = policyFingerprint(expandedPreservedPatterns);
-		const protectDispatch = resolveProtectDispatch() || jevRetentionAvailable;
-		const keepOriginalPrompt = jevRetentionAvailable ? true : (cfg.keepOriginalPrompt ?? true);
+		const protectDispatch = resolveProtectDispatch();
+		const keepOriginalPrompt = cfg.keepOriginalPrompt ?? true;
 		const keepLastUserPrompts =
 			cfg.keepLastUserPrompts !== undefined ? Math.trunc(cfg.keepLastUserPrompts) : 10;
 		const stampedAges = stampUserTurnAge(
@@ -757,14 +666,10 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			withRetainedSourceIndex(message, sourceIndex),
 		);
 		const rawValidationBase = buildTrimmableSourceMessages(rawSourceMessages, stampedAges);
-		const duplicateFileReadIds = findDuplicateFileReadIds(rawValidationBase);
 		const checkpointProtectedToolCallIds = extractProtectedToolCallIds(
 			rawValidationBase,
 			expandedPreservedPatterns,
 		);
-		for (const duplicateId of duplicateFileReadIds) {
-			checkpointProtectedToolCallIds.delete(duplicateId);
-		}
 		const protectedTypes = new Set<string>([PINNED_CUSTOM_TYPE]);
 		if (expandedPreservedPatterns.length > 0) protectedTypes.add(PRESERVED_CUSTOM_TYPE);
 		const keepLastUserPromptIndices = computeKeepLastUserPromptsProtectedIndices(
@@ -779,7 +684,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			checkpointProtectedToolCallIds,
 			keepLastUserPromptIndices,
 			keepOriginalPrompt,
-			duplicateFileReadIds,
 		);
 		const pinned = shouldPinForCurrentContext ? pinnedTier.buildPinnedMessage() : null;
 		const pinnedMessage: TrimmableMessage | undefined = pinned
@@ -851,7 +755,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		const effectiveDivisor = calibratedDivisor ?? tokenEstimatorDivisor;
 		const systemPromptTokens = approximateTextTokens(systemPromptString, effectiveDivisor);
 		const base = buildTrimmableSourceMessages(sourceMessages, stampedAges);
-		const activeDuplicateFileReadIds = findDuplicateFileReadIds(base);
+		const duplicateSkillReadIds = findDuplicateSkillReadIds(base);
 		// When a trimmable message's source path matches a preserved
 		// pattern, stamp it with the `PRESERVED_CUSTOM_TYPE` so the
 		// existing `protectedCustomTypes` channel protects it. The
@@ -885,9 +789,6 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// Compute this before the reset and cleanup passes so it reflects
 		// the tool calls the model emitted in the current source stream.
 		const protectedToolCallIds = extractProtectedToolCallIds(base, expandedPreservedPatterns);
-		for (const duplicateId of activeDuplicateFileReadIds) {
-			protectedToolCallIds.delete(duplicateId);
-		}
 		// The policy sees the complete current stream. It alone decides
 		// whether the local estimate reached Tier 2 before any content
 		// transform can run.
@@ -909,7 +810,7 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 		// sole floor authority. The policy subtracts system-prompt and
 		// permanently protected mass before applying this floor.
 		const dropFloorTokens = Math.trunc(cfg.tier1MaxTokens ?? VERBATIM_TIER_MAX_TOKENS);
-		let result = await applyThreeTierTrim(withPinned, {
+		const result = await applyThreeTierTrim(withPinned, {
 			verbatimMaxTokens: cfg.tier1MaxTokens,
 			summarizeMaxTokens: cfg.tier2MaxTokens,
 			dropFloorTokens,
@@ -917,92 +818,17 @@ export default function contextTrimmerExtension(pi: ExtensionAPI): void {
 			protectDispatch,
 			preservedPatterns: expandedPreservedPatterns,
 			protectedToolCallIds,
-			duplicateFileReadIds: activeDuplicateFileReadIds,
+			duplicateSkillReadIds,
 			tokenEstimatorDivisor: effectiveDivisor,
 			systemPromptTokens,
 			keepLastUserPrompts,
 			keepOriginalPrompt,
 		});
 
-		if (
-			result.reachedTier2 &&
-			result.droppedTurnStarts.length > 0 &&
-			jevRetentionAvailable &&
-			typeSafeApiKey !== undefined
-		) {
-			const duplicateFree = collapseDuplicateFileReads(withPinned, activeDuplicateFileReadIds);
-			const duplicateFreeKeepLastIndices = computeKeepLastUserPromptsProtectedIndices(
-				duplicateFree,
-				keepLastUserPrompts,
-			);
-			const turns = listTrimmableTurns(
-				duplicateFree,
-				protectedTypes,
-				protectDispatch,
-				expandedPreservedPatterns,
-				protectedToolCallIds,
-				duplicateFreeKeepLastIndices,
-				keepOriginalPrompt,
-				effectiveDivisor,
-			);
-			const droppedStarts = new Set(result.droppedTurnStarts);
-			const droppedTurns = turns.filter((turn) => droppedStarts.has(turn.start) && turn.tokens > 0);
-			const decisions = await classifyJevRetentionCandidates({
-				apiKey: typeSafeApiKey,
-				taskContext: jevTaskContext(duplicateFree),
-				candidates: droppedTurns.map((turn) => ({
-					id: `turn-${turn.start}`,
-					text: jevTurnText(duplicateFree, turn.start, turn.end),
-					tokens: turn.tokens,
-				})),
-				timeoutMs: 2_000,
-			});
-			const retentionBudget = Math.max(
-				0,
-				Math.trunc(cfg.tier2MaxTokens ?? SUMMARIZE_TIER_MAX_TOKENS) - dropFloorTokens,
-			);
-			const ranked = droppedTurns
-				.map((turn) => ({ turn, decision: decisions.get(`turn-${turn.start}`) }))
-				.filter((entry) =>
-					entry.decision !== undefined &&
-					entry.decision.keepProbability >= entry.decision.dropProbability,
-				)
-				.sort((left, right) => {
-					const leftMargin = left.decision!.keepProbability - left.decision!.dropProbability;
-					const rightMargin = right.decision!.keepProbability - right.decision!.dropProbability;
-					return rightMargin - leftMargin || right.turn.start - left.turn.start;
-				});
-			const selectedStarts = new Set<number>();
-			let retainedTokens = 0;
-			for (const entry of ranked) {
-				if (retainedTokens + entry.turn.tokens > retentionBudget) continue;
-				selectedStarts.add(entry.turn.start);
-				retainedTokens += entry.turn.tokens;
-			}
-			if (selectedStarts.size > 0) {
-				const marked = markJevRetainedTurns(duplicateFree, turns, selectedStarts);
-				result = await applyThreeTierTrim(marked, {
-					verbatimMaxTokens: cfg.tier1MaxTokens,
-					summarizeMaxTokens: cfg.tier2MaxTokens,
-					dropFloorTokens,
-					protectedCustomTypes: protectedTypes,
-					protectDispatch,
-					preservedPatterns: expandedPreservedPatterns,
-					protectedToolCallIds,
-					duplicateFileReadIds: new Set(),
-					tokenEstimatorDivisor: effectiveDivisor,
-					systemPromptTokens,
-					keepLastUserPrompts,
-					keepOriginalPrompt,
-					forceTier2Reset: true,
-				});
-			}
-		}
-
 		// Content cleanup is a Tier 2 action. Running it after the
 		// ordered policy reset keeps duplicate-pair collapse and oldest-turn
 		// dropping ahead of every other content-changing pass.
-		let cleaned: TrimmableMessage[] = result.messages.map(stripJevRetentionMarker);
+		let cleaned: TrimmableMessage[] = result.messages;
 		if (result.reachedTier2) {
 			const reasoningBlockCap = cfg.reasoningBlockCap ?? REASONING_BLOCK_CAP_DEFAULT;
 			const intercomKeepLast = cfg.intercomKeepLast !== undefined ? Math.trunc(cfg.intercomKeepLast) : DEFAULT_INTERCOM_KEEP_LAST;

@@ -20,7 +20,7 @@ On each LLM call, the extension inspects the message stream and applies one of t
 |------|-------|--------|
 | Verbatim | 0 to 50k trimmable tokens | Send the full message stream. |
 | Hold | over 50k and below 100k | Leave middle-band messages untouched. |
-| Reset | 100k or more | Remove older exact file-read pairs, then drop the oldest eligible turns toward tier 1. When Jev retention is active, Jev can keep selected old turns. Stop before the configured tier 1 floor is undershot. |
+| Reset | 100k or more | Remove duplicate skill-read pairs, then drop the oldest eligible turns toward tier 1. Stop before the configured tier 1 floor is undershot. |
 
 The extension uses its estimate of the current LLM-bound stream as the only reset trigger. Provider status percentages, aggregate totals, cache-hit statistics, and report identity cannot independently remove, rewrite, or reorder existing context. Cache-aware prompt usage can still calibrate the local estimate. Below Tier 2, the extension keeps the existing stream intact and in order.
 
@@ -36,7 +36,7 @@ Protected subagent inputs never count toward this budget, and never get dropped.
 
 The agent definition travels as a `customType: "context-trimmer-pinned"` message in the `messages` array. The trim policy protects it through the `protectedCustomTypes` option whenever the pinned synthetic is injected.
 
-Dispatch instructions are the first user message, stamped with `userTurnAge === 0`. The trim policy subtracts their tokens from the cap total. This protection applies when the `pi-subagents` extension is installed or Jev retention is active. Without either condition, the first user prompt is ordinary trimmable content. Detection is automatic.
+Dispatch instructions are the first user message, stamped with `userTurnAge === 0`. The trim policy subtracts their tokens from the cap total. This protection applies only when the `pi-subagents` extension is installed. Without pi-subagents, the first user prompt is ordinary trimmable content. Detection is automatic. The default is on when pi-subagents is present.
 
 When configured, the extension also injects the agent's `personality.md` content as a pinned-tier message on every LLM call. It rebuilds that message on every `context` event instead of saving it in the session file.
 
@@ -67,17 +67,7 @@ The extension is global. After installation, every Pi session, including parent 
 - The dispatch task is the first user message, stamped with `userTurnAge === 0`. `isProtectedSlot` exempts it from drop, and its tokens are subtracted from the cap total.
 - A new subagent session contains the dispatch, the pinned synthetic, and one short trimmable message. With less than 50k tokens, the trim path is skipped.
 
-The synthetic is rebuilt on every `context` event from the file system and is never persisted in the session file. Dispatch protection is on by default when `pi-subagents` is installed. Override it with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=0`. Jev retention always protects the first user prompt while Jev is available.
-
-## Jev retention
-
-Jev retention is optional and off by default. Enable it with `jevRetention: true` or `PI_CONTEXT_TRIMMER_JEV_RETENTION=1`. The extension uses Jev only when it can also read `TYPESAFE_API_KEY` from the process environment or the `.env` file beside `context-trimmer.json`.
-
-Jev runs only when the local message stream reaches `tier2MaxTokens`. The extension first removes older exact file reads. It then sends the turns selected by the normal reset to TypeSafe and asks whether each turn contains a requirement, a human decision, an unresolved blocker, a non-repeatable state change, or necessary evidence. A turn selected for retention displaces less valuable trimmable content. Jev never rewrites or summarizes messages.
-
-The complete Jev pass has one two-second deadline. Candidate chunks share that deadline, and the extension does not retry a failed request. Missing credentials, a timeout, an HTTP failure, or a malformed answer leaves the normal deterministic reset in effect.
-
-Enabling Jev sends candidate conversation turns and tool results to TypeSafe. Review TypeSafe's data-retention terms before you enable it. The extension does not send the system prompt. It keeps the first user prompt whole and includes a bounded copy of user-task context in the Jev request.
+The synthetic is rebuilt on every `context` event from the file system and is never persisted in the session file. Dispatch protection is on by default when `pi-subagents` is installed. Override it with `PI_CONTEXT_TRIMMER_PROTECT_DISPATCH=0`. In a plain parent session without pi-subagents, the first user prompt is ordinary trimmable content.
 
 ## Loop guard
 
@@ -137,7 +127,7 @@ Models with reasoning support may put a `type:"thinking"` content block on assis
 
 The cap keeps the last N reasoning blocks, counted from the latest, and drops the rest. It counts blocks, not tokens.
 
-The cap runs only after a local Tier 2 reset. The reset removes older exact file-read pairs and drops eligible older turns first. Below Tier 2, the cap leaves every reasoning block intact. The pinned synthetic is never at risk. The cap runs for every model without per-model branching.
+The cap runs only after a local Tier 2 reset. The reset removes duplicate skill-read pairs and drops eligible older turns first. Below Tier 2, the cap leaves every reasoning block intact. The pinned synthetic is never at risk. The cap runs for every model without per-model branching.
 
 | Cap value | Effect |
 |-----------|--------|
@@ -152,11 +142,11 @@ Set the cap with `PI_CONTEXT_TRIMMER_REASONING_BLOCK_CAP` or the `reasoningBlock
 
 Chain and parallel completions can appear as both `subagent-notify` and, when an intercom target is set, `intercom_message`. `subagent-notify` is a display notification controlled by `subagentNotifyKeepLast`. `intercom_message` is a grouped result controlled by `intercomKeepLast`. The two limits are independent. See the `subagentNotifyKeepLast` row in the config-file table for the env-var and JSON-key reference.
 
-Four kinds of transcript entries can accumulate outside the three-tier budget: repeated file reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer records exact duplicate file reads while it builds the message stream. At the local Tier 2 ceiling, it removes marked older pairs, then resets eligible context toward Tier 1. The other cleanup passes run after that reset and only when the relevant extension is installed.
+Four kinds of transcript entries can accumulate outside the three-tier budget: repeated skill reads, `intercom_message`, `subagent-notify`, and `toolResult:subagent`. The trimmer records duplicate skill reads while it builds the message stream. At the local Tier 2 ceiling, it removes marked older pairs, then resets eligible context toward Tier 1. The other cleanup passes run after that reset and only when the relevant extension is installed.
 
 | Rule | Category | Gate | Behavior |
 |------|----------|------|----------|
-| 0 | Completed file reads | Tier 2 ceiling reached | Keep every pair below the ceiling. At the ceiling or above, keep the newest read for the same normalized path and scope. This rule also applies to paths listed in `preservedPaths`. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together before the reset. |
+| 0 | Completed reads under a `skills` directory | Tier 2 ceiling reached | Keep every pair below the ceiling. At the ceiling or above, keep the newest read when the same skill file was read with the same scope. A whole-file read duplicates only another whole-file read. A bounded read duplicates only the same path, offset, and limit. Overlapping ranges and partial-versus-whole reads remain. Remove the matching older tool call and result together before the reset. |
 | 1 | `intercom_message` (`role: "custom"`, `customType: "intercom_message"`) | Local Tier 2 reset and `intercom` tool registered (pi-intercom) | Keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. |
 | 2 | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | Local Tier 2 reset and `intercom` tool registered (pi-intercom) | Keep the first occurrence of each run identity in stream order. Drop later duplicates. There is no operator knob. Run identity priority is `details.sessionValue`, then the `details` fingerprint, then the content-header agent name, then the stream index. |
 | 2b | `subagent-notify` (`role: "custom"`, `customType: "subagent-notify"`) | Local Tier 2 reset and `intercom` tool registered (pi-intercom) | After deduplication, keep the last N in stream order. `-1` keeps all, `0` keeps none, and a positive N keeps the last N. When unset, use the resolved `intercomKeepLast` value. |
@@ -205,8 +195,7 @@ Create `~/.pi/agent/context-trimmer.json`:
   "intercomKeepLast": -1,                                          // -1 passthrough (default), 0 send none, N keep last N
   "subagentNotifyKeepLast": -1,                                     // unset, use intercomKeepLast
   "keepLastUserPrompts": 10,                                        // default 10; 0/negative/absent does nothing
-  "keepOriginalPrompt": true,                                       // default true; false makes the original eligible above tier 2
-  "jevRetention": false                                              // default false; requires TYPESAFE_API_KEY
+  "keepOriginalPrompt": true                                        // default true; false makes the original eligible above tier 2
 }
 ```
 
@@ -226,8 +215,7 @@ All fields are optional. The file is read once when the extension loads. Restart
 | `intercomKeepLast` | integer in `[-1, ∞)` | `-1` (passthrough) | The setting applies only after a local Tier 2 reset and is gated on the `intercom` tool. Without it, the rule is inert. | `PI_CONTEXT_TRIMMER_INTERCOM_KEEP_LAST` |
 | `subagentNotifyKeepLast` | integer in `[-1, ∞)` | resolved `intercomKeepLast` | After a local Tier 2 reset, an unset value uses the resolved `intercomKeepLast`. It uses the same gate. Deduplication runs first, then recency trimming. | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` |
 | `keepLastUserPrompts` | positive integer N | `10` | Retains the last N operator-authored `role: "user"` messages while the effective total is within tier 2. Above tier 2, retained prompts remain eligible for oldest-first trimming. `0`, negative, non-integer, `NaN`, or `Infinity` means absent. | `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` |
-| `keepOriginalPrompt` | boolean | `true` | `true` permanently protects the dispatch slot. `false` makes it eligible for oldest-first trimming above tier 2. Jev retention overrides `false` while Jev is available. The original counts toward N in both modes. | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` |
-| `jevRetention` | boolean | `false` | When enabled with a `TYPESAFE_API_KEY`, asks Jev which turns from a Tier 2 reset deserve retention. | `PI_CONTEXT_TRIMMER_JEV_RETENTION` |
+| `keepOriginalPrompt` | boolean | `true` | `true` permanently protects the dispatch slot. `false` makes it eligible for oldest-first trimming above tier 2. The original counts toward N in both modes. | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` |
 
 ### Environment variables (override the file)
 
@@ -246,8 +234,6 @@ All fields are optional. The file is read once when the extension loads. Restart
 | `PI_CONTEXT_TRIMMER_SUBAGENT_NOTIFY_KEEP_LAST` | Integer in `[-1, ∞)`. At a local Tier 2 reset, this sets the number of `subagent-notify` entries to keep. See the `subagentNotifyKeepLast` field above for validation rules. |
 | `PI_CONTEXT_TRIMMER_KEEP_LAST_USER_PROMPTS` | Positive integer N. The last N operator-authored `role: "user"` messages stay retained within tier 2 and remain eligible for oldest-first trimming above tier 2. See the `keepLastUserPrompts` field above for validation rules. |
 | `PI_CONTEXT_TRIMMER_KEEP_ORIGINAL_PROMPT` | `1` keeps the dispatch slot permanently protected, which is the default. `0` makes it eligible for oldest-first trimming above tier 2. See the `keepOriginalPrompt` field above for validation rules. |
-| `PI_CONTEXT_TRIMMER_JEV_RETENTION` | `1` enables Jev retention. `0` disables it. The default is off. Jev also requires `TYPESAFE_API_KEY`. |
-| `TYPESAFE_API_KEY` | TypeSafe API credential. The extension reads the process environment first, then the `.env` file beside `context-trimmer.json`. It sends no Jev request when this value is absent. |
 | `PI_CONTEXT_TRIMMER_CONFIG_PATH` | Overrides the config-file location. The default is `~/.pi/agent/context-trimmer.json`. This is useful for tests or operators who keep config elsewhere. |
 
 When neither channel resolves a `personalityPath`, the pinned-tier injection is skipped. The wiring calls `buildPinnedMessage()`, gets `null`, and prepends nothing.
@@ -266,7 +252,7 @@ If the extension cannot prove the pairing, the configured divisor applies. This 
 
 `usage.totalTokens` does not trigger a reset. Pi exposes its status-line percentage through `ctx.getContextUsage().percent`. Providers can report stale totals, cache-inclusive totals, or a percentage that does not describe the current stream. The extension does not use that percentage as a reset trigger. The local visible-content estimate, after protected mass and system-prompt accounting, is the sole reset predicate.
 
-For the visible estimate, the trimmer subtracts system-prompt tokens and permanently protected message mass from both tier caps. Protected mass includes the dispatch slot when dispatch and original-prompt protection are enabled, pinned or other protected custom messages, preserved-path messages, and tool results paired with protected tool calls. Tier 1 returns the stream unchanged. The middle band holds it unchanged. At the Tier 2 ceiling, the trimmer removes older exact file-read pairs, then drops the oldest whole turns toward the effective Tier 1 target. The reset stops before the effective tier 1 floor would be undershot, so a stream can remain above the target when the next whole-turn drop would cross that floor or when no eligible whole turn remains.
+For the visible estimate, the trimmer subtracts system-prompt tokens and permanently protected message mass from both tier caps. Protected mass includes the dispatch slot when dispatch and original-prompt protection are enabled, pinned or other protected custom messages, preserved-path messages, and tool results paired with protected tool calls. Tier 1 returns the stream unchanged. The middle band holds it unchanged. At the Tier 2 ceiling, the trimmer removes duplicate skill-read pairs, then drops the oldest whole turns toward the effective Tier 1 target. The reset stops before the effective tier 1 floor would be undershot, so a stream can remain above the target when the next whole-turn drop would cross that floor or when no eligible whole turn remains.
 
 Protected messages survive even when they sit inside a dropped turn. A protected tool-call block can remain inside its assistant message with its matching result. When an unprotected tool-call block is dropped, its matching result is dropped too. Opaque reasoning can make exact per-turn sizes unavailable, so the trimmer cuts whole turns instead of claiming exact accounting.
 
@@ -274,7 +260,7 @@ The loop guard has its own informational token signal. It samples up to the last
 
 ## Development
 
-Run the test suite. It currently contains 407 tests and takes a few seconds on a modern laptop.
+Run the test suite. It currently contains 395 tests and takes a few seconds on a modern laptop.
 
 ```bash
 npm install   # installs tsx as a dev dependency
@@ -292,13 +278,11 @@ Project structure:
 ```
 index.ts              # Extension wiring: registers session_start / turn_end / context handlers
 config.ts             # Pure config resolver (parse file + merge env over file)
-jev-retention.ts      # Bounded TypeSafe request and Choice-response validation
 policy.ts             # Three-tier trim policy (the trim algorithm)
 pinned-tier.ts        # Pinned content reader (personality)
 retained-view-state.ts # Pure retained-view state validation and reconstruction
 test/policy.test.ts   # Unit tests for the trim policy
 test/config.test.ts   # Unit tests for config resolution (precedence + parsing)
-test/jev-retention.test.ts # Unit tests for Jev requests and the shared timeout
 test/retained-view-state.test.ts # Retained-state validation and reconstruction tests
 test/integration.test.ts # End-to-end tests for the context handler wiring
 tsconfig.json         # TypeScript config for the extension
