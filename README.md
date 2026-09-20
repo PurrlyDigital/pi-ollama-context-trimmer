@@ -1,3 +1,5 @@
+ARCHIVED. Ollama switched to a token based with caching main billing/use structure. While their original GPU based billing structure still exists for legacy accounts this extension is no longer going to be updated.
+
 # pi-ollama-context-trimmer
 
 Pi extension that trims the message stream sent to the model against a three-tier token budget. It helps subagents keep working when tool-result tails grow too large for the model's context window.
